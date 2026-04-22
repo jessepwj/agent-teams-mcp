@@ -1,0 +1,73 @@
+[package]
+name = "agent-teams-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["jessepwj"]
+license = "MIT"
+readme = "README.md"
+description = "MCP server that turns Claude Code into a team lead coordinating Claude Code / Codex / Gemini worker agents, with true-push worker→lead notifications via Claude Code's FileChanged + asyncRewake hook"
+repository = "https://github.com/jessepwj/agent-teams-mcp"
+homepage = "https://github.com/jessepwj/agent-teams-mcp"
+keywords = ["mcp", "claude-code", "agent", "team", "ai"]
+categories = ["command-line-utilities", "asynchronous", "development-tools"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+cc-sdk = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tempfile = "3"
+dirs = "6"
+which = "7"
+fs2 = "0.4"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# CLI
+clap = { version = "4", features = ["derive"], optional = true }
+
+# Optional: web dashboard
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+
+# Optional: checkpoint (git notes-based agent session audit trail)
+git2 = { version = "0.19", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+# Optional: TUI dashboard (ratatui terminal UI)
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+
+[features]
+default = []
+cli = ["clap"]
+dashboard = ["axum", "tower-http"]
+checkpoint = ["git2", "sha2"]
+tui = ["ratatui", "crossterm", "checkpoint"]
+
+[[bin]]
+name = "agent-teams"
+path = "src/bin/agent_teams.rs"
+required-features = ["cli"]
+
+[dependencies.tracing-subscriber]
+version = "0.3"
+features = ["env-filter"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+
+[patch.crates-io]
+cc-sdk = { path = "vendor/cc-sdk" }
+crossterm = { path = "vendor/crossterm" }
+ratatui = { path = "vendor/ratatui" }
+tokio-test = { path = "vendor/tokio-test" }
+tracing-subscriber = { path = "vendor/tracing-subscriber" }
+tempfile = { path = "vendor/tempfile" }

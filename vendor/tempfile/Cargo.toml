@@ -1,0 +1,8 @@
+[package]
+name = "tempfile"
+version = "3.27.0"
+edition = "2021"
+
+[lib]
+name = "tempfile"
+path = "src/lib.rs"

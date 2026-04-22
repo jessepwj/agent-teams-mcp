@@ -1,0 +1,8 @@
+[package]
+name = "cc-sdk"
+version = "0.5.0"
+edition = "2021"
+
+[lib]
+name = "cc_sdk"
+path = "src/lib.rs"

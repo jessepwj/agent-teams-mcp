@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "FileChanged": [
+      {
+        "matcher": "pending.jsonl",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node E:/aigc内容整理/agent-teams-rs-team-mode/test-wake/wake-hook.js",
+            "async": true,
+            "asyncRewake": true
+          }
+        ]
+      }
+    ]
+  }
+}

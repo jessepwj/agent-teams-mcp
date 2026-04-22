@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "team-mode": {
+      "command": "E:\\aigc内容整理\\agent-teams-rs-team-mode\\target\\debug\\team_mode_mcp.exe",
+      "args": [],
+      "env": {
+        "CLAUDE_CODE_GIT_BASH_PATH": "D:\\Git\\bin\\bash.exe",
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}

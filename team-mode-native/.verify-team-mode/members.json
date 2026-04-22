@@ -1,0 +1,41 @@
+[
+  {
+    "profile": {
+      "id": "lead",
+      "teamId": "dev",
+      "name": "Lead",
+      "kind": "member",
+      "handle": "lead",
+      "roleLabel": "lead",
+      "status": "active",
+      "joinedAt": "2026-04-22T01:51:11.711421200Z"
+    }
+  },
+  {
+    "profile": {
+      "id": "reviewer",
+      "teamId": "dev",
+      "name": "Reviewer",
+      "kind": "member",
+      "handle": "reviewer",
+      "roleLabel": "review",
+      "status": "active",
+      "joinedAt": "2026-04-22T01:51:11.764178500Z"
+    },
+    "execution": {
+      "memberId": "reviewer",
+      "adapter": "gemini-cli-terminal",
+      "launchMode": "native_terminal_pty",
+      "viewerMode": "native_terminal",
+      "command": {
+        "program": "powershell.exe",
+        "args": [
+          "-NoExit"
+        ]
+      },
+      "systemPrompt": "You are @reviewer.",
+      "promptMode": "append",
+      "restartPolicy": "never"
+    }
+  }
+]

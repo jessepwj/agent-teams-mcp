@@ -1,0 +1,17 @@
+[package]
+name = "tracing-subscriber"
+version = "0.3.23"
+edition = "2021"
+
+[lib]
+name = "tracing_subscriber"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = "0.1"
+tracing-core = "0.1"
+
+[features]
+default = []
+env-filter = []
+fmt = []

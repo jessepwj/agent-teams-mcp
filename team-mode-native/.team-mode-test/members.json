@@ -1,0 +1,29 @@
+[
+  {
+    "profile": {
+      "id": "coder",
+      "teamId": "test-team",
+      "name": "Coder",
+      "kind": "member",
+      "handle": "coder",
+      "roleLabel": "member",
+      "status": "active",
+      "joinedAt": "2026-04-22T03:16:12.327671700Z"
+    },
+    "execution": {
+      "memberId": "coder",
+      "adapter": "claude-code-terminal",
+      "launchMode": "native_terminal_pty",
+      "viewerMode": "native_terminal",
+      "command": {
+        "program": "claude"
+      },
+      "env": {
+        "CLAUDE_CODE_GIT_BASH_PATH": "D:\\Git\\usr\\bin\\bash.exe"
+      },
+      "systemPrompt": "You are @coder, a software developer. Use Team Mode MCP tools to reply.",
+      "promptMode": "append",
+      "restartPolicy": "never"
+    }
+  }
+]

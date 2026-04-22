@@ -1,0 +1,8 @@
+[package]
+name = "crossterm"
+version = "0.28.1"
+edition = "2021"
+
+[lib]
+name = "crossterm"
+path = "src/lib.rs"

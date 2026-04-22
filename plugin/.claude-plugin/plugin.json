@@ -1,0 +1,9 @@
+{
+  "name": "agent-teams",
+  "version": "0.1.0",
+  "description": "Multi-agent team orchestration for Claude Code. Spawn Claude + Codex + Gemini agents using slash commands.",
+  "author": { "name": "ZhangHanDong" },
+  "repository": "https://github.com/ZhangHanDong/agent-teams",
+  "license": "MIT",
+  "keywords": ["multi-agent", "teams", "codex", "gemini", "delegation", "orchestration"]
+}
