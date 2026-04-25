@@ -116,7 +116,36 @@ team-mode 的 8 个 MCP 工具刻意把"操作建议/警告"放在 **响应** �
 
 ---
 
-## 9. 跨平台几个老坑
+## 9. `/mcp` 显示连接但工具调用报错（CC 客户端 bug）
+
+**症状**：CC 的 `/mcp` 面板显示 `team-mode: connected`，但你下次调用任何工具就报错。`/mcp reconnect` 一下立刻就好。
+
+**根因**：CC 在某些时机会单方面关闭 MCP relay 的 stdin（最常见触发：ESC 中断、长时间无 tool 调用、CC 自身的某些重置）。MCP 一收到 stdin EOF 就 exit（这是合规行为）。但 **CC 的 `/mcp` 面板显示是 lazy 的，不会主动 ping MCP 进程**，所以 UI 上还是 stale 的"connected"。下次你调用工具，CC 想往已关闭的 stdio 写入 → 报错。
+
+这是 **CC 客户端的 bug**（MCP server 侧无法修复，因为 stdio 一断就该 exit）。我们能做的就是早识别、快恢复：
+
+**确认是不是这个问题**：
+```bash
+tail -1 .agent-teams/mcp.log
+# 看到这行就是命中了：
+# WARN MCP: stdin EOF — parent closed the pipe, exiting run_stdio
+```
+
+**应对**：
+- **`/mcp reconnect` 即可**，不用重启 CC（detached daemon 让 worker / 消息历史 / session_id 全部存活，只是 stdio 桥要重建）
+- daemon 进程仍在跑（可以从 `tasklist | grep team_mode_daemon` 验证），所以 web UI、worker 子进程、消息推送给其他 CC 都不受影响
+- reconnect 后第一次 tool call 会触发 MCP 重新连 daemon → 拿到完整的 in-flight 状态
+
+**预防**：
+- 少按 ESC（尤其是在 worker 还在工作的时候）
+- 长时间无操作前可以先做一次 `team_list` 之类的轻量调用，让 stdio 保持活跃
+- 多窗口同时 CC 的话，最容易触发（CC 的 stdio 管理在多 session 下有竞态）
+
+未来如果 Anthropic 修了 `/mcp` UI 的状态检测，这个坑就会消失。但现状下，请按上面流程处理。
+
+---
+
+## 10. 跨平台几个老坑
 
 **Windows**：
 - 路径包含中文是 OK 的（PathBuf + UTF-8 已测）
@@ -129,7 +158,7 @@ team-mode 的 8 个 MCP 工具刻意把"操作建议/警告"放在 **响应** �
 
 ---
 
-## 10. ESC 永远是出路
+## 11. ESC 永远是出路
 
 任何时候 Stop hook 卡住 → **按 ESC**。hook 脚本注册了 SIGINT handler，会立即 `exit 0` 让出 prompt。
 
@@ -143,7 +172,7 @@ export TEAM_MODE_STOP_WAIT_SEC=300    # 改 5 分钟（默认 7200 秒 = 2 小�
 
 ---
 
-## 11. 关于 daemon 与 MCP relay 的关系
+## 12. 关于 daemon 与 MCP relay 的关系
 
 新架构（2026-04 之后）下：
 - `team_mode_mcp.exe` = **薄 relay**，CC 启动时 spawn，挂了不影响 worker
@@ -159,7 +188,7 @@ daemon 自动 self-kill：当 15 秒内所有 team 都没有 live owner_cc_pid �
 
 ---
 
-## 12. 工具调用前先做 `team_list`，看清状态
+## 13. 工具调用前先做 `team_list`，看清状态
 
 习惯性养成：每次 session 开始或 `/mcp reconnect` 之后，先 `team_list`，看：
 - 有没有 orphan team（owner CC 死了）
@@ -169,7 +198,7 @@ daemon 自动 self-kill：当 15 秒内所有 team 都没有 live owner_cc_pid �
 
 ---
 
-## 13. 想新增 backend / 改架构？读这两份 spec
+## 14. 想新增 backend / 改架构？读这两份 spec
 
 - [`docs/team-mode-mcp-final.md`](team-mode-mcp-final.md) —— MCP 工具集、消息路由、storage 布局
 - [`.plans/refactor-data-layout/spec.md`](../.plans/refactor-data-layout/spec.md) —— 当前 `<base>/<team>/` 子目录布局的 design spec
