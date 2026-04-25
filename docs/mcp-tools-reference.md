@@ -350,6 +350,29 @@ All URIs take the form `team://<team>/...`. Clients can `subscribe` to receive `
 
 ---
 
+## Per-dispatch terminal message guarantee
+
+Every successful `send_message` to a worker results in **exactly one**
+terminal message back to the room — never zero, never two:
+
+- If the worker produces any visible text in its turn → `Reply` with that text.
+- If the worker's turn ends silently (LLM produced nothing, content
+  filtered, etc.) → `Status` with `[SYSTEM] worker 'X' completed its turn
+  without producing any reply text for msg <id>...`
+- If the worker's stdout pipe closes mid-turn (process crashed, killed) →
+  `Status` with `[SYSTEM] worker 'X' output channel closed mid-turn...
+  Use worker_add on_existing=reuse to revive`. The AgentLoop exits cleanly
+  after this notice; the worker is reported `dead` on the next `worker_list`.
+- If `send_input` itself fails (worker died before its turn started) →
+  `Status` with `[SYSTEM] worker 'X' died while processing message...`
+  (handled by the pre-existing Bug 17 fix.)
+
+The lead always sees a single terminal event per dispatch. Combined with
+the Stop hook delivering replies/statuses on the next turn, this means
+the lead never has to poll to know "did the worker actually finish?".
+
+---
+
 ## Runtime hints (just-in-time guidance)
 
 Each tool's response may include a `hint` (and sometimes secondary

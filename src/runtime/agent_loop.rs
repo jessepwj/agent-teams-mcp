@@ -11,6 +11,22 @@ use crate::team_mode::domain::{InboxStatus, MessageKind};
 use crate::team_mode::service::{InboxNotifier, InboxService, MessageService, SendMessageRequest};
 use crate::team_mode::storage::{MemberStore, MessageStore};
 
+/// Why the worker's output stream stopped accepting events for the
+/// current inbox turn. Drives the step-5 branch that decides whether to
+/// post a real `Reply` or a synthesized `[SYSTEM]` Status to keep the
+/// lead informed.
+#[derive(Debug, Clone, Copy)]
+enum TurnEndCause {
+    /// `AgentOutput::TurnComplete` or `Idle` — clean end-of-turn signal.
+    TurnComplete,
+    /// `AgentOutput::Error` — backend reported a turn-level error.
+    AgentError,
+    /// `output_rx.recv()` returned None — the child's stdout pipe closed
+    /// (process died, was killed, or stdin pair was dropped). Caller
+    /// must shut down the loop after the terminal message is posted.
+    OutputClosed,
+}
+
 /// Handle returned by `AgentLoop::start`. Drop or call `shutdown()` to stop the loop.
 pub struct AgentLoopHandle {
     pub join_handle: std::thread::JoinHandle<()>,
@@ -183,47 +199,150 @@ impl AgentLoop {
                     }
                 }
 
-                // 4. Collect Claude Code's response until TurnComplete.
+                // 4. Collect Claude Code's response until the turn ends.
+                //
+                // We track the END-CAUSE so step 5 can synthesize a [SYSTEM]
+                // status whenever the worker produced no text. The whole point
+                // is the lead must always get exactly ONE terminal message
+                // back per inbox dispatch — Reply when there's content, Status
+                // otherwise. Without this guarantee, a worker that finishes a
+                // turn silently (LLM ignored the request, content was filtered,
+                // process died mid-turn) leaves the lead waiting forever.
                 let mut parts: Vec<String> = Vec::new();
-                loop {
+                let end_cause: TurnEndCause = loop {
                     match output_rx.recv().await {
                         Some(AgentOutput::Message(text)) | Some(AgentOutput::Delta(text)) => {
                             parts.push(text);
                         }
-                        Some(AgentOutput::TurnComplete) | Some(AgentOutput::Idle) => break,
+                        Some(AgentOutput::TurnComplete) | Some(AgentOutput::Idle) => {
+                            break TurnEndCause::TurnComplete;
+                        }
                         Some(AgentOutput::Error(e)) => {
                             parts.push(format!("[agent error: {e}]"));
-                            break;
+                            break TurnEndCause::AgentError;
                         }
-                        None => return,
+                        None => {
+                            // stdout pipe closed mid-turn — the child process
+                            // is gone (crashed, killed, or stdin/stdout pair
+                            // dropped). We still must surface this to the
+                            // lead. Fall through to step 5; after sending the
+                            // [SYSTEM] notice we will exit the loop because
+                            // there's nothing left to listen on.
+                            break TurnEndCause::OutputClosed;
+                        }
                     }
-                }
+                };
 
-                // 5. Post the reply back to the room.
-                let body = parts.join("");
-                if !body.is_empty() {
-                    tracing::info!(member = %self.member_id, reply_len = body.len(), "posting reply to room");
-                    let _ = self.message_service.send(SendMessageRequest {
-                        team_id: self.team_id.clone(),
-                        room_id: self.room_id.clone(),
-                        sender: self.member_id.clone(),
-                        kind: MessageKind::Reply,
-                        subject: None,
-                        body,
-                        mentions: Vec::new(),
-                        visibility: Vec::new(),
-                        audience_policy: None,
-                        reply_to: Some(message.id.clone()),
-                        thread_id: message.thread_id.clone(),
-                        expires_at: None,
-                    });
-                }
+                // 5. Always post EXACTLY ONE terminal message back to the room.
+                //
+                // Branching:
+                //   - body has visible content (after trim) → `Reply`
+                //   - empty body + TurnComplete             → `[SYSTEM]` Status: silent turn
+                //   - empty body + AgentError               → `[SYSTEM]` Status: agent error
+                //                                              (parts already includes
+                //                                              the error string above,
+                //                                              so this branch usually
+                //                                              has content; included for
+                //                                              completeness)
+                //   - any cause + OutputClosed              → `[SYSTEM]` Status: pipe closed
+                //
+                // Rationale: lead coordination relies on every dispatch
+                // producing a single observable terminal event. Two events
+                // (a Reply AND a "completed" status) would be redundant noise;
+                // zero events strands the lead. So we pick exactly one.
+                let raw_body = parts.join("");
+                let trimmed = raw_body.trim();
+                let has_content = !trimmed.is_empty();
+                let pipe_closed = matches!(end_cause, TurnEndCause::OutputClosed);
+
+                let (kind, body) = if has_content && !pipe_closed {
+                    (MessageKind::Reply, raw_body)
+                } else {
+                    let notice = match (has_content, end_cause) {
+                        (false, TurnEndCause::TurnComplete) => format!(
+                            "[SYSTEM] worker '{member}' completed its turn without \
+                             producing any reply text for msg {mid}. The worker may \
+                             have silently ignored the request or finished without \
+                             output. Check the worker's prompt or send a follow-up.",
+                            member = self.member_id,
+                            mid = message.id
+                        ),
+                        (true, TurnEndCause::OutputClosed) => format!(
+                            "[SYSTEM] worker '{member}' output channel closed \
+                             mid-turn while answering msg {mid} (partial output: {n} \
+                             chars). The child process likely died. Use \
+                             `worker_add name={member} on_existing=reuse` to revive.\n\n\
+                             --- partial output ---\n{partial}",
+                            member = self.member_id,
+                            mid = message.id,
+                            n = trimmed.len(),
+                            partial = trimmed
+                        ),
+                        (false, TurnEndCause::OutputClosed) => format!(
+                            "[SYSTEM] worker '{member}' output channel closed \
+                             before producing any reply for msg {mid}. The child \
+                             process died at the start of its turn. Use \
+                             `worker_add name={member} on_existing=reuse` to revive.",
+                            member = self.member_id,
+                            mid = message.id
+                        ),
+                        (false, TurnEndCause::AgentError) => format!(
+                            "[SYSTEM] worker '{member}' raised an agent error while \
+                             processing msg {mid} but emitted no message body. See \
+                             the worker's stderr / daemon log for details.",
+                            member = self.member_id,
+                            mid = message.id
+                        ),
+                        // (true, TurnComplete) or (true, AgentError) hit the
+                        // Reply branch above; this match is exhaustive.
+                        _ => unreachable!(
+                            "terminal-message branch: has_content={has_content} cause={cause:?}",
+                            cause = end_cause
+                        ),
+                    };
+                    (MessageKind::Status, notice)
+                };
+
+                tracing::info!(
+                    member = %self.member_id,
+                    msg_id = %message.id,
+                    kind = ?kind,
+                    body_len = body.len(),
+                    end_cause = ?end_cause,
+                    "posting terminal message for inbox turn"
+                );
+                let _ = self.message_service.send(SendMessageRequest {
+                    team_id: self.team_id.clone(),
+                    room_id: self.room_id.clone(),
+                    sender: self.member_id.clone(),
+                    kind,
+                    subject: None,
+                    body,
+                    mentions: Vec::new(),
+                    visibility: Vec::new(),
+                    audience_policy: None,
+                    reply_to: Some(message.id.clone()),
+                    thread_id: message.thread_id.clone(),
+                    expires_at: None,
+                });
 
                 // 6. Ack the processed inbox item.
                 tracing::debug!(member = %self.member_id, msg_id = %message.id, "ack'd inbox item");
                 let _ = self
                     .inbox_service
                     .ack(&self.team_id, &self.member_id, &[message.id]);
+
+                // 6b. If the child's stdout pipe closed, the loop cannot
+                // process any further messages — its source of TurnComplete
+                // events is gone. Exit cleanly now (the [SYSTEM] notice for
+                // this turn was already delivered in step 5).
+                if pipe_closed {
+                    tracing::info!(
+                        member = %self.member_id,
+                        "exiting agent loop after output pipe closed"
+                    );
+                    return;
+                }
 
                 // 7. Backfill backend session_id into the member record once
                 // the worker has actually started its conversation. The
@@ -542,5 +661,173 @@ mod tests {
             .find(|m| m.sender == "worker" && matches!(m.kind, MessageKind::Reply));
         assert!(reply.is_some(), "expected a reply from worker in the room");
         assert_eq!(reply.unwrap().body, "Done!");
+    }
+
+    /// Helper to wire up an AgentLoop + scripted output channel.
+    /// Returns the message_store and inbox_service so the test can assert
+    /// what the agent_loop posted.
+    fn run_loop_with_script<F>(
+        script: F,
+    ) -> (MessageStore, InboxService)
+    where
+        F: FnOnce(mpsc::Sender<AgentOutput>, mpsc::Receiver<String>) + Send + 'static,
+    {
+        let dir = tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        seed_env(&base);
+
+        let (message_service, inbox_service, message_store) = build_services(&base);
+
+        // Lead → worker dispatch.
+        message_service
+            .send(SendMessageRequest {
+                team_id: "team-1".into(),
+                room_id: "main".into(),
+                sender: "lead".into(),
+                kind: MessageKind::Dispatch,
+                subject: None,
+                body: "@worker do something".into(),
+                mentions: Vec::new(),
+                visibility: Vec::new(),
+                audience_policy: None,
+                reply_to: None,
+                thread_id: None,
+                expires_at: None,
+            })
+            .unwrap();
+
+        let (output_tx, output_rx) = mpsc::channel::<AgentOutput>(32);
+        let (input_tx, input_rx) = mpsc::channel::<String>(32);
+        let mock = MockSession {
+            name: "worker".into(),
+            output_rx: None,
+            input_tx,
+        };
+        let mut orch = RuntimeOrchestrator::new();
+        orch.register_backend(MockBackend::new(mock));
+        let orch = Arc::new(Mutex::new(orch));
+
+        // Pre-spawn so send_input is routable.
+        {
+            let orch2 = Arc::clone(&orch);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                orch2
+                    .lock()
+                    .await
+                    .spawn_managed_member(
+                        "worker",
+                        "worker",
+                        SpawnConfig::new("worker", "test prompt"),
+                        BackendType::ClaudeCode,
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+
+        let agent_loop = AgentLoop {
+            member_id: "worker".into(),
+            session_key: "worker".into(),
+            team_id: "team-1".into(),
+            room_id: "main".into(),
+            orchestrator: orch,
+            inbox_service: inbox_service.clone(),
+            message_store: message_store.clone(),
+            message_service,
+            poll_interval: Duration::from_millis(50),
+            inbox_notifier: None,
+            member_store: None,
+        };
+
+        let driver = std::thread::spawn(move || script(output_tx, input_rx));
+        let loop_handle = agent_loop.start(output_rx);
+        driver.join().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        loop_handle.shutdown();
+
+        // Keep dir alive for caller's assertions by leaking — only OK because
+        // tempdir auto-deletes when the binding drops. We move the dir into
+        // a long-lived handle the caller still holds (the stores).
+        std::mem::forget(dir);
+
+        (message_store, inbox_service)
+    }
+
+    /// Bug 25 regression: a turn that completes without any output text MUST
+    /// still produce a terminal message, otherwise the lead waits forever
+    /// for a reply that never comes.
+    #[test]
+    fn agent_loop_emits_system_status_on_silent_turn() {
+        let (message_store, inbox_service) = run_loop_with_script(|tx, mut rx| {
+            tx.blocking_send(AgentOutput::TurnComplete).unwrap(); // ready signal
+            let _ = rx.blocking_recv().unwrap();
+            // Worker produced ZERO output, then signalled TurnComplete.
+            tx.blocking_send(AgentOutput::TurnComplete).unwrap();
+        });
+
+        let messages = message_store.list_by_room("team-1", "main").unwrap();
+        let from_worker: Vec<_> = messages.iter().filter(|m| m.sender == "worker").collect();
+        assert_eq!(
+            from_worker.len(),
+            1,
+            "expected exactly one terminal message from worker"
+        );
+        assert!(
+            matches!(from_worker[0].kind, MessageKind::Status),
+            "silent turn should produce Status, not Reply: kind={:?}",
+            from_worker[0].kind
+        );
+        assert!(
+            from_worker[0].body.contains("[SYSTEM]")
+                && from_worker[0]
+                    .body
+                    .contains("completed its turn without producing any reply text"),
+            "unexpected body: {}",
+            from_worker[0].body
+        );
+
+        // Inbox should still be acked.
+        let inbox = inbox_service.peek("team-1", "worker", None).unwrap();
+        assert!(matches!(
+            inbox.items[0].status,
+            crate::team_mode::domain::InboxStatus::Acked
+        ));
+    }
+
+    /// Bug 25 regression: stdout pipe closing mid-turn (child crashed) MUST
+    /// surface a [SYSTEM] notice and stop the loop cleanly.
+    #[test]
+    fn agent_loop_emits_system_status_on_output_pipe_close() {
+        let (message_store, _inbox) = run_loop_with_script(|tx, mut rx| {
+            tx.blocking_send(AgentOutput::TurnComplete).unwrap(); // ready signal
+            let _ = rx.blocking_recv().unwrap();
+            // Worker emitted partial output, then the pipe died.
+            tx.blocking_send(AgentOutput::Delta("partial...".into()))
+                .unwrap();
+            drop(tx); // simulate child stdout pipe close
+        });
+
+        let messages = message_store.list_by_room("team-1", "main").unwrap();
+        let from_worker: Vec<_> = messages.iter().filter(|m| m.sender == "worker").collect();
+        assert_eq!(
+            from_worker.len(),
+            1,
+            "expected exactly one terminal message"
+        );
+        assert!(matches!(from_worker[0].kind, MessageKind::Status));
+        assert!(
+            from_worker[0].body.contains("output channel closed"),
+            "unexpected body: {}",
+            from_worker[0].body
+        );
+        assert!(
+            from_worker[0].body.contains("partial..."),
+            "should include the partial output: {}",
+            from_worker[0].body
+        );
     }
 }

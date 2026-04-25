@@ -620,6 +620,49 @@ case-insensitive; check spelling."。
 
 ---
 
+### Bug 25: worker turn 静默结束 / 进程崩溃时 lead 没反馈
+
+**位置**：`src/runtime/agent_loop.rs::run` step 4-5
+
+**症状**：
+- worker 完整收到 dispatch 但 LLM 没产出任何文字（指令不遵循 / 拒答 /
+  内容被过滤），`type:result` 一来就 break，旧代码 `if !body.is_empty()`
+  跳过 send，inbox 默默 ack，lead 永远等不到反馈。
+- worker 子进程 stdout pipe 中途关闭（崩溃 / OOM / 被外部 kill），
+  `output_rx.recv()` 返回 None，旧代码 `None => return` 直接退出
+  AgentLoop，连 [SYSTEM] 都不发，lead 完全失明。
+- 与 Bug 17（send_input fail）互补：Bug 17 处理"进 turn 之前进程已死"，
+  Bug 25 处理"进 turn 之后进程死"和"进 turn 但产出为空"。
+
+**用户说法**：worker 处理完任务后 lead 应该都能感知，无论是回复还是
+"什么都没说就停了"。但是不能因此发两条（reply + 完成通知）—— reply
+本身就是"完成"信号，多发就是噪音。
+
+**修复**：每次处理一条 inbox dispatch，AgentLoop 必须输出**恰好一条**
+终结消息回 room：
+
+| 终结条件 | end_cause | 内容 | kind |
+|---|---|---|---|
+| 有可见文字（trim 后非空） | 任意 | worker 实际输出 | `Reply` |
+| 空输出 + TurnComplete | TurnComplete | `[SYSTEM] worker 'X' completed its turn without producing any reply text for msg <id>...` | `Status` |
+| 空输出 + AgentError | AgentError | `[SYSTEM] worker 'X' raised an agent error...` | `Status` |
+| 任意 + 输出 pipe 关闭 | OutputClosed | `[SYSTEM] worker 'X' output channel closed mid-turn... use worker_add on_existing=reuse to revive` | `Status` |
+
+实现上把 `let mut end_cause` 模式换成 `let end_cause: TurnEndCause = loop { ... break <expr> ... }`。
+`OutputClosed` 路径在发完 [SYSTEM] + ack 后退出 AgentLoop（pipe 死了
+没法处理新消息）。
+
+测试加两个：`agent_loop_emits_system_status_on_silent_turn`（验证空输出
+也产出 Status）+ `agent_loop_emits_system_status_on_output_pipe_close`
+（验证 None 路径仍发 [SYSTEM] 并把已收到的 partial 内容附在 body 里）。
+
+**为什么不加超时**（防 worker hang 永不返回 type:result）：现实中
+hang 几乎都是 LLM 长思考的合法场景，加错超时就误报；当真 hang 时进程
+通常活着，用户可手动 kill 触发 OutputClosed 路径。如果未来真出问题，
+再加可配置的 `TEAM_MODE_TURN_HARD_TIMEOUT_SEC`。
+
+---
+
 ### Bug 24: Web UI 右栏对无 session_id 的 worker 串台到 lead
 
 **位置**：`src/team_mode_web/read_model.rs::conversation_for_member`
