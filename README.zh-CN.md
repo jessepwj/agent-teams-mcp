@@ -41,9 +41,11 @@ bash scripts/setup.sh
 claude   # 在仓库根目录启动 Claude Code
 ```
 
-setup 脚本会校验前置条件（cargo、node）、build 两个 release 二进制（`team_mode_mcp` + `team_mode_daemon`）、跑 300 个单元测试、并打印下一步指引。改完代码任何时候都能重跑。
+setup 脚本会校验前置条件（cargo、node）、build 两个 release 二进制（`team_mode_mcp` + `team_mode_daemon`）、**从 `.mcp.json.template` 生成带绝对路径的 `.mcp.json`**、跑 300 个单元测试、并打印下一步指引。改完代码或移动仓库后任何时候都能重跑。
 
-仓库已经自带 `.mcp.json`（用 `${CLAUDE_PROJECT_DIR}` 的项目相对路径）和 `.claude/settings.json`（用于真·推送的 Stop hook） —— 两者都会在启动 CC 时自动加载，无需手动接线。
+仓库自带 `.claude/settings.json`（用于真·推送的 Stop hook）和 `.mcp.json.template`。真正的 `.mcp.json` 是 gitignored 的，因为里面有你这台机器的绝对二进制路径 —— 由 setup 生成。
+
+> **为什么不在 `.mcp.json` 里用 `${CLAUDE_PROJECT_DIR}`？** Claude Code 不会展开 `mcpServers.command` 字段里的 env-var 占位符（只有 `hooks` 字段会展开）。所以我们在 setup 时生成带绝对路径的文件。**移动仓库后必须重跑 setup**。
 
 进入 Claude Code 会话后，用 `/mcp` 检查 —— 应该能看到 `team-mode` 已连接。如有问题请看 [`docs/open-source-deployment.md`](docs/open-source-deployment.md)。
 

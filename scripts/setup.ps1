@@ -43,11 +43,24 @@ if (-not (Test-Path $DaemonBin)) { Fail "missing: $DaemonBin" }
 Ok $McpBin
 Ok $DaemonBin
 
-Step "3/4 Smoke-running cargo test --lib (300 tests, <2s)"
+Step "3/4 Generating .mcp.json with absolute path"
+
+$Template = Join-Path $RepoRoot ".mcp.json.template"
+$Target   = Join-Path $RepoRoot ".mcp.json"
+if (-not (Test-Path $Template)) { Fail ".mcp.json.template missing - corrupt clone?" }
+
+# Use forward slashes in the JSON value: Windows spawn accepts them, AND
+# JSON would otherwise turn '\a' (e.g. in 'E:\aigc\...') into BEL etc.
+$McpBinForJson = $McpBin -replace '\\', '/'
+(Get-Content $Template -Raw) -replace 'REPLACE_ME_WITH_ABS_PATH', $McpBinForJson | Set-Content -Path $Target -NoNewline -Encoding UTF8
+Ok "Wrote $Target"
+Ok "  command = $McpBinForJson"
+
+Step "4/5 Smoke-running cargo test --lib (300 tests, <2s)"
 cargo test --lib --quiet 2>&1 | Select-Object -Last 3
 if ($LASTEXITCODE -ne 0) { Fail "cargo test failed (exit $LASTEXITCODE)" }
 
-Step "4/4 Setup complete. Next steps:"
+Step "5/5 Setup complete. Next steps:"
 @"
 
   1. From this directory, launch Claude Code:

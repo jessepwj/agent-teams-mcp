@@ -55,22 +55,26 @@ DAEMON_BIN="$REPO_ROOT/target/release/team_mode_daemon${EXE_SUFFIX}"
 [ -f "$MCP_BIN"    ] && print_ok "$MCP_BIN"    || { print_fail "missing: $MCP_BIN"; exit 1; }
 [ -f "$DAEMON_BIN" ] && print_ok "$DAEMON_BIN" || { print_fail "missing: $DAEMON_BIN"; exit 1; }
 
-# ---------- POSIX EXE_EXT advice ----------
-print_step "3/5 Verifying .mcp.json compatibility on this OS"
+# ---------- generate .mcp.json from template ----------
+print_step "3/5 Generating .mcp.json with absolute path"
 
-if [ "$IS_WINDOWS" = "0" ]; then
-  if [ "${EXE_EXT:-}" != "" ]; then
-    print_warn "EXE_EXT is currently '$EXE_EXT'. The .mcp.json default uses \${EXE_EXT:-.exe}."
-    print_warn "POSIX users should run:  export EXE_EXT=\"\""
-    print_warn "(Add to ~/.bashrc or ~/.zshrc to persist across shells.)"
-  else
-    print_warn "Detected POSIX OS. Before launching Claude Code, run:"
-    print_warn "    export EXE_EXT=\"\""
-    print_warn "(Otherwise .mcp.json's \${EXE_EXT:-.exe} will resolve to '.exe' and CC won't find the binary.)"
-  fi
+TEMPLATE="$REPO_ROOT/.mcp.json.template"
+TARGET="$REPO_ROOT/.mcp.json"
+[ -f "$TEMPLATE" ] || { print_fail ".mcp.json.template missing — corrupt clone?"; exit 1; }
+
+# Always emit forward-slash paths in JSON (Windows spawn accepts both, but
+# JSON turns "\\a", "\\t" etc. into BEL/TAB so backslashes are unsafe).
+# `cygpath -m` gives Windows path with forward slashes (e.g. "E:/foo/bar").
+if [ "$IS_WINDOWS" = "1" ] && command -v cygpath >/dev/null 2>&1; then
+  MCP_BIN_FOR_JSON="$(cygpath -m "$MCP_BIN")"
 else
-  print_ok "Windows detected — .mcp.json default works as-is."
+  MCP_BIN_FOR_JSON="$MCP_BIN"
 fi
+
+# sed with | delimiter; the placeholder string contains nothing requiring escape.
+sed "s|REPLACE_ME_WITH_ABS_PATH|$MCP_BIN_FOR_JSON|g" "$TEMPLATE" > "$TARGET"
+print_ok "Wrote $TARGET"
+print_ok "  command = $MCP_BIN_FOR_JSON"
 
 # ---------- test sweep ----------
 print_step "4/5 Smoke-running cargo test --lib (300 tests, <2s)"
@@ -93,9 +97,10 @@ cat <<EOF
        (wait for reply to push automatically)
        team_delete({"name":"smoke"})
 
-  IMPORTANT — after editing .mcp.json or .claude/settings.json:
+  IMPORTANT — after editing .mcp.json or .claude/settings.json (or
+  re-running this script with a moved repo):
      You MUST fully restart Claude Code (kill all CC windows + relaunch).
-     '/mcp reconnect' alone does NOT pick up hook changes.
+     '/mcp reconnect' alone does NOT pick up hook or path changes.
 
   Read docs/usage-tips.md for the do's and don'ts.
 

@@ -1,0 +1,13 @@
+{
+  "_comment_template": "This is the TEMPLATE. scripts/setup.sh / setup.ps1 reads it, substitutes the placeholder below with the absolute path of the just-built binary, and writes the result to `.mcp.json` (gitignored). Do not edit `.mcp.json` directly — re-run setup after any path change.",
+  "_comment_devs": "Why a template: Claude Code's `mcpServers.command` field does NOT expand env-var-style placeholders like ${CLAUDE_PROJECT_DIR} (only `hooks` does). So we have to write a literal absolute path, and the only portable way to get one is to generate it at setup time. Always use forward slashes in `command` — Windows accepts them and JSON would otherwise turn '\\a' into BEL etc.",
+  "mcpServers": {
+    "team-mode": {
+      "command": "REPLACE_ME_WITH_ABS_PATH",
+      "args": [],
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}
