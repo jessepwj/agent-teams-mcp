@@ -1291,7 +1291,13 @@ impl TeamModeToolset {
                 Value::String(
                     "Replies will arrive automatically as a <system-reminder> \
                      when your next turn starts. Do NOT call inbox_read or \
-                     sleep — just end your turn and continue when reminded."
+                     sleep — just end your turn and continue when reminded. \
+                     If reminders never arrive (worker IS replying — check \
+                     `.lead-pending-wake.log` for new entries), the Stop hook \
+                     in `.claude/settings.json` is not loaded. Fully restart \
+                     Claude Code (NOT just `/mcp reconnect` — hooks only load \
+                     at CC startup). After any change to `.mcp.json` or \
+                     `.claude/settings.json`, a full CC restart is required."
                         .into(),
                 ),
             );

@@ -16,8 +16,15 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-ROOT = Path(r"E:\aigc内容整理\agent-teams-rs-team-mode")
-MCP_BIN = ROOT / "target" / "debug" / "team_mode_mcp.exe"
+ROOT = Path(__file__).resolve().parent
+EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
+# Default to release; override with TEAM_MODE_MCP_BIN if you want debug build.
+MCP_BIN = Path(
+    os.environ.get(
+        "TEAM_MODE_MCP_BIN",
+        str(ROOT / "target" / "release" / f"team_mode_mcp{EXE_SUFFIX}"),
+    )
+)
 LOG_PATH = ROOT / "mcp_server.log"
 TEAMS_DIR = Path(os.path.expanduser("~")) / ".claude" / "teams" / "mcp-test"
 

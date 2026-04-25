@@ -1,8 +1,8 @@
 {
-  "_comment": "Local-development MCP config. Points at target/debug because cargo build (default) writes there; that way changes to team-mode code are picked up by the next /mcp reconnect. End-user install flow uses cargo build --release + copying the binary onto PATH (see README). If you change this to release, every dev cycle has to run cargo build --release manually — don't.",
+  "_comment": "Default points at the release build with project-relative path. Build with: cargo build --release --bin team_mode_mcp --bin team_mode_daemon. ${EXE_EXT:-.exe} = '.exe' on Windows; POSIX users: export EXE_EXT=\"\" before starting Claude Code. For dev iteration, locally override to target/debug — but DO NOT commit that.",
   "mcpServers": {
     "team-mode": {
-      "command": "E:/aigc内容整理/agent-teams-rs-team-mode/target/debug/team_mode_mcp.exe",
+      "command": "${CLAUDE_PROJECT_DIR}/target/release/team_mode_mcp${EXE_EXT:-.exe}",
       "args": [],
       "env": {
         "RUST_LOG": "info"

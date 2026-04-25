@@ -336,7 +336,7 @@ bun test web/team-mode/app.smoke.test.mjs
 当前前端 smoke 结果：
 
 ```text
-19 pass
+20 pass
 0 fail
 ```
 
@@ -354,6 +354,7 @@ bun test web/team-mode/app.smoke.test.mjs
 - 刷新失败与 Retry 恢复
 - stale detail error 清理后重新打开 Lead Activity
 - 成员进程会话打开
+- 成员进程会话首次打开默认滚动到底部
 - 会话内容中工具调用和工具结果配对渲染
 - 会话按工作轮次展示，并突出最终回复
 - 后台成员刷新失败时保留已缓存详情

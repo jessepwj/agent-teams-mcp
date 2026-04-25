@@ -1,7 +1,0 @@
-[2026-04-22T12:05:05.630Z] hook fired
-[2026-04-22T12:05:05.632Z] pending empty, exit 0
-[2026-04-22T12:05:27.716Z] trigger-delayed wrote pending: "场景B-空闲wake测试"
-[2026-04-22T12:05:28.473Z] hook fired
-[2026-04-22T12:05:28.479Z] injected 1 msg(s), cleared pending, exit 2
-[2026-04-22T12:05:29.261Z] hook fired
-[2026-04-22T12:05:29.263Z] pending empty, exit 0

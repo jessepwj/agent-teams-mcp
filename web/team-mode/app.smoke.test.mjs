@@ -978,6 +978,24 @@ test("focusing lead opens the process conversation", async () => {
   assert.match(harness.document.getElementById("detailBody").innerHTML, /团队状态正常/);
 });
 
+test("member conversation opens scrolled to the bottom by default", async () => {
+  const payloads = basePayloads();
+  const harness = createHarness({
+    hash: "#member=lead",
+    fetchImpl: async (url) => payloads[url] ?? failedJson(404, "Not Found"),
+  });
+  const detailPane = harness.document.getElementById("detailPane");
+  detailPane.clientHeight = 100;
+  detailPane.scrollHeight = 1000;
+  detailPane.scrollTop = 0;
+
+  await harness.start();
+  detailPane.scrollHeight = 1400;
+  await flushTimers();
+
+  assert.equal(detailPane.scrollTop, 1400);
+});
+
 test("process conversation pairs tool calls into collapsible rows", async () => {
   const payloads = basePayloads();
 

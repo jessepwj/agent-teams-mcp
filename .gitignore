@@ -21,7 +21,14 @@ debug
 
 # Environment and local config
 .env
-.claude/
+
+# Local Claude Code overrides — keep .claude/settings.json tracked (ships
+# with the OSS repo so the Stop hook is wired on first clone). Ignore the
+# user-private overrides only.
+.claude/settings.local.json
+.claude/.credentials.json
+.claude/cache/
+.claude/projects/
 
 # team_mode_mcp runtime data directories (both old and new)
 .agent-teams/
@@ -43,3 +50,9 @@ Cargo.lock
 
 # Scratch / working notes not meant for the repo
 docs/中间内容.txt
+
+# Local-only working tree leftovers
+/test-wake/
+/mcp_server.log
+# NOTE: vendor/ is intentionally TRACKED — Cargo.toml [patch.crates-io] points
+# at vendor/* paths, so removing vendor would break `cargo build` for fresh clones.

@@ -9,6 +9,10 @@
   <img alt="Tests" src="https://img.shields.io/badge/tests-282%20passing-brightgreen.svg">
 </p>
 
+<p align="right">
+  <a href="README.zh-CN.md">中文文档 →</a>
+</p>
+
 # agent-teams-mcp
 
 **`agent-teams-mcp`** is a [Model Context Protocol](https://modelcontextprotocol.io) server written in Rust that turns your Claude Code CLI into a **team lead** — it can spawn and coordinate worker agents (Claude Code, Codex, Gemini CLI) inside managed subprocesses, and route `@mention`-style messages between them.
@@ -22,27 +26,39 @@ The biggest differentiator: **true push notifications from workers back to the l
 
 ---
 
-## TL;DR
+## TL;DR — fresh clone in 1 command
 
 ```bash
-# 1. Build
-cargo build --release --bin team_mode_mcp
+git clone https://github.com/jessepwj/agent-teams-mcp
+cd agent-teams-mcp
 
-# 2. Wire it into your Claude Code .mcp.json
-cat > .mcp.json <<'EOF'
-{
-  "mcpServers": {
-    "team-mode": {
-      "command": "/abs/path/to/target/release/team_mode_mcp",
-      "args": []
-    }
-  }
-}
-EOF
+# One-shot bootstrap (cross-platform):
+bash scripts/setup.sh
+# or:  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 
-# 3. (Strongly recommended) Wire the FileChanged push hook
-#    See docs/push-notifications.md
+# Then:
+claude   # launch Claude Code from the repo root
 ```
+
+The setup script verifies prerequisites (cargo, node), builds both
+release binaries (`team_mode_mcp` + `team_mode_daemon`), runs the 300
+unit tests, and prints next steps. Re-run any time after a code change.
+
+The repo ships `.mcp.json` (project-relative path via `${CLAUDE_PROJECT_DIR}`)
+and `.claude/settings.json` (Stop hook for true push) — both auto-load on
+first run, no manual wiring required.
+
+Inside the Claude Code session, verify with `/mcp` — you should see
+`team-mode` connected. If anything fails, see
+[`docs/open-source-deployment.md`](docs/open-source-deployment.md).
+
+> **⚠ One critical pitfall:** any change to `.mcp.json` or
+> `.claude/settings.json` requires a **full Claude Code restart**
+> (close all CC windows + relaunch). `/mcp reconnect` alone does NOT
+> reload hook configuration. If worker replies stop arriving as
+> `<system-reminder>` after a config change, this is almost always why.
+> See [§3 below](#troubleshooting--worker-replies-arent-pushing) for
+> the triage steps.
 
 Then inside your Claude Code session:
 
@@ -181,50 +197,89 @@ See [`docs/mcp-tools-reference.md`](docs/mcp-tools-reference.md) for full schema
 ```bash
 git clone https://github.com/jessepwj/agent-teams-mcp
 cd agent-teams-mcp
-cargo build --release --bin team_mode_mcp
+cargo build --release --bin team_mode_mcp --bin team_mode_daemon
 ```
 
-The binary lives at `target/release/team_mode_mcp`. Copy it somewhere on your `PATH` or reference it by full path.
+You need **both** binaries — `team_mode_mcp` is the thin stdio relay Claude
+Code spawns, and `team_mode_daemon` is the detached process that owns
+worker subprocesses and survives `/mcp reconnect`.
 
-### Claude Code wiring
+### Zero-config wiring (recommended)
 
-Add to `.mcp.json` at your project root (or `~/.claude/mcp.json` globally):
+The repo ships with a working `.mcp.json` and `.claude/settings.json` at
+the project root, both pointing at the just-built release binaries via
+`${CLAUDE_PROJECT_DIR}`. **Just launch Claude Code from the repo root** —
+both the MCP server and the Stop hook auto-load on first turn.
 
-```json
-{
-  "mcpServers": {
-    "team-mode": {
-      "command": "/absolute/path/to/team_mode_mcp",
-      "args": [],
-      "env": {
-        "RUST_LOG": "info"
-      }
-    }
-  }
-}
+POSIX users only: `export EXE_EXT=""` before launching CC, otherwise the
+default `${EXE_EXT:-.exe}` resolves to `.exe` and the binary won't be found.
+
+### Custom location / PATH install
+
+If you want the binary on `PATH` instead of project-relative:
+
+```bash
+cp target/release/team_mode_mcp target/release/team_mode_daemon /usr/local/bin/
 ```
 
-### FileChanged push hook (optional, strongly recommended)
+Then edit `.mcp.json` to use `"command": "team_mode_mcp"` (no path).
+Set `TEAM_MODE_DAEMON_EXE=/usr/local/bin/team_mode_daemon` so the relay
+finds the daemon when it spawns it.
 
-See [`docs/push-notifications.md`](docs/push-notifications.md) for the full walkthrough. In short, add to `~/.claude/settings.json`:
+### Push notifications — already wired
 
-```json
-{
-  "hooks": {
-    "FileChanged": [{
-      "matcher": "lead_pending.jsonl",
-      "hooks": [{
-        "type": "command",
-        "command": "node /abs/path/to/scripts/hooks/lead-pending-wake.js",
-        "async": true,
-        "asyncRewake": true
-      }]
-    }]
-  }
-}
-```
+`.claude/settings.json` already contains the Stop hook that surfaces
+worker replies as `<system-reminder>` in your next CC turn. **Restart
+Claude Code after first clone** so it picks up the hook config (CC only
+loads hooks at startup). After that, every change to `.mcp.json` /
+`.claude/settings.json` requires a full CC restart, not just `/mcp reconnect`.
 
-Restart Claude Code (hook config is only loaded on startup). That's it — worker replies now appear in your session the moment they happen.
+For the design rationale (why Stop hook + JSON block + ancestor routing,
+not the older FileChanged + asyncRewake approach), see
+[`docs/push-notifications.md`](docs/push-notifications.md) and
+[`docs/hook-push-design.md`](docs/hook-push-design.md).
+
+### After first clone — sanity checklist
+
+1. `bash scripts/setup.sh` — succeeds (or `powershell scripts\setup.ps1` on Windows)
+2. `target/release/team_mode_mcp(.exe)` and `team_mode_daemon(.exe)` exist
+3. `claude` launched from repo root → `/mcp` shows `team-mode` connected
+4. Try `team_create({"name":"smoke"})` then `team_delete({"name":"smoke"})` — both succeed
+5. Read [`docs/usage-tips.md`](docs/usage-tips.md) for "what to do, what to avoid"
+
+If step 3 fails, check [`docs/open-source-deployment.md`](docs/open-source-deployment.md) — it has a full triage table for `/mcp` connection errors.
+
+---
+
+## Troubleshooting — worker replies aren't pushing
+
+This is the #1 issue OSS users hit. Symptoms: you call `send_message`,
+the tool returns success, but no `<system-reminder>` arrives in your next
+turn. Triage in this exact order:
+
+1. **Did you restart CC after first clone / after editing
+   `.claude/settings.json`?** Hooks are loaded **only** at CC startup —
+   `/mcp reconnect` does NOT pick them up. Quit all CC windows, relaunch
+   `claude`, retry.
+2. **Is the worker actually replying?** `tail -f .agent-teams/mcp.log` —
+   you should see `posting reply ... kind=Reply recipients=["lead"]`.
+   - No → worker is stuck (check the worker's adapter, e.g., is `codex`
+     installed and on PATH?).
+   - Yes → keep going.
+3. **Is the Stop hook firing?** `tail -f .lead-pending-wake.log` — you
+   should see `stop: injected N ...` lines.
+   - No entries at all → hook not loaded → see step 1.
+   - `cooldown active` or `stop_hook_active=true` → normal loop guard,
+     wait one turn.
+   - `injected 0, ancestors=[...]` → message belongs to a different CC
+     (multi-CC scenario); `rm lead_pending.jsonl` to clear stale entries.
+4. **Already did all of the above?** See
+   [`docs/open-source-deployment.md`](docs/open-source-deployment.md) for
+   the full table (15+ scenarios with fixes).
+
+The `send_message` tool's response `hint` field is intentionally chatty
+about this — if you ever see "If reminders never arrive ..." in a tool
+result, you've already hit the issue and should restart CC.
 
 ---
 

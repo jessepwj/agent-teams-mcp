@@ -35,6 +35,7 @@ const state = {
   memberActivity: null,
   memberConversationKey: "",
   memberConversationLoadingKey: "",
+  memberConversationScrollKey: "",
   memberConversation: null,
   detailRequestSeq: 0,
   language: "zh",
@@ -910,6 +911,7 @@ function clearMemberDetailCache() {
   state.memberActivity = null;
   state.memberConversationKey = "";
   state.memberConversationLoadingKey = "";
+  state.memberConversationScrollKey = "";
   state.memberConversation = null;
 }
 
@@ -1763,7 +1765,9 @@ function renderMemberConversation(name) {
   $("detailTitle").textContent = `${t("processSession")} · ${name}`;
 
   if (state.memberConversationKey === key && state.memberConversation) {
-    renderMemberConversationContent(name, state.memberConversation);
+    renderMemberConversationContent(name, state.memberConversation, {
+      forceBottom: state.memberConversationScrollKey !== key,
+    });
     return;
   }
 
@@ -1795,7 +1799,9 @@ async function refreshMemberConversation(name, { force = false } = {}) {
     state.memberConversation = data;
     state.memberConversationLoadingKey = "";
     if (state.detailTab === "session") {
-      renderMemberConversationContent(name, data);
+      renderMemberConversationContent(name, data, {
+        forceBottom: state.memberConversationScrollKey !== key,
+      });
     }
   } catch (error) {
     if (state.teamId !== teamId || state.selectedMemberName !== name) {
@@ -1810,7 +1816,8 @@ async function refreshMemberConversation(name, { force = false } = {}) {
   }
 }
 
-function renderMemberConversationContent(name, data) {
+function renderMemberConversationContent(name, data, { forceBottom = false } = {}) {
+  const key = memberDetailKey(state.teamId, name);
   $("detailTitle").textContent = `${t("processSession")} · ${name}`;
   const source = data.source || {};
   const sourceMeta = renderConversationSource(source);
@@ -1828,7 +1835,14 @@ function renderMemberConversationContent(name, data) {
 
   preserveDetailScroll(() => {
     $("detailBody").innerHTML = `${sourceMeta}${conversation}${limitations}`;
-  });
+  }, { forceBottom });
+  if (forceBottom) {
+    nextFrame(() => {
+      state.memberConversationScrollKey = key;
+    });
+  } else {
+    state.memberConversationScrollKey = key;
+  }
 }
 
 function renderConversationSource(source) {
@@ -2347,7 +2361,7 @@ function renderInlineMarkdown(text) {
     .join("");
 }
 
-function preserveDetailScroll(renderFn) {
+function preserveDetailScroll(renderFn, { forceBottom = false } = {}) {
   const pane = $("detailPane");
   const previousTop = pane?.scrollTop || 0;
   const previousHeight = pane?.scrollHeight || 0;
@@ -2355,7 +2369,7 @@ function preserveDetailScroll(renderFn) {
   renderFn();
   if (!pane) return;
   nextFrame(() => {
-    if (nearBottom) {
+    if (forceBottom || nearBottom) {
       pane.scrollTop = pane.scrollHeight;
     } else {
       pane.scrollTop = previousTop + Math.max(0, pane.scrollHeight - previousHeight);
