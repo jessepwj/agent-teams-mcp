@@ -387,6 +387,104 @@ stdout 里一行 `{"type":"system","subtype":"notification","key":"stop-hook-err
 
 ---
 
+### Bug 12: Worker 间 ping-pong 死循环（`parent.sender` auto-recipient）
+
+**位置**：`src/team_mode/service/message_service.rs::send()`
+
+**症状**：多 worker 团队下，alice 和 carol 互相 @ 之后，会无限互相礼貌回复
+（"收到"→"等待指示"→"等待下一步"→"保持待命"→…），持续 10+ 分钟，消耗 token。
+MCP log 可见每 5-15s 就有一次 `member=alice sender=carol` / `member=carol sender=alice` 交替。
+
+**根因**：`send()` 对 Reply kind 自动把 parent.sender 加入 `effective_recipients`。
+这是"自然聊天"语义：alice 回复 carol 的消息 → carol 自动收到 alice 的回复。但结合
+LLM 喜欢产出礼貌确认的天性，worker 间一旦开启对话就停不下来。
+
+**修复**：删除 parent.sender auto-recipient 规则。路由完全靠：
+1. body 里的显式 `@mention`（`parse_mentions_from_body`）
+2. Lead observability 规则（worker 发任何消息自动加 lead 为收件人）
+
+worker 如果没在 body 里写 `@alice` 就不会路由给 alice，自然收敛。
+
+**教训**：看起来符合直觉的"自动收件人"规则在 LLM 场景下要非常小心——人类知道何时
+停止礼貌回复，LLM 不知道。
+
+---
+
+### Bug 13: CC ESC 关闭 MCP stdin → 所有 workers 陪葬
+
+**位置**：架构层面，不是单一文件
+
+**症状**：用户在 CC 里按 ESC（打断 hook 或任意 tool 调用）后，MCP 连接断开，
+下次 /mcp reconnect 才能恢复；期间正在跑长任务的 workers 全部一起死。日志：
+```
+14:15:15 WARN MCP: stdin EOF — parent closed the pipe, exiting run_stdio
+```
+
+**根因**：**不是信号问题，是 IO 层面 CC 主动关了 MCP 的 stdin**。
+- 多轮尝试（FreeConsole / SetConsoleCtrlHandler / tokio::signal）都是信号层面，
+  对 stdin pipe close 无效
+- stdio MCP 协议规定 EOF=会话结束，MCP 规范退出是正确的
+- 但这导致 workers（MCP 的子进程）跟着 MCP 一起被 OS 收走
+
+**修复**：架构重构为 Strategy H detached daemon：
+- 新二进制 `team_mode_daemon` 持有 orchestrator + 所有 worker 进程
+- MCP 变成 stdio relay，只转发 JSON-RPC 到 daemon（通过 127.0.0.1 localhost TCP）
+- Daemon spawn 时 `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB`
+- MCP 死/重启不影响 daemon + workers
+- CC 全退出后 daemon 里的 `lead-watchdog` 发现 owner_cc_pid 都死 15s 后自杀
+
+**验证**：手动 `Stop-Process team_mode_mcp`，worker 进程 + daemon 均存活；
+重新 /mcp 连接后 `worker_list` 显示原 worker 仍 running，发消息正常走通。
+
+**详见**：`docs/worker-detach-refactor.md`
+
+---
+
+### Bug 14: 同项目无限创建 team 无约束
+
+**位置**：`src/team_mode/mcp/tools.rs::team_create`
+
+**症状**：同一 CC 可以无限调 `team_create` 创建多个 team，每个又能加 worker，
+资源失控。另外过去 session 留下的 orphan team（owner CC 已死）永远躺在磁盘上，
+新 team 创建时没反馈。
+
+**修复**：
+1. `team_create` 启动时枚举所有 team，按 `owner_cc_pid` 检查 liveness：
+   - 有活 team → 拒绝并列出
+   - 只剩 orphan → 自动清理，返回 `cleaned_orphan_teams` 字段
+2. `team_list` 为每个 team 加 `ownerStatus`（alive / orphan / unbound）字段，
+   用户一眼看清历史遗留
+3. `team_delete` 同时 prune `lead_pending.jsonl` 里该 team 的条目
+
+---
+
+### Bug 15: Web UI 显示的 worker 会话是 lead CC 的
+
+**位置**：`src/team_mode_web/read_model.rs::conversation_for_member`
+
+**症状**：web UI 右栏"进程会话 · worker"显示了 JSONL 文件路径，但内容是当前
+CC（lead）的对话，不是 worker 的。表现为用户问 worker 一个简单问题，web 却渲染
+出 lead 和用户讨论架构的上下文。
+
+**根因**：discovery 只按 mtime 排序取第一个 JSONL。CC 比 worker 写得更频繁，
+总是 CC 的 session 排在最前面。
+
+**修复**（两步）：
+1. 从 claude CLI 的 stream-json `system`/`init` 和 `result` 事件里捕获
+   `session_id`（UUID，= JSONL 文件名），存到 ClaudeCodeSession 的
+   `Arc<Mutex<Option<String>>>` 里
+2. `agent_loop` 每次处理完 turn 后查 `orchestrator.session_id_of()`，把最新
+   session_id 写回 `member.execution.session_id`（worker_add 时写不了，因为
+   stream-json 模式 spawn 后 claude CLI 静默，等首个用户消息才发 init 事件）
+3. web `read_model.conversation_for_member` 优先用 `execution.session_id`
+   在 discover_sessions 结果里做精确查找，找不到才回落到 mtime-first
+
+**附带 Windows 路径 bug**：`std::fs::canonicalize` 在 Windows 上会加 `\\?\`
+前缀，encoding 出来 `---E--aigc-...` 跟 claude CLI 实际创建的 `E--aigc-...`
+不匹配。`session_discovery.rs` 现在会 strip 该前缀并尝试多个路径变体。
+
+---
+
 ## 用户明确的设计原则
 
 以下是开发过程中用户多次强调的偏好，贡献者请尊重：
