@@ -521,15 +521,35 @@ async function handleStop(event, baseDir, pendingPath) {
     // makes the "infinite-loop" risk from repeatedly blocking effectively
     // zero; the loop markers below only change how long we are willing
     // to WAIT, never whether we inject real content.
-    const tryBlock = () => {
-        const c = classifyPending(pendingPath, ancestorSet);
+    // BATCH_GRACE_MS: when we detect at least one message ready to inject,
+    // pause briefly and re-scan once before actually blocking. This catches
+    // the case where the lead broadcasts to N workers and replies arrive
+    // staggered — the first reply hits pending, we'd inject it solo, and
+    // the next 2-3 replies (landing milliseconds later) would only surface
+    // on the *next* Stop hook cycle. 500ms is short enough to feel
+    // immediate to the user and long enough to coalesce a typical fan-out
+    // into a single "N 条新消息" reminder.
+    const BATCH_GRACE_MS = parseInt(
+        process.env.TEAM_MODE_STOP_BATCH_GRACE_MS || '500',
+        10
+    );
+
+    const tryBlock = async () => {
+        let c = classifyPending(pendingPath, ancestorSet);
         if (c.mine.length === 0) return false;
+        if (BATCH_GRACE_MS > 0) {
+            await sleep(BATCH_GRACE_MS);
+            // Re-classify; new entries from concurrent worker replies are
+            // additive — `c.mine` cannot shrink because nobody else drains
+            // pending while this hook holds it.
+            c = classifyPending(pendingPath, ancestorSet);
+        }
         writePeersBack(pendingPath, c.othersRaw, baseDir);
         writeCooldown(baseDir, sessionId);
         process.stdout.write(
             JSON.stringify({ decision: 'block', reason: renderReminder(c.mine) })
         );
-        log(baseDir, `stop: injected ${c.mine.length}, kept ${c.othersRaw.length} for peers [${routingNote}], exit 0 (block via JSON)`);
+        log(baseDir, `stop: injected ${c.mine.length} (batch grace ${BATCH_GRACE_MS}ms), kept ${c.othersRaw.length} for peers [${routingNote}], exit 0 (block via JSON)`);
         process.exit(0);
     };
 
@@ -537,7 +557,7 @@ async function handleStop(event, baseDir, pendingPath) {
     // Check pending BEFORE entering the wait loop. Pending can already hold
     // messages that arrived between the last hook fire and this one (e.g.
     // workers replied while CC was processing an injected batch).
-    tryBlock();
+    await tryBlock();
 
     // ---- Poll loop ----
     // Always wait the full TEAM_MODE_STOP_WAIT_SEC window regardless of
@@ -566,7 +586,7 @@ async function handleStop(event, baseDir, pendingPath) {
     log(baseDir, `stop: shepherd wait up to ${waitSec}s [${routingNote}] session=${sessionId || '?'}`);
     while (Date.now() < deadline) {
         await sleep(POLL_INTERVAL_MS);
-        tryBlock();
+        await tryBlock();
     }
     log(baseDir, `stop: wait timed out after ${waitSec}s, exit 0`);
     process.exit(0);

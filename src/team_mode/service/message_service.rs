@@ -103,14 +103,24 @@ impl MessageService {
             );
         }
 
+        // Build a lowercase->canonical-name index so `@Alice` and `@alice`
+        // both route to the on-disk `alice`. Worker names are validated to
+        // be all-lowercase at create time (validate_slug_name), but the
+        // sender writing the body may capitalize naturally.
+        let lc_active: HashMap<String, (String, MemberStatus)> = active_members
+            .iter()
+            .map(|(name, status)| (name.to_lowercase(), (name.clone(), status.clone())))
+            .collect();
+
         let mut effective_recipients = Vec::new();
         let mut dropped_for = Vec::new();
         for mention in &mention_candidates {
-            match active_members.get(&mention.handle) {
-                Some(status) if *status == MemberStatus::Active => {
-                    push_unique(&mut effective_recipients, mention.handle.clone());
+            let lookup = lc_active.get(&mention.handle.to_lowercase());
+            match lookup {
+                Some((canonical, MemberStatus::Active)) => {
+                    push_unique(&mut effective_recipients, canonical.clone());
                 }
-                Some(_) => dropped_for.push(DeliveryDrop {
+                Some((_, _)) => dropped_for.push(DeliveryDrop {
                     recipient: mention.raw.clone(),
                     reason: DropReason::RemovedMember,
                 }),

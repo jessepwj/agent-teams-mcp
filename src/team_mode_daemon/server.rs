@@ -190,8 +190,27 @@ fn run_lead_watchdog(team_store: TeamStore, toolset: Arc<TeamModeToolset>) {
             }
         };
 
+        // Empty team list now COUNTS as a "no live lead" round. Previously
+        // `team_delete` removing the last team froze the watchdog forever
+        // (counter reset every tick), so the daemon stayed up indefinitely
+        // holding a TCP port + a few MB of RAM. Treating empty as dead lets
+        // the daemon self-clean after the same 15s grace as the
+        // "all-owners-dead" path. A subsequent team_create still spawns a
+        // fresh daemon in ~1s.
         if teams.is_empty() {
-            consecutive_dead = 0;
+            consecutive_dead += 1;
+            tracing::debug!(
+                consecutive_dead,
+                grace = LEAD_WATCH_GRACE_CHECKS,
+                "lead-watchdog: no teams, counting toward grace"
+            );
+            if consecutive_dead >= LEAD_WATCH_GRACE_CHECKS {
+                tracing::info!(
+                    "lead-watchdog: no teams left for grace period, shutting down daemon"
+                );
+                drop(toolset);
+                std::process::exit(0);
+            }
             continue;
         }
 

@@ -142,8 +142,13 @@ pub fn list_members(state: &TeamModeWebState, team_id: &str) -> Result<MembersRe
         .ok_or_else(|| WebError::not_found(format!("team '{team_id}' not found")))?;
     let members = state.member_service.list_by_team(team_id)?;
     let messages = state.message_service.list_by_room(team_id, "main")?;
+    // Hide members removed via worker_remove from the web UI: they exist on
+    // disk so worker_add reuse can fast-resume them, but their `execution`
+    // still carries the last-known sessionState ("running") which would
+    // otherwise display as live workers in the Web sidebar.
     let views = members
         .into_iter()
+        .filter(|member| member.profile.status == MemberStatus::Active)
         .map(|member| member_summary_view(&team, &member, &messages))
         .collect();
     Ok(MembersResponse { members: views })
@@ -248,24 +253,57 @@ pub fn read_member_conversation(
 
     let sessions = session_discovery::discover_sessions(Path::new(&cwd));
     let requested_session_id = execution.and_then(|profile| profile.session_id.clone());
-    let selected_session = requested_session_id
-        .as_ref()
-        .and_then(|session_id| {
-            sessions
-                .iter()
-                .find(|session| &session.session_id == session_id)
-        })
-        .or_else(|| sessions.first());
+    let is_lead = matches!(member.profile.kind, MemberKind::Lead);
+
+    // For workers (not the lead), refuse the "latest mtime in cwd" fallback.
+    // In every realistic setup the lead's own CC instance writes JSONL into
+    // the same cwd, and CC writes far more often than any worker — so the
+    // mtime-first match would silently surface the lead/CC's transcript as
+    // the worker's "session". The user reads the worker's right pane and
+    // sees the lead's tool calls, with no signal that the wrong file was
+    // chosen.
+    //
+    // The correct behaviour for a worker that hasn't yet been observed:
+    // return an empty placeholder. session_id gets persisted by
+    // `agent_loop` after the FIRST `type:result` event, so as soon as the
+    // worker handles one inbox message the conversation pane fills in.
+    //
+    // The lead is exempt — for the lead, "the latest JSONL in cwd" IS the
+    // correct match (the lead IS the CC instance writing those events).
+    let selected_session = match (requested_session_id.as_ref(), is_lead) {
+        (Some(session_id), _) => sessions
+            .iter()
+            .find(|session| &session.session_id == session_id)
+            // For the lead, falling back to mtime-first is fine — the
+            // lead IS the CC writing in this cwd. For workers we already
+            // refuse the fallback above (worker without exact match shows
+            // empty), so this branch only applies when we matched.
+            .or_else(|| if is_lead { sessions.first() } else { None }),
+        (None, true) => sessions.first(),
+        (None, false) => None,
+    };
     let Some(session) = selected_session else {
+        let mut limitations = Vec::new();
+        let confidence = if !is_lead && requested_session_id.is_none() {
+            limitations.push(
+                "Worker has no captured backend session_id yet. \
+                 The session is recorded after the first `type:result` event \
+                 (i.e. once the worker has answered at least one message). \
+                 Refresh after sending the worker its first message."
+                    .into(),
+            );
+            "no_session_yet"
+        } else {
+            limitations.push(
+                "No Claude Code session JSONL file was found for this member cwd."
+                    .into(),
+            );
+            limitations
+                .push("The lookup is scoped to the member cwd first, then team cwd.".into());
+            "no_session_file"
+        };
         return Ok(empty_conversation(
-            name,
-            provider,
-            "no_session_file",
-            Some(cwd),
-            vec![
-                "No Claude Code session JSONL file was found for this member cwd.".into(),
-                "The lookup is scoped to the member cwd first, then team cwd.".into(),
-            ],
+            name, provider, confidence, Some(cwd), limitations,
         ));
     };
 
@@ -395,7 +433,13 @@ fn team_counts_from_parts(
     messages: &[Message],
     inbox_service: &crate::team_mode::service::InboxService,
 ) -> Result<TeamCountsView, WebError> {
-    let member_count = members.len();
+    // Count only Active members so the sidebar header matches the visible
+    // member list (which filters by status). Removed members linger on
+    // disk as fast-resume sources but should not show up in headcounts.
+    let member_count = members
+        .iter()
+        .filter(|member| member.profile.status == MemberStatus::Active)
+        .count();
     let active_worker_count = members
         .iter()
         .filter(|member| {

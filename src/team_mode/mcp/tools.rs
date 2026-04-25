@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -144,12 +144,15 @@ impl TeamModeToolset {
     }
 
     pub fn list_tools(&self) -> Vec<ToolDescriptor> {
+        // Tool descriptions are deliberately terse. Detailed guidance and
+        // failure-mode hints come back as `hint` / `note` fields in tool
+        // responses — that is just-in-time context, where attention is
+        // freshest. Static descriptions only carry the contract the AI
+        // must know to even begin a call.
         vec![
             tool(
                 "team_create",
-                "Create a team. A virtual 'lead' member is auto-created — the agent calling this MCP is that lead. `cwd` becomes the default working directory workers inherit unless they override it. \
-                 Only ONE live team per project is allowed: if a team already exists AND its owner CC is still alive, this call fails and the existing team's name is surfaced (delete it first). \
-                 If existing teams are all orphans (owner CC has died), they are auto-cleaned and a list of reaped team names is returned in `cleaned_orphan_teams`.",
+                "Create a team. The caller becomes its lead.",
                 json_schema(
                     &[
                         ("name", json!({"type":"string"})),
@@ -160,24 +163,19 @@ impl TeamModeToolset {
             ),
             tool(
                 "team_list",
-                "List all teams with their name, cwd, worker count, and `ownerStatus` (alive | orphan | unbound). \
-                 `alive` = the owner CC PID is still a running process. `orphan` = a previous CC created this team but has since died; the team's workers are dead too and it should be cleaned up. `unbound` = legacy entry without a recorded owner.",
+                "List teams.",
                 empty_object_schema(),
             ),
             tool(
                 "team_delete",
-                "Delete a team. Running workers are automatically shut down and stored records for this team are removed. Returns any shutdown failures so you can manually clean up orphan processes.",
+                "Delete a team and stop all its workers.",
                 json_schema(&[("name", json!({"type":"string"}))], &["name"]),
             ),
             tool(
                 "worker_add",
-                "Add a worker to a team AND start its managed agent process. \
-                 On the first add pass `adapter` (and optionally other config). \
-                 If a saved execution profile already exists for `name`, you MUST pass `on_existing` to tell MCP what to do: \
-                 `reuse` = fast-resume with the saved config (extra config fields you pass are ignored), \
-                 `overwrite` = replace saved config with what you pass now (adapter required), \
-                 `error` = refuse and surface the path so you can investigate. \
-                 `name` is a slug (letters/digits/_/-), cannot be 'lead', must be unique within the team. `cwd` defaults to the team's cwd when omitted.",
+                "Add a worker to a team and start its process. \
+                 Pass `adapter` on first add. If a saved profile for this name \
+                 already exists, also pass `on_existing` to choose what to do.",
                 json_schema(
                     &[
                         ("team", json!({"type":"string"})),
@@ -203,12 +201,12 @@ impl TeamModeToolset {
             ),
             tool(
                 "worker_list",
-                "List active workers in a team (lead is never listed). Returns `name`, `adapter`, `sessionState`.",
+                "List a team's workers and their state.",
                 json_schema(&[("team", json!({"type":"string"}))], &["team"]),
             ),
             tool(
                 "worker_remove",
-                "Remove a worker from the team: stop its process and mark the identity as removed. The on-disk execution profile is intentionally kept so the lead can later fast-resume via `worker_add` with `on_existing=reuse`.",
+                "Stop a worker's process. The on-disk profile is kept so it can be revived later with `worker_add on_existing=reuse`.",
                 json_schema(
                     &[
                         ("team", json!({"type":"string"})),
@@ -219,8 +217,10 @@ impl TeamModeToolset {
             ),
             tool(
                 "send_message",
-                "Send a message as the team's lead. `text` MUST contain at least one @handle AND every @handle in it MUST match an active worker — any unmatched @handles will cause the call to fail with the list of unmatched names. Example: `@alice please review the PR`. \
-                 IMPORTANT — DO NOT sleep-and-poll for replies. When the FileChanged+asyncRewake push hook is configured (see docs/push-notifications.md), every worker reply is auto-injected into your next turn as a <system-reminder>; just finish your turn and wait. Only call `inbox_read` as a fallback if you have confirmed the push hook is NOT configured, or you explicitly need to check backlog.",
+                "Send a message as team lead. `text` must contain at least one \
+                 @handle that matches an active worker (e.g. `@alice please review`). \
+                 Replies arrive automatically as a system-reminder when your \
+                 next turn starts — do not poll or sleep waiting for them.",
                 json_schema(
                     &[
                         ("team", json!({"type":"string"})),
@@ -231,7 +231,9 @@ impl TeamModeToolset {
             ),
             tool(
                 "inbox_read",
-                "FALLBACK ONLY — read messages addressed to the team's lead. The PRIMARY delivery channel is the FileChanged+asyncRewake push hook: when configured, worker replies surface automatically as <system-reminder> in your next turn — you should NOT sleep-and-poll after `send_message`. Use this tool only when: (a) you've confirmed the push hook is NOT configured, (b) you're explicitly checking backlog on session start, or (c) you suspect a message was missed. `limit` caps results (default 20, max 100). `unread_only=true` (default) skips already-acked messages. `auto_ack=true` marks returned messages as read+acked in the same call.",
+                "Read the lead's inbox. Replies normally arrive automatically \
+                 via the Stop hook; this tool is a fallback for explicit backlog \
+                 checks. `auto_ack=true` marks returned messages as read.",
                 json_schema(
                     &[
                         ("team", json!({"type":"string"})),
@@ -258,6 +260,7 @@ impl TeamModeToolset {
                 let teams = self.team_service.list()?;
                 let mut sys = sysinfo::System::new();
                 sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                let mut orphan_names: Vec<String> = Vec::new();
                 let decorated = teams
                     .into_iter()
                     .map(|team| {
@@ -266,6 +269,7 @@ impl TeamModeToolset {
                                 if sys.process(sysinfo::Pid::from_u32(pid)).is_some() {
                                     "alive"
                                 } else {
+                                    orphan_names.push(team.name.clone());
                                     "orphan"
                                 }
                             }
@@ -278,7 +282,22 @@ impl TeamModeToolset {
                         val
                     })
                     .collect::<Vec<_>>();
-                Ok(success(json!({ "teams": decorated })))
+                let mut payload = json!({ "teams": decorated });
+                if !orphan_names.is_empty() {
+                    if let Value::Object(map) = &mut payload {
+                        map.insert(
+                            "hint".into(),
+                            Value::String(format!(
+                                "Orphan teams (owner CC has died): [{}]. \
+                                 Their workers are gone; run `team_delete name=<x>` \
+                                 on each to free the one-live-team-per-project budget. \
+                                 (team_create also auto-cleans orphans when called.)",
+                                orphan_names.join(", ")
+                            )),
+                        );
+                    }
+                }
+                Ok(success(payload))
             }
             "team_delete" => self.team_delete(&args),
             "worker_add" => self.worker_add(&args),
@@ -297,6 +316,11 @@ impl TeamModeToolset {
                 "'lead' is reserved and cannot be used as a team name".into(),
             ));
         }
+        // Strict slug check so the team name stays @mention-able and safe
+        // for filesystem use across platforms. Catches uppercase, spaces,
+        // unicode, leading dots/dashes, and >64-byte names — all of which
+        // earlier silently slipped through and produced unreachable teams.
+        crate::util::validate_slug_name(&name)?;
 
         // Bind this team to the CC process that owns our MCP stdio session
         // (we are CC's child; our parent PID == CC's PID). Push routing will
@@ -435,8 +459,22 @@ impl TeamModeToolset {
 
         // Best-effort shutdown for every managed worker; collect failures
         // so the caller can clean up orphan processes if any.
+        //
+        // Skip rules:
+        //   - Members already in `Removed` status had `worker_remove` called
+        //     earlier; their orchestrator slot was cleaned up at that point.
+        //     Re-attempting shutdown only produces a noisy "session not
+        //     registered" error in the response that confuses the lead.
+        //   - "session not registered" / "MemberNotFound" failures during the
+        //     loop are also benign — they just mean the orchestrator already
+        //     forgot the spawn_key (daemon restart or earlier remove). We
+        //     drop those from `shutdown_failures` so only real shutdown
+        //     errors (a still-alive child the OS refused to kill) surface.
         if let Ok(members) = self.member_service.list_by_team(&team_name) {
             for record in members {
+                if matches!(record.profile.status, MemberStatus::Removed) {
+                    continue;
+                }
                 let key = spawn_key(&team_name, &record.profile.name);
                 let orch = Arc::clone(&self.runtime_orchestrator);
                 let key_clone = key.clone();
@@ -444,10 +482,23 @@ impl TeamModeToolset {
                     orch.lock().await.shutdown_managed_member(&key_clone).await
                 });
                 if let Err(err) = result {
-                    if !matches!(record.profile.kind, MemberKind::Lead) {
+                    let msg = err.to_string();
+                    // Filter benign "this session was already gone" errors
+                    // so the response only flags REAL shutdown failures
+                    // (a still-alive child the OS refused to kill). The
+                    // orchestrator surfaces session-not-found as either of
+                    // these two strings depending on which call path missed:
+                    //   - "no managed session registered for spawn_key '...'"
+                    //   - "Member '...' not found in team 'runtime'" (legacy
+                    //     path before the orchestrator dropped the "runtime"
+                    //     placeholder team — kept for older daemons)
+                    let is_already_gone = msg.contains("no managed session registered")
+                        || (msg.contains("not found") && msg.contains("'runtime'"));
+                    if !matches!(record.profile.kind, MemberKind::Lead) && !is_already_gone {
                         shutdown_failures.push(json!({
+                            "team": team_name.clone(),
                             "member": record.profile.name,
-                            "reason": err.to_string(),
+                            "reason": msg,
                         }));
                     }
                 }
@@ -495,6 +546,11 @@ impl TeamModeToolset {
                 "'lead' is a reserved name and cannot be used for a worker".into(),
             ));
         }
+        // Same strict slug check as team_create. Without this, names with
+        // spaces / uppercase / unicode were accepted but unreachable via
+        // @mention — workers existed in members.json but no message could
+        // ever route to them.
+        crate::util::validate_slug_name(&worker_name)?;
 
         let team = self
             .team_service
@@ -578,11 +634,28 @@ impl TeamModeToolset {
         // Idempotent reuse: if the orchestrator already has a live session
         // for this spawn_key, don't try to re-spawn (which would error
         // "already registered"). Just report the current state.
+        //
+        // If the worker was registered but has died (process gone), we drop
+        // the stale session entry now so the spawn path below can recreate
+        // a fresh one. Without this cleanup `spawn_managed_member` rejects
+        // any spawn_key already in its HashMap, so a `worker_add reuse` on
+        // a dead worker would fail with "already registered" — exactly the
+        // workflow the `[SYSTEM] worker died ... use on_existing=reuse to
+        // restart` notice tells the lead to perform.
         let spawn_key_pre = spawn_key(&team_name, &worker_name);
-        let already_live = self.async_runtime.block_on({
+        let (already_live, revived_from_dead) = self.async_runtime.block_on({
             let orch = Arc::clone(&self.runtime_orchestrator);
             let key = spawn_key_pre.clone();
-            async move { orch.lock().await.is_alive(&key).await.unwrap_or(false) }
+            async move {
+                let mut guard = orch.lock().await;
+                let alive = guard.is_alive(&key).await.unwrap_or(false);
+                let revived = if !alive && guard.has_session(&key) {
+                    guard.remove_dead_session_if_any(&key).await
+                } else {
+                    false
+                };
+                (alive, revived)
+            }
         });
         if matches!(mode, WorkerAddMode::Reuse) && already_live {
             // Make sure the on-disk session_state reflects reality and return.
@@ -796,13 +869,45 @@ impl TeamModeToolset {
             WorkerAddMode::Create => "create",
         };
 
+        let mut payload = json!({
+            "team": team_name.clone(),
+            "name": worker_name.clone(),
+            "sessionState": ready_state,
+            "mode": mode_str,
+        });
+        if let Value::Object(map) = &mut payload {
+            if revived_from_dead {
+                map.insert("revived_from_dead".into(), Value::Bool(true));
+                map.insert(
+                    "note".into(),
+                    Value::String(
+                        "Previous worker process was dead — its stale session was \
+                         dropped and a fresh process spawned. The worker has a new \
+                         conversation context (no memory of prior turns)."
+                            .into(),
+                    ),
+                );
+            }
+            // Reach out only on the create path: reuse already returns
+            // because the worker has been observed before, so the lead
+            // already knows the session_id timing trick.
+            if matches!(mode, WorkerAddMode::Create) {
+                map.insert(
+                    "hint".into(),
+                    Value::String(
+                        "Worker process started. Its backend session_id is captured \
+                         after the FIRST `type:result` event — i.e. once you send the \
+                         first @mention message and the worker replies. Until then, \
+                         the web UI 'process session' pane shows a placeholder for \
+                         this worker."
+                            .into(),
+                    ),
+                );
+            }
+        }
+
         Ok(success_with_updates(
-            json!({
-                "team": team_name.clone(),
-                "name": worker_name.clone(),
-                "sessionState": ready_state,
-                "mode": mode_str,
-            }),
+            payload,
             vec![team_uri(&team_name), inbox_uri(&team_name, &worker_name)],
         ))
     }
@@ -911,7 +1016,34 @@ impl TeamModeToolset {
                 })
             })
             .collect();
-        Ok(success(json!({ "workers": workers })))
+        let dead_names: Vec<String> = workers
+            .iter()
+            .filter_map(|w| {
+                let state = w.get("sessionState")?.as_str()?;
+                if state == "dead" {
+                    w.get("name")?.as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut payload = json!({ "workers": workers });
+        if !dead_names.is_empty() {
+            if let Value::Object(map) = &mut payload {
+                map.insert(
+                    "hint".into(),
+                    Value::String(format!(
+                        "Dead workers found: [{}]. Revive each with \
+                         `worker_add name=<x> on_existing=reuse`. The worker \
+                         will lose its prior conversation context but its \
+                         saved profile (adapter / model / system_prompt) \
+                         is reused automatically.",
+                        dead_names.join(", ")
+                    )),
+                );
+            }
+        }
+        Ok(success(payload))
     }
 
     fn send_message(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
@@ -934,31 +1066,141 @@ impl TeamModeToolset {
             ));
         }
 
-        // Build active worker set (excluding lead).
+        // Build active worker set (excluding lead). Also build a lowercase
+        // index so the mention parser can be case-insensitive while still
+        // routing to the canonically-cased name on disk.
         let members = self.member_service.list_active(&team_name)?;
-        let active_worker_names: HashSet<_> = members
+        let active_workers: Vec<String> = members
             .iter()
             .filter(|r| !matches!(r.profile.kind, MemberKind::Lead))
             .map(|r| r.profile.name.clone())
             .collect();
-
-        // Strict check: ALL @handles must resolve to an active worker.
-        let unmatched: Vec<_> = body_handles
+        let lc_index: HashMap<String, String> = active_workers
             .iter()
-            .filter(|h| !active_worker_names.contains(*h))
-            .cloned()
+            .map(|n| (n.to_lowercase(), n.clone()))
             .collect();
+
+        // Resolve @handles case-insensitively. Each user-visible handle in
+        // `body_handles` becomes the on-disk worker name when matched, or
+        // stays as the raw handle if unmatched (for the error message).
+        let mut resolved: Vec<String> = Vec::new();
+        let mut unmatched: Vec<String> = Vec::new();
+        for h in &body_handles {
+            match lc_index.get(&h.to_lowercase()) {
+                Some(canonical) => {
+                    if !resolved.iter().any(|r| r == canonical) {
+                        resolved.push(canonical.clone());
+                    }
+                }
+                None => {
+                    if !unmatched.iter().any(|u| u == h) {
+                        unmatched.push(h.clone());
+                    }
+                }
+            }
+        }
         if !unmatched.is_empty() {
-            let mut active_sorted: Vec<_> = active_worker_names.iter().cloned().collect();
+            let mut active_sorted: Vec<_> = active_workers.iter().cloned().collect();
             active_sorted.sort();
             return Err(Error::Other(format!(
-                "send_message: unmatched @mentions {:?}. Active workers in team '{}': {:?}",
+                "send_message: unmatched @mentions {:?}. Active workers in team '{}': {:?}. \
+                 (Mention matching is case-insensitive; check spelling.)",
                 unmatched, team_name, active_sorted
             )));
         }
 
+        // Liveness pre-check: any recipient whose process is dead would
+        // otherwise sit in their inbox forever (the agent_loop that would
+        // post a [SYSTEM] death notice only exists while the worker is
+        // alive, so a daemon-restart scenario silently strands the lead).
+        // For each dead recipient we synthesize a [SYSTEM] Status reply
+        // immediately, route it via lead-observability, and drop the
+        // recipient from the dispatch.
         let room_id = "main".to_string();
         self.room_service.ensure_main_room(&team_name)?;
+
+        let mut live_recipients: Vec<String> = Vec::new();
+        let mut dead_recipients: Vec<String> = Vec::new();
+        for recipient in &resolved {
+            let key = spawn_key(&team_name, recipient);
+            let alive = self.async_runtime.block_on({
+                let orch = Arc::clone(&self.runtime_orchestrator);
+                let key = key.clone();
+                async move { orch.lock().await.is_alive(&key).await.unwrap_or(false) }
+            });
+            if alive {
+                live_recipients.push(recipient.clone());
+            } else {
+                dead_recipients.push(recipient.clone());
+            }
+        }
+
+        // Emit [SYSTEM] notice for each dead recipient up-front so the lead
+        // does not wait on the Stop hook shepherd for a reply that will
+        // never arrive.
+        let mut system_notices: Vec<Value> = Vec::new();
+        for dead in &dead_recipients {
+            let notice = format!(
+                "[SYSTEM] worker '{dead}' is not alive — message not delivered. \
+                 Use `worker_add name={dead} on_existing=reuse` to spawn a fresh \
+                 process (the worker will lose prior conversation context)."
+            );
+            let sys_msg = self.message_service.send(SendMessageRequest {
+                team_id: team_name.clone(),
+                room_id: room_id.clone(),
+                sender: dead.clone(),
+                kind: MessageKind::Status,
+                subject: None,
+                body: notice.clone(),
+                mentions: Vec::new(),
+                visibility: Vec::new(),
+                audience_policy: None,
+                reply_to: None,
+                thread_id: None,
+                expires_at: None,
+            });
+            match sys_msg {
+                Ok(m) => system_notices.push(json!({
+                    "worker": dead,
+                    "message_id": m.id,
+                    "text": notice,
+                })),
+                Err(err) => {
+                    tracing::warn!(
+                        worker = %dead,
+                        error = %err,
+                        "failed to write [SYSTEM] dead-worker notice"
+                    );
+                }
+            }
+        }
+
+        if live_recipients.is_empty() {
+            // All targeted workers were dead. Don't write a no-op dispatch
+            // — return a structured error listing the dead names so the
+            // tool caller sees the failure without scrolling through the
+            // [SYSTEM] reply chain.
+            return Err(Error::Other(format!(
+                "send_message: all targeted workers are dead {:?} in team '{}'. \
+                 [SYSTEM] notices have been posted to the lead inbox. \
+                 Restart with `worker_add on_existing=reuse` before retrying.",
+                dead_recipients, team_name
+            )));
+        }
+
+        // Rewrite the body so the dispatch only carries live mentions. The
+        // worker text routing already filters, but pruning here keeps the
+        // visible body clean. We replace each dead @handle with [worker
+        // unavailable: name] inline.
+        let mut filtered_body = text.clone();
+        for dead in &dead_recipients {
+            // Try canonical case first, then the raw handle as it appeared.
+            let pat = format!("@{dead}");
+            filtered_body = filtered_body
+                .replace(&pat, &format!("[worker unavailable: {dead}]"));
+        }
+        // Mentions for live recipients are already in `filtered_body`. The
+        // message_service will re-parse and route to live ones only.
 
         let message = self.message_service.send(SendMessageRequest {
             team_id: team_name.clone(),
@@ -966,8 +1208,8 @@ impl TeamModeToolset {
             sender: LEAD_NAME.into(),
             kind: MessageKind::Dispatch,
             subject: None,
-            body: text,
-            mentions: Vec::new(),
+            body: filtered_body,
+            mentions: live_recipients.clone(),
             visibility: Vec::new(),
             audience_policy: None,
             reply_to: None,
@@ -994,13 +1236,49 @@ impl TeamModeToolset {
             .map(Value::String)
             .collect();
 
-        Ok(success_with_updates(
-            json!({
-                "message": message,
-                "matched_recipients": matched_recipients,
-            }),
-            updated,
-        ))
+        let mut payload = json!({
+            "message": message,
+            "matched_recipients": matched_recipients,
+        });
+        if let Value::Object(map) = &mut payload {
+            // Always reinforce the "no polling" rule on every successful
+            // send. The whole reason for putting it here (vs the static
+            // tool description) is that this is the moment the model is
+            // most tempted to follow up with a sleep / inbox_read loop.
+            map.insert(
+                "hint".into(),
+                Value::String(
+                    "Replies will arrive automatically as a <system-reminder> \
+                     when your next turn starts. Do NOT call inbox_read or \
+                     sleep — just end your turn and continue when reminded."
+                        .into(),
+                ),
+            );
+            if !dead_recipients.is_empty() {
+                map.insert(
+                    "dead_recipients".into(),
+                    Value::Array(
+                        dead_recipients
+                            .iter()
+                            .cloned()
+                            .map(Value::String)
+                            .collect::<Vec<_>>(),
+                    ),
+                );
+                map.insert("system_notices".into(), Value::Array(system_notices));
+                let dead_names = dead_recipients.join(", ");
+                map.insert(
+                    "dead_recipients_hint".into(),
+                    Value::String(format!(
+                        "Workers [{dead_names}] were skipped because their process is gone. \
+                         Revive each with `worker_add name=<x> on_existing=reuse` (the worker \
+                         loses prior conversation context) before retrying."
+                    )),
+                );
+            }
+        }
+
+        Ok(success_with_updates(payload, updated))
     }
 
     fn inbox_read(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
@@ -1061,13 +1339,31 @@ impl TeamModeToolset {
             .map(|c| c.unread)
             .unwrap_or(0);
 
-        Ok(success(json!({
+        let mut payload = json!({
             "team": team_name,
             "lead": LEAD_NAME,
             "unread_count": unread_count,
             "total_returned": messages_out.len(),
             "messages": messages_out,
-        })))
+        });
+        // Inbox is a fallback channel — when it returns nothing, surface a
+        // hint so the model doesn't fall into a poll loop. The Stop hook
+        // delivers replies as `<system-reminder>` automatically; calling
+        // this tool without backlog-checking intent is wasted work.
+        if messages_out.is_empty() {
+            if let Value::Object(map) = &mut payload {
+                map.insert(
+                    "hint".into(),
+                    Value::String(
+                        "No messages in inbox. Worker replies arrive automatically \
+                         via the Stop hook on your next turn — calling inbox_read \
+                         is rarely needed; only useful for explicit backlog audits."
+                            .into(),
+                    ),
+                );
+            }
+        }
+        Ok(success(payload))
     }
 
     fn member_store_members_file_hint(&self, team_name: &str) -> String {

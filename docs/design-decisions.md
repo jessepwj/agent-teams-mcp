@@ -485,6 +485,194 @@ CC（lead）的对话，不是 worker 的。表现为用户问 worker 一个简�
 
 ---
 
+### Bug 16: `worker_add on_existing=reuse` 对 dead worker 失败
+
+**位置**：`src/team_mode/mcp/tools.rs::worker_add` + `src/runtime/orchestrator.rs`
+
+**症状**：worker 进程死后调 `worker_add on_existing=reuse` 报
+`"Managed member 'edgetest__bob' is already registered"`。讽刺的是
+`[SYSTEM] worker died` 通知里就明确建议用户 "use worker_add with
+on_existing=reuse to restart"，按指引操作必败。
+
+**根因**：reuse 短路只在 `already_live==true` 时生效；dead worker 落到
+`spawn_managed_member`，那里 hard-rejects 任何已注册 spawn_key。Bug 5 fix
+只覆盖"进程活"场景，没清理 dead session 注册。
+
+**修复**：
+1. orchestrator 加 `remove_dead_session_if_any(&spawn_key)`：检测进程是否
+   还活、活的不动、死了 drop HashMap entry + session_registry handle。
+2. `worker_add` reuse 路径在 liveness 查询同事务里：dead → 调上述清理 →
+   走正常 spawn 路径。响应里加 `revived_from_dead: true` + `note` 字段
+   说明"新进程不继承旧对话上下文"。
+
+---
+
+### Bug 17: daemon 重启后给 dead worker 发消息永远无 [SYSTEM] 反馈
+
+**位置**：`src/team_mode/mcp/tools.rs::send_message`
+
+**症状**：daemon 被外部杀后自动重建，新 daemon 把所有旧 worker 标 dead；
+但 `send_message @dead_worker` 仍返回 `delivered`，lead 永远收不到死亡
+通知，Stop hook 阻塞到 7200s 超时。
+
+**根因**：现有 `[SYSTEM]` 通知由 `agent_loop::send_input failure` 发出。
+daemon 重启后没起 agent_loop（worker 已死），dispatch 进了无主 inbox 没
+路径触发死亡反馈。
+
+**修复**：`send_message` 派发前对每个 effective_recipient 查
+`orchestrator.is_alive`：
+- 全 dead → fail-fast 错误，列名提示用 reuse 复活；同时已写
+  [SYSTEM] notice 到 lead inbox。
+- 部分 dead → body 自动改写为 `[worker unavailable: <name>]`，对 alive
+  recipient 正常派发；为每个 dead recipient 立即写 [SYSTEM] reply；
+  返回 `dead_recipients` + `system_notices` + `dead_recipients_hint`。
+
+---
+
+### Bug 18: orchestrator 错误信息暴露内部 "runtime" 假名
+
+**位置**：`src/runtime/orchestrator.rs`
+
+**症状**：`team_delete` 的 `shutdown_failures` 里出现
+`"Member 'edgetest__alice' not found in team 'runtime'"` —— 用户困惑
+"team 'runtime' 是什么？"。其实 spawn_key 已含真 team 名，不需要再生造一个。
+
+**修复**：4 处 `Error::MemberNotFound { team: "runtime", ... }` 替换为
+`Error::Other("no managed session registered for spawn_key '...'")`，
+错误文本直接说明问题（spawn_key 没注册，可能已 shutdown 或从未启动）。
+
+附带：`team_delete` 加过滤——把 "no managed session registered" 与
+"not found in team 'runtime'"（兼容旧 daemon）从 shutdown_failures 中
+剔除；把 status=Removed 的成员一开始就跳过 shutdown 循环。
+
+---
+
+### Bug 19: `worker_add` / `team_create` 名字校验过松
+
+**位置**：`src/team_mode/mcp/tools.rs` + `src/util/mod.rs`
+
+**症状**：`worker_add name="has space"` / `name="中文名"` / `name="BadName"`
+全部接受。但 `@mention` 解析器只识别 `[A-Za-z0-9_\-.]`——这些 worker 创建
+后无法 @mention，成为不可达僵尸。
+
+**修复**：新增 `validate_slug_name`：要求小写 ASCII 字母/数字/`_`/`-`/`.`，
+长度 1-64，必须以字母或数字开头。`team_create` 与 `worker_add` 调用前先校验，
+失败时错误信息明确指出哪个字符不合规、规则是什么。统一小写之后 @mention
+就能做 case-insensitive 匹配（见 Bug 21）。
+
+---
+
+### Bug 20: Web UI 把已 remove 的 worker 显示为"运行中"
+
+**位置**：`src/team_mode_web/read_model.rs::list_members` 和 `team_counts`
+
+**症状**：worker 已 `worker_remove`，但 web UI 仍把它列在成员侧栏，状态
+"运行中"。原因：`list_members` 不按 `MemberStatus::Active` 过滤；而成员
+disk record 里的 `execution.sessionState` 不会随 remove 改写（保留以备
+未来 reuse fast-resume），所以一直显示最后已知状态。
+
+**修复**：`list_members` 与 `team_counts_from_parts` 都按 `status==Active`
+过滤；`member_count` 改为只数 active 成员，与侧栏可见数量一致。
+
+---
+
+### Bug 21: @mention 大小写敏感
+
+**位置**：`src/team_mode/mcp/tools.rs::send_message`、
+`src/team_mode/service/message_service.rs::send`
+
+**症状**：`@BOB` 不匹配 worker `bob`，报 unmatched mention。lead AI 写消息
+时常自然大写，每次踩坑都得改回小写。
+
+**修复**：name 校验已强制小写（Bug 19），所以 case-insensitive 匹配不会有
+两个名字冲突。`send_message` 与 `message_service::send` 都建 lowercase→
+canonical 索引，对 `mention.handle.to_lowercase()` 做查找；display 保留
+原大小写，路由用规范名。错误信息提示 "Mention matching is
+case-insensitive; check spelling."。
+
+---
+
+### Bug 22: lead-watchdog 在 `teams.is_empty()` 时永不自杀
+
+**位置**：`src/team_mode_daemon/server.rs::run_lead_watchdog`
+
+**症状**：用户 `team_delete` 删完最后一个 team 后，daemon 仍占内存 + 端口，
+永远不退出。`consecutive_dead` 计数器在 empty branch 里被重置为 0。
+
+**修复**：empty branch 也累加 `consecutive_dead`，并使用同一 grace
+（15s）。下次 `team_create` 重新拉起 daemon 仅 ~1s。日志改成
+`"lead-watchdog: no teams left for grace period, shutting down daemon"`。
+
+---
+
+### Bug 23: Stop hook 单次只投第一条到达消息
+
+**位置**：`scripts/hooks/lead-pending-wake.js::tryBlock`
+
+**症状**：lead 广播给 N 个 worker，第一条 reply 到达 pending 时 Stop hook
+立即注入并 exit；后续 ~毫秒内到达的 reply 只能等下次 Stop。Bug 11 fix
+解决了"被漏掉"的问题，但用户感受为"消息分批到"。
+
+**修复**：`tryBlock` 检测到至少一条消息后等
+`TEAM_MODE_STOP_BATCH_GRACE_MS`（默认 500ms）再 reclassify，把同窗 reply
+合并成一条 reminder。窗口可调，0 即关闭。日志加 `(batch grace 500ms)`
+标记便于审计。
+
+---
+
+### Bug 24: Web UI 右栏对无 session_id 的 worker 串台到 lead
+
+**位置**：`src/team_mode_web/read_model.rs::conversation_for_member`
+
+**症状**：刚 `worker_add` 的新 worker 在产生第一条 reply 之前没有
+session_id；旧代码用 `or_else(|| sessions.first())` 兜底——按 mtime 排序，
+最近的 JSONL 是 lead/CC 自己的，结果右栏显示 lead 的全部对话与工具调用。
+用户一直以为"右栏不管点谁都是 lead"，其实是 sessionless worker 全部
+fallback 到 CC 的 JSONL。
+
+**修复**：non-lead member 取消 mtime fallback——sessionId 不在
+discover_sessions 列表时返回 `confidence: "no_session_yet"` 占位，并附
+`limitations` 字段说明"等首个 type:result 后刷新即可"。lead 仍允许 mtime
+fallback（因为 lead 就是当前 CC，最近的 JSONL 本来就是它）。
+
+---
+
+## 工具描述压缩 + 运行时 hint 模式（2026-04-25）
+
+**问题**：8 个 tool descriptions 总长 ~2.5KB，全量加载到上下文。其中大量是
+"操作注意事项 / 反例警告"：
+- `send_message` 描述里塞着"DO NOT sleep-and-poll, see docs/push-notifications.md"
+- `inbox_read` 描述里"FALLBACK ONLY"长篇说明
+- `worker_add` 描述把 reuse/overwrite/error 三个 enum 值各展开两行解释
+
+**坏处**：
+1. token 浪费——每次会话开头都加载，不管 AI 是否要用这个工具。
+2. 注意力不连续——AI 看一次后 attention 衰减，过几轮就忘"不要轮询"这事。
+3. 不动态——警告固定不变，不能针对当下场景细化。
+
+**修复方向**：
+- 静态描述只保留"AI 第一次碰这工具就必须知道的契约"（参数语义 + 关键
+  调用前提）。删除文档链接、长篇 fallback 描述、enum 值展开。
+- "操作建议 / 反例警告 / 复活方式" 移到工具返回值的 `hint` 字段，按当前
+  状态动态生成：
+  - `send_message` 成功 → `hint`: "Replies will arrive automatically..."
+  - `send_message` 部分 dead → `dead_recipients_hint`: 复活指令
+  - `inbox_read` 空 → `hint`: "无消息；Stop hook 自动投递"
+  - `worker_list` 含 dead → `hint`: "Dead workers: [...]. Revive with..."
+  - `team_list` 含 orphan → `hint`: "Orphan teams: [...]. team_delete 清理"
+  - `worker_add` 新建 → `hint`: "session_id 在首个 type:result 后捕获"
+
+**结果**：工具 description 总长从 ~2.5KB 缩到 ~700 chars（节省 ~70%），
+关键提示出现在 AI 最需要它的时刻——刚调用完工具、正要决定下一步动作时。
+
+**为什么不全部塞 description**：description 是 system prompt 的一部分，
+"全量预加载 + 静态" 的本质决定它不能承载所有指引；动态返回 hint 才能
+做到 just-in-time。硬规则（必须含 @mention、name 必须 slug）继续在代码层
+强制 + fail-fast 错误信息说清原因；建议性指引（不要轮询、复活方式）放
+hint。
+
+---
+
 ## 用户明确的设计原则
 
 以下是开发过程中用户多次强调的偏好，贡献者请尊重：
@@ -496,3 +684,5 @@ CC（lead）的对话，不是 worker 的。表现为用户问 worker 一个简�
 - **ESC 应该能打断 hook**：SIGINT handler 必须就位。
 - **别猜测**：涉及 CC 官方机制的问题（asyncRewake 行为、Channels 规则、Stop hook
   exit 2 语义）都要派 subagent 查官方文档 + 社区实现，不凭印象说。
+- **不靠 docs 操作 MCP**：MCP 使用注意点写到工具返回 `hint` 里，不要让 AI
+  去读 markdown。硬规则用代码层校验 + 清晰错误信息；建议性指引用动态 hint。

@@ -202,13 +202,12 @@ impl RuntimeOrchestrator {
         let member_id = member_id.as_ref().to_string();
         tracing::debug!(member_id = %member_id, input_len = input.len(), "sending input to session");
         let handle = {
-            let managed =
-                self.sessions
-                    .get_mut(&member_id)
-                    .ok_or_else(|| Error::MemberNotFound {
-                        team: "runtime".into(),
-                        member: member_id.clone(),
-                    })?;
+            let managed = self.sessions.get_mut(&member_id).ok_or_else(|| {
+                Error::Other(format!(
+                    "no managed session registered for spawn_key '{member_id}' \
+                     (worker may have died or was never spawned)"
+                ))
+            })?;
 
             managed.set_runtime_state(ExecutionSessionState::Running);
             if let Err(err) = managed.session.send_input(input).await {
@@ -232,13 +231,11 @@ impl RuntimeOrchestrator {
         member_id: impl AsRef<str>,
     ) -> Result<Option<Receiver<AgentOutput>>> {
         let member_id = member_id.as_ref().to_string();
-        let managed = self
-            .sessions
-            .get_mut(&member_id)
-            .ok_or_else(|| Error::MemberNotFound {
-                team: "runtime".into(),
-                member: member_id,
-            })?;
+        let managed = self.sessions.get_mut(&member_id).ok_or_else(|| {
+            Error::Other(format!(
+                "no managed session registered for spawn_key '{member_id}'"
+            ))
+        })?;
         Ok(managed.output_receiver.take())
     }
 
@@ -247,11 +244,50 @@ impl RuntimeOrchestrator {
         let managed = self
             .sessions
             .get(member_id)
-            .ok_or_else(|| Error::MemberNotFound {
-                team: "runtime".into(),
-                member: member_id.to_string(),
-            })?;
+            .ok_or_else(|| Error::Other(format!(
+                "no managed session registered for spawn_key '{member_id}'"
+            )))?;
         Ok(managed.session.is_alive().await)
+    }
+
+    /// Whether the orchestrator currently has a registered session entry
+    /// for `member_id`, regardless of whether the underlying child process
+    /// is alive. Useful when the caller wants to decide whether re-spawn
+    /// is allowed without taking the (mutable) lock for `is_alive`.
+    pub fn has_session(&self, member_id: impl AsRef<str>) -> bool {
+        self.sessions.contains_key(member_id.as_ref())
+    }
+
+    /// Drop a session entry whose child process has already died, returning
+    /// `true` if a stale entry was removed. Does NOT shut down the session
+    /// (that is for the live-process path); the assumption is the OS
+    /// already reaped the child. This unblocks `worker_add on_existing=reuse`
+    /// for a worker that died externally — without this, `spawn_managed_member`
+    /// refuses to recreate the spawn_key because a stale `ManagedSession`
+    /// occupies the slot.
+    ///
+    /// Safe to call even when the session is still live: it will check
+    /// `session.is_alive()` and refuse to drop a live session, returning
+    /// `false`. Callers that mean "force kill" should use
+    /// `shutdown_managed_member` instead.
+    pub async fn remove_dead_session_if_any(&mut self, member_id: impl AsRef<str>) -> bool {
+        let member_id = member_id.as_ref().to_string();
+        let Some(managed) = self.sessions.get(&member_id) else {
+            return false;
+        };
+        if managed.session.is_alive().await {
+            return false;
+        }
+        if let Some(_managed) = self.sessions.remove(&member_id) {
+            self.session_registry.remove_handle(&member_id);
+            tracing::info!(
+                spawn_key = %member_id,
+                "removed dead managed session entry to allow respawn"
+            );
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns the backend-assigned session id for the given managed
@@ -265,13 +301,11 @@ impl RuntimeOrchestrator {
     pub async fn shutdown_managed_member(&mut self, member_id: impl AsRef<str>) -> Result<()> {
         let member_id = member_id.as_ref().to_string();
         tracing::info!(member_id = %member_id, "shutting down managed member");
-        let mut managed =
-            self.sessions
-                .remove(&member_id)
-                .ok_or_else(|| Error::MemberNotFound {
-                    team: "runtime".into(),
-                    member: member_id.clone(),
-                })?;
+        let mut managed = self.sessions.remove(&member_id).ok_or_else(|| {
+            Error::Other(format!(
+                "no managed session registered for spawn_key '{member_id}' (already shut down or never started)"
+            ))
+        })?;
 
         managed.set_runtime_state(ExecutionSessionState::Stopped);
         match managed.session.shutdown().await {
