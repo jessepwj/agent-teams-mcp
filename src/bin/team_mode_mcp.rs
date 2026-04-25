@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 use agent_teams::team_mode::data_dir;
-use agent_teams::team_mode_daemon::DaemonToolClient;
+use agent_teams::team_mode_daemon::{DaemonToolClient, prune_stale_endpoint};
 use agent_teams::{TeamModeMcpRuntime, TeamModeToolset};
 use tracing_subscriber::EnvFilter;
 
@@ -100,6 +100,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(data_dir = %data_dir.display(), "using data directory");
 
     let project_root = env::current_dir()?;
+
+    // Startup prune: if a previous daemon self-killed (lead-watchdog grace
+    // expiry on empty teams) but left runtime/daemon.json behind, the next
+    // tool call would otherwise burn a 2s TCP timeout pinging a dead pid
+    // before falling through to spawn a fresh daemon. Prune up-front so
+    // /mcp reconnect after daemon death is fast and clean.
+    prune_stale_endpoint(&data_dir);
+
     let mut runtime = if daemon_relay_disabled() {
         tracing::warn!("TEAM_MODE_DAEMON disabled; running workers in MCP process");
         TeamModeMcpRuntime::with_tool_executor(

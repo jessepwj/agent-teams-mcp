@@ -16,7 +16,7 @@ use crate::team_mode::mcp::executor::TeamModeToolExecutor;
 use crate::team_mode::mcp::schemas::ToolDescriptor;
 use crate::team_mode::mcp::tools::ToolExecution;
 use crate::team_mode_daemon::ipc::{
-    DaemonInfo, DaemonRequest, DaemonResponse, read_frame, read_info, write_frame,
+    DaemonInfo, DaemonRequest, DaemonResponse, info_path, read_frame, read_info, write_frame,
 };
 
 pub struct DaemonToolClient {
@@ -58,13 +58,19 @@ impl DaemonToolClient {
 
     fn ensure_daemon(&self) -> Result<DaemonInfo> {
         if let Some(info) = self.cached_info.lock().unwrap().clone() {
-            if self.ping_info(&info).is_ok() {
+            if is_pid_alive(info.pid) && self.ping_info(&info).is_ok() {
                 return Ok(info);
             }
         }
 
+        // Fast path: prune endpoint file if its pid is already dead. Avoids
+        // the 2s TCP timeout in ping_info and ensures stale endpoints from a
+        // self-killed daemon (lead-watchdog grace expiry) don't confuse the
+        // next request.
+        prune_stale_endpoint(&self.base_dir);
+
         if let Ok(info) = read_info(&self.base_dir) {
-            if self.ping_info(&info).is_ok() {
+            if is_pid_alive(info.pid) && self.ping_info(&info).is_ok() {
                 *self.cached_info.lock().unwrap() = Some(info.clone());
                 return Ok(info);
             }
@@ -87,8 +93,14 @@ impl DaemonToolClient {
         })?;
 
         let result = (|| {
+            // Re-prune inside the lock — between ensure_daemon and now, another
+            // MCP could have noticed the same death and (a) pruned the file
+            // already, or (b) started a fresh daemon that wrote a new file.
+            // Either way is fine: read_info will reflect current truth.
+            prune_stale_endpoint(&self.base_dir);
+
             if let Ok(info) = read_info(&self.base_dir) {
-                if self.ping_info(&info).is_ok() {
+                if is_pid_alive(info.pid) && self.ping_info(&info).is_ok() {
                     *self.cached_info.lock().unwrap() = Some(info.clone());
                     return Ok(info);
                 }
@@ -264,6 +276,49 @@ fn exe_name(stem: &str) -> String {
     #[cfg(not(target_os = "windows"))]
     {
         stem.to_string()
+    }
+}
+
+/// Best-effort liveness check for a PID. Returns `false` if the process has
+/// exited. Treats refresh failures as `true` (fail-open) so a sysinfo glitch
+/// doesn't accidentally prune a healthy daemon.
+fn is_pid_alive(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+    let target = Pid::from_u32(pid);
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+    );
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(target).is_some()
+}
+
+/// If `<base>/runtime/daemon.json` references a dead pid, delete it. Idempotent
+/// and silent on missing file / read errors — this is a best-effort cleanup.
+pub fn prune_stale_endpoint(base_dir: &std::path::Path) {
+    let path = info_path(base_dir);
+    let Ok(info) = read_info(base_dir) else {
+        return;
+    };
+    if is_pid_alive(info.pid) {
+        return;
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => tracing::info!(
+            stale_pid = info.pid,
+            path = %path.display(),
+            "pruned stale daemon endpoint (pid no longer alive)",
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            stale_pid = info.pid,
+            path = %path.display(),
+            error = %err,
+            "failed to prune stale daemon endpoint",
+        ),
     }
 }
 
