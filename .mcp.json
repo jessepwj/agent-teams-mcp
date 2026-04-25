@@ -1,7 +1,8 @@
 {
+  "_comment": "Local-development MCP config. Points at target/debug because cargo build (default) writes there; that way changes to team-mode code are picked up by the next /mcp reconnect. End-user install flow uses cargo build --release + copying the binary onto PATH (see README). If you change this to release, every dev cycle has to run cargo build --release manually — don't.",
   "mcpServers": {
     "team-mode": {
-      "command": "E:/aigc内容整理/agent-teams-rs-team-mode/target/release/team_mode_mcp.exe",
+      "command": "E:/aigc内容整理/agent-teams-rs-team-mode/target/debug/team_mode_mcp.exe",
       "args": [],
       "env": {
         "RUST_LOG": "info"

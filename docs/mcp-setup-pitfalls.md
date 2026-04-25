@@ -221,10 +221,48 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n' \
 
 ---
 
-## 三个坑总结
+## 坑四：项目内 `.mcp.json` 指向 release，开发改代码不生效
+
+### 现象
+
+修改 Rust 源码 → `cargo build` 通过 → `/mcp reconnect` → MCP 工具行为没变。代码改动像被无视了。
+
+### 原因
+
+`cargo build`（不带 `--release`）默认产出到 `target/debug/`。但项目自带的 `.mcp.json` 长期指向 `target/release/team_mode_mcp.exe`（来自最初安装文档的 copy-paste），所以 MCP relay 启动的是几天前的旧 release binary，daemon 也跟着是旧的。
+
+每次让代码生效都得 `cargo build --release` 一次，几分钟级链接时间，且 binary 还可能被运行中的进程占用导致 `os error 5: 拒绝访问`。
+
+### 解决
+
+项目内 `.mcp.json` 必须指向 `target/debug/team_mode_mcp.exe`：
+
+```json
+{
+  "mcpServers": {
+    "team-mode": {
+      "command": "<repo>/target/debug/team_mode_mcp.exe"
+    }
+  }
+}
+```
+
+这样标准开发循环（改代码 → `cargo build` → `/mcp reconnect`）零摩擦。
+
+### 开发期 vs 安装期分工
+
+- **开发期**：`.mcp.json`（git 跟踪、本地共享）→ `target/debug/`，`cargo build` 默认产出，立即生效。
+- **安装期 / 给开源用户**：README 引导 `cargo build --release` + 把 `target/release/team_mode_mcp.exe` 拷到 PATH 或在用户级 `~/.claude.json` 写绝对路径。release 编译开销摊销到一次性安装，长跑 daemon 享受优化。
+
+两条路线分离，互不干扰。**永远不要把项目内 `.mcp.json` 改回 release**。
+
+---
+
+## 四个坑总结
 
 | # | 坑 | 表现 | 解决 |
 |---|---|---|---|
 | 1 | 配置文件位置错误 | `/mcp` 检测不到 server | 改用项目根目录的 `.mcp.json` |
 | 2 | Windows 路径含中文 | `✘ failed`，cmd 无法解析路径 | 用 `mklink /J` 建 junction 到 ASCII 路径 |
 | 3 | stdio 协议格式不匹配 | `✘ failed`，二进制正常但 Claude Code 连不上 | server 改用 NDJSON 输出，去掉 Content-Length 帧 |
+| 4 | `.mcp.json` 指向 release | 改代码后 `/mcp reconnect` 不生效 | 项目内 `.mcp.json` 改 `target/debug/`；release 留给安装期 |

@@ -9,10 +9,14 @@
 //! 2. Send `initialize` with `{clientInfo: {name, version}}` → receive `{userAgent}`.
 //! 3. Send `initialized` notification (no `id`).
 //! 4. Send `thread/start` with `{cwd, approvalPolicy}` → receive `{thread: {id, ...}}`.
-//! 5. Send `turn/start` with `{threadId, input: [{type: "text", text: "..."}]}`.
+//! 5. Emit a synthetic [`AgentOutput::Idle`] so the AgentLoop's ready-check
+//!    completes without consuming an LLM turn — Codex has no `--system-prompt`
+//!    flag, so any system instruction must ride on the first real user message.
 //! 6. A background task reads stdout line-by-line, parsing messages
 //!    and forwarding them as [`AgentOutput`] events through an mpsc channel.
-//! 7. Follow-up inputs are sent as additional `turn/start` requests.
+//! 7. The first `send_input` call prepends the stashed system prompt as
+//!    `[System instructions]\n...\n\n---\n\n<user input>`, then dispatches
+//!    `turn/start`. Subsequent inputs go through unchanged.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -200,25 +204,31 @@ impl AgentBackend for CodexBackend {
             "Thread created"
         );
 
-        // ----- Step 4: Send initial prompt as first turn -----
-        let turn_id = next_id(&request_id);
-        let turn_req = JsonRpcRequest::new(
-            turn_id,
-            METHOD_TURN_START,
-            Some(serde_json::json!({
-                "threadId": thread_id,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": initial_prompt
-                    }
-                ]
-            })),
-        );
-        send_request(&stdin_writer, &turn_req).await?;
+        // ----- Step 4: Stash system prompt for the first real input -----
+        //
+        // Codex has no `--system-prompt` flag (compare to Claude Code). The
+        // app-server protocol only consumes user-role messages via `turn/start`.
+        // Sending the system prompt as a standalone `turn/start` here would:
+        //   - waste an LLM round-trip (the model "answers" the instruction),
+        //   - delay spawn readiness by 5–15s on cold start,
+        //   - leave a noisy "Got it!" reply on the very first turn.
+        //
+        // Instead we stash it and prepend it to whatever the AgentLoop sends
+        // next. yepanywhere does the same trick (their `globalInstructions`
+        // ride on the first user message). The AgentLoop's ready-check waits
+        // for TurnComplete/Idle/Error, so we have to inject a synthetic Idle
+        // (step 6 below) — there's no real turn in flight.
+        let pending_system_prompt = if initial_prompt.trim().is_empty() {
+            None
+        } else {
+            Some(initial_prompt)
+        };
 
         // ----- Step 5: Spawn background reader -----
         let (output_tx, output_rx) = tokio::sync::mpsc::channel(OUTPUT_CHANNEL_SIZE);
+        // Clone the sender so we can push the synthetic ready signal (step 6)
+        // after the reader task takes ownership of `output_tx`.
+        let ready_tx = output_tx.clone();
         let reader_alive = alive.clone();
         let reader_name = agent_name.clone();
 
@@ -300,6 +310,23 @@ impl AgentBackend for CodexBackend {
             debug!(agent = %reader_name, "Background Codex reader stopped");
         });
 
+        // ----- Step 6: Emit synthetic Idle so AgentLoop's ready-check unblocks
+        //
+        // The reader task is wired up but the child has no work in flight —
+        // it's sitting at thread/start completion, waiting for a turn/start.
+        // AgentLoop drains output until it sees TurnComplete/Idle/Error, so
+        // without this push the spawn-time ready-check would hang until the
+        // 30s init timeout (the protocol read timeout for thread/start).
+        // `Idle` is the right signal: nothing is happening, the worker is
+        // ready for input.
+        if ready_tx.send(AgentOutput::Idle).await.is_err() {
+            warn!(
+                agent = %agent_name,
+                "spawn-time Idle dropped — receiver already gone"
+            );
+        }
+        drop(ready_tx);
+
         let session = CodexSession {
             name: agent_name,
             child: Some(child),
@@ -309,6 +336,7 @@ impl AgentBackend for CodexBackend {
             output_rx: Some(output_rx),
             alive,
             reader_handle: Some(reader_handle),
+            pending_system_prompt: Arc::new(Mutex::new(pending_system_prompt)),
         };
 
         Ok(Box::new(session))
@@ -324,11 +352,19 @@ struct CodexSession {
     name: String,
     child: Option<Child>,
     stdin: Arc<Mutex<BufWriter<tokio::process::ChildStdin>>>,
+    /// Codex's `thread/start` response carries this UUID. It also names the
+    /// rollout JSONL file under `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`,
+    /// so it doubles as the backend session id surfaced via [`AgentSession::session_id`].
     thread_id: String,
     request_id: Arc<AtomicU64>,
     output_rx: Option<tokio::sync::mpsc::Receiver<AgentOutput>>,
     alive: Arc<AtomicBool>,
     reader_handle: Option<JoinHandle<()>>,
+    /// System instructions captured at spawn that have not yet been delivered
+    /// to the model. Consumed (set to `None`) on the first `send_input` so it
+    /// rides along with the user's first real message instead of burning a
+    /// dedicated turn at startup.
+    pending_system_prompt: Arc<Mutex<Option<String>>>,
 }
 
 #[async_trait]
@@ -344,6 +380,16 @@ impl AgentSession for CodexSession {
             });
         }
 
+        // Drain any pending system prompt and prepend it to this turn.
+        // After the first send the slot is None and this is a no-op.
+        let final_input = {
+            let mut slot = self.pending_system_prompt.lock().await;
+            match slot.take() {
+                Some(sp) => format!("[System instructions]\n{sp}\n\n---\n\n{input}"),
+                None => input.to_string(),
+            }
+        };
+
         let id = next_id(&self.request_id);
         let req = JsonRpcRequest::new(
             id,
@@ -353,7 +399,7 @@ impl AgentSession for CodexSession {
                 "input": [
                     {
                         "type": "text",
-                        "text": input
+                        "text": final_input
                     }
                 ]
             })),
@@ -367,6 +413,15 @@ impl AgentSession for CodexSession {
 
     async fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    fn session_id(&self) -> Option<String> {
+        // Codex's `thread/start` UUID is the canonical session identifier:
+        // it names the rollout file on disk (.../rollout-<ts>-<thread_id>.jsonl)
+        // and is the only stable handle for `thread/resume`. Persisting it
+        // into `member.execution.session_id` lets the web UI render the
+        // worker's exact transcript instead of falling back to mtime guesses.
+        Some(self.thread_id.clone())
     }
 
     async fn shutdown(&mut self) -> Result<()> {
@@ -490,7 +545,15 @@ async fn wait_for_response(
     let expected_val = serde_json::Value::Number(expected_id.into());
     let mut line_buf = String::new();
 
-    let timeout_duration = std::time::Duration::from_secs(30);
+    // 30s default fits Codex cold start on Windows (10–15s) with margin.
+    // Override via `TEAM_MODE_CODEX_INIT_TIMEOUT_SEC` for ultra-cold disks
+    // or constrained CI runners; clamped to >=5s to stay sane.
+    let timeout_secs: u64 = std::env::var("TEAM_MODE_CODEX_INIT_TIMEOUT_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|n| n.max(5))
+        .unwrap_or(30);
+    let timeout_duration = std::time::Duration::from_secs(timeout_secs);
     let deadline = tokio::time::Instant::now() + timeout_duration;
 
     loop {
@@ -498,7 +561,9 @@ async fn wait_for_response(
 
         let read_result = tokio::time::timeout_at(deadline, reader.read_line(&mut line_buf))
             .await
-            .map_err(|_| Error::Timeout { seconds: 30 })?
+            .map_err(|_| Error::Timeout {
+                seconds: timeout_secs,
+            })?
             .map_err(|e| Error::CodexProtocol {
                 reason: format!("Read error waiting for response: {e}"),
             })?;

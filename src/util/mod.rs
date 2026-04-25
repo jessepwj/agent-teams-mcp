@@ -1,6 +1,7 @@
 //! Utility modules: atomic writes, file locking, ID generation, session discovery.
 
 pub mod atomic_write;
+pub mod codex_session_discovery;
 pub mod file_lock;
 pub mod id_gen;
 pub mod session_discovery;
