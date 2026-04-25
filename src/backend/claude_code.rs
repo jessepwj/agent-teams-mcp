@@ -166,10 +166,25 @@ impl ClaudeCodeBackend {
             cmd.arg("--model").arg(model);
         }
 
-        // Permission mode.
-        if let Some(ref mode) = config.permission_mode {
-            cmd.arg("--permission-mode").arg(mode);
-        }
+        // Permission mode — defaults to `bypassPermissions` when the caller
+        // didn't override.
+        //
+        // Why hardcode: this backend always runs in headless stream-json mode
+        // (`-p "" --input-format stream-json`). In that mode the CLI cannot
+        // ask the user for tool-use approval — there is no terminal to prompt.
+        // The CLI's actual default `--permission-mode default` therefore
+        // *blocks* on every Bash/Edit/Write call waiting for an answer that
+        // never comes, and the agent silently hangs. `bypassPermissions` is
+        // the only mode that lets a managed worker get any work done.
+        //
+        // This is unlike `reasoning_effort` (which we deliberately don't
+        // hardcode — that's a user preference). Permission mode is a protocol
+        // requirement of the non-interactive transport, not a preference.
+        let permission_mode = config
+            .permission_mode
+            .as_deref()
+            .unwrap_or("bypassPermissions");
+        cmd.arg("--permission-mode").arg(permission_mode);
 
         // Allowed tools.
         if !config.allowed_tools.is_empty() {

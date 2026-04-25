@@ -1,3 +1,7 @@
+> **[HISTORICAL — 2026-04]** 这是 Web 前端的初始设计计划，写于"只读"阶段。当前实现已经超出只读范围（新增 `POST /api/teams/.../rooms/main/messages` 让人类用户从浏览器发消息，sender 写死 `user`，lazy-create 该成员）。Codex worker 的 conversation 也已渲染（解析 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`）。**计划文档保留作演进记录，实际实现以 `team-mode-web-guide.md` 为准。**
+
+---
+
 # Team Mode Web 前端计划
 
 > 状态：设计计划  
@@ -7,10 +11,11 @@
 
 ## 1. 目标与边界
 
-本前端要解决两个核心问题：
+本前端要解决三个核心问题：
 
-1. 提供一个群聊室，展示 lead 与 workers 之间的完整聊天历史。
+1. 提供一个直观的群聊室，展示 lead 与 workers 之间的完整聊天历史。
 2. 只读展示成员，包括 lead 的执行状态、活动轨迹和可用会话信息。
+3. 默认展示成员对应进程会话，诊断和原始 JSON 只作为排查入口。
 
 本计划的关键边界：
 
@@ -19,9 +24,9 @@
 - 新实现拆到独立目录和模块中，避免和现有 MCP runtime、TUI、旧 dashboard 纠缠。
 - 当前后端只提供 member `session` 快照，不提供 turn-by-turn 原始执行日志。因此 MVP 不能伪装成有完整“进程日志回放”。
 
-最终产品定位：
+当前产品定位：
 
-> Slack 式 team transcript 浏览器，加 GitHub Actions 式执行审阅台。
+> 微信/Slack 式 team 群聊浏览器，加可切换的进程会话阅读面板。
 
 ---
 
@@ -143,11 +148,11 @@ cargo run --features team-mode-web --bin team_mode_web -- --data-dir .agent-team
 ┌────────────────────────────────────────────────────────────┐
 │ Top bar: team selector | search | time range | live status │
 ├──────────────┬───────────────────────────────┬─────────────┤
-│ Left nav     │ Main timeline                 │ Detail pane │
+│ Left nav     │ Group chat                    │ Session pane│
 │ teams        │ room: main                    │ message     │
-│ rooms        │ messages                      │ thread      │
-│ members      │ thread markers                │ member      │
-│ filters      │ mention highlights            │ raw json    │
+│ rooms        │ message bubbles               │ session     │
+│ members      │ system notices                │ member      │
+│ filters      │ mention highlights            │ diagnostics │
 ├──────────────┴───────────────────────────────┴─────────────┤
 │ Bottom status: filters | counts | data source | shortcuts   │
 └────────────────────────────────────────────────────────────┘
@@ -157,12 +162,13 @@ cargo run --features team-mode-web --bin team_mode_web -- --data-dir .agent-team
 
 - 左栏收进抽屉。
 - 右栏详情变底部抽屉或二级页面。
-- 线程详情从主时间线进入独立子页。
+- 线程详情从消息详情进入独立子页。
 
 一级视图只保留：
 
-- `Chat`：群聊历史和线程。
+- `Chat`：群聊历史。
 - `Members`：成员快照和活动。
+- `Session`：右侧成员进程会话阅读。
 - `Explore`：搜索、过滤、原始 JSON，Phase 2 再做。
 
 不要做营销首页，打开即是实际可用的 team 浏览界面。
@@ -176,26 +182,26 @@ cargo run --features team-mode-web --bin team_mode_web -- --data-dir .agent-team
 MVP 必须展示：
 
 - 当前 team 的 `main` 房间消息。
-- sender、时间、kind、正文、thread 标记。
+- sender、时间、正文气泡。
 - `@mention` 高亮。
-- `delivery_status` 徽标。
-- `read_by`、`acked_by` 的摘要。
+- 异常 `delivery_status` 的轻量提示。
 - 点击消息打开右侧详情。
-- 点击 thread 标记打开线程详情。
 - 点击 sender 或 mention 进行快速过滤。
 
-消息主时间线以 `team://<team>/rooms/main` 为事实源。
+消息主群聊以 `team://<team>/rooms/main` 为事实源。
+
+默认群聊列表不展示 `kind`、线程数量、收件人、read/ack 等调试字段。它们进入右侧详情或诊断页签，避免主聊天区像调试表格。
 
 ### 6.2 线程
 
 MVP 支持：
 
-- 从主时间线打开线程。
+- 从消息详情查看线程。
 - 右侧详情固定 root message。
 - 下方按时间显示同 `thread_id` 消息。
 - 显示回复数量、最后更新时间。
 
-线程参考 Slack 的右侧 thread panel，而不是把所有回复永久展开污染主时间线。
+线程参考 Slack 的右侧 thread panel，而不是把所有回复永久展开污染主群聊。
 
 ### 6.3 成员只读面板
 
@@ -206,6 +212,8 @@ MVP 必须展示：
 - worker 的 `adapter`、`model`、`cwd`、`sessionState`。
 - `system_prompt` 和 `env` 默认折叠，且 `env` 要脱敏。
 - 最近消息、最近被提及、最近回复。
+
+默认右栏优先显示成员进程会话，而不是 profile/execution 字段列表。profile、execution、raw JSON 应放在 `详情` 或折叠区。
 
 ### 6.4 Lead 活动
 
@@ -366,7 +374,7 @@ MVP 先实现前 8 个，`search/stats/events` 可放 Phase 2。
 
 #### `GET /api/teams/:team/rooms/main`
 
-用途：主聊天时间线。
+用途：主群聊数据源。
 
 查询参数：
 
@@ -593,18 +601,19 @@ MemberView
 #### 消息显示规则
 
 - `sender == "lead"` 时使用 lead 样式，但仍按普通消息展示。
-- `kind == "dispatch"` 作为任务派发样式，左侧显示 `Dispatch` 徽标。
-- `kind == "reply"` 作为回复样式，若 `reply_to` 存在则在详情中链接原消息。
+- `kind == "dispatch"` 和 `kind == "reply"` 默认都按普通聊天气泡展示，不在群聊中显示 kind 徽标。
+- 若 `reply_to` 存在，则在详情中链接原消息。
 - `kind == "system" | "notice" | "status"` 使用较弱视觉，不抢主消息注意力。
-- `delivery_status == "failed"` 必须在主线直接可见。
-- `dropped_for` 不在主线平铺，放到详情面板。
+- `delivery_status == "failed" | "expired" | "partial"` 必须在群聊里轻量可见。
+- 成功投递状态不在群聊里显示。
+- `dropped_for` 不在群聊里平铺，放到详情面板。
 
 #### Thread 派生规则
 
 - 同一 `thread_id` 的消息归为一个 thread。
 - `reply_to == null` 或该 thread 内最早消息作为 root 候选。
-- 主时间线默认只显示 root message 和 thread reply count。
-- 如果某条消息是 reply 但没有可解析 root，则仍显示在主线，并在详情里标记“thread metadata incomplete”。
+- 主群聊不默认显示 thread reply count。
+- 如果某条消息是 reply 但没有可解析 root，则仍显示在群聊，并在详情里标记“thread metadata incomplete”。
 
 #### Member 活动派生规则
 
@@ -709,23 +718,37 @@ MCP `team_create` 创建成功后默认打开 `/#team=<team-id>`，因此页面�
 - 不使用大面积紫蓝渐变、营销式大卡片或装饰背景。
 - 卡片只用于消息详情、成员详情、弹层，不做卡套卡。
 
-### 9.2 消息列表
+### 9.2 群聊列表
 
-消息行显示：
+主聊天区采用群聊气泡，而不是调试列表。
+
+消息气泡显示：
 
 - sender。
 - 时间。
-- kind 徽标。
 - 正文。
 - mention 高亮。
-- thread 标记。
-- delivery 状态。
+- 异常 delivery 状态。
 
-长正文默认折叠到 3 行，展开后完整阅读。主时间线保持流式列表，不做大气泡堆叠。
+默认不显示：
+
+- kind 徽标。
+- delivery 成功状态。
+- thread 数量。
+- effective recipients。
+- read/ack 摘要。
+
+这些信息在右侧详情里看。系统状态消息，例如 worker 无输出、worker 不可用，居中显示为灰色系统提示。长正文允许换行并保持气泡宽度约束。
 
 ### 9.3 详情面板
 
-右侧详情随选中对象变化：
+右侧栏随选中对象变化，并使用页签降低信息噪声：
+
+- `会话`：默认。展示成员对应 Claude session 内容，并按工作轮次组织：收到输入/Hook 输入、执行步骤、最终回复。工具调用和结果配对为可折叠行。
+- `详情`：结构化字段和消息/成员摘要。
+- `诊断`：日志、diagnostics source、raw JSON。
+
+右侧详情内容包括：
 
 - 选中消息：recipients、delivery、dropped_for、visibility、read_by、acked_by、raw JSON。
 - 选中成员：profile、execution、sessionState、最近活动、raw JSON。
@@ -767,11 +790,13 @@ AppShell
     ThreadShortcutList
     FilterSummary
   ChatTimeline
-    MessageRow
+    ChatMessageBubble
+    ChatSystemNotice
     MentionText
-    MessageStatusBadge
-    ThreadBadge
   DetailPane
+    SessionTranscript
+    WorkTurn
+    ToolCallRow
     MessageDetail
     ThreadDetail
     MemberDetail
@@ -801,14 +826,13 @@ useMemberActivity(team, name)
 
 ### 9.6 交互细节
 
-主时间线：
+主群聊：
 
-- 点击消息行：右栏打开 Message Detail。
-- 点击 thread badge：右栏打开 Thread Detail。
+- 点击消息气泡：右栏打开 Message Detail。
 - 点击 sender：添加 `sender=<name>` 过滤。
 - 点击 mention：添加 `mentioned=<name>` 过滤。
 - 双击正文：无操作，避免误解为可编辑。
-- 鼠标 hover：显示复制 message id、复制 deep link、查看 raw JSON。
+- 线程、投递、raw JSON 等调试信息只在右栏查看。
 
 成员列表：
 
@@ -842,8 +866,8 @@ useMemberActivity(team, name)
 
 - 三栏全展开。
 - 左栏 260px。
-- 右栏 360px 到 460px。
-- 中间主区占剩余空间。
+- 中间群聊和右栏默认按剩余空间 `1:1`。
+- 右栏可拖拽调整，手动调整后持久化。
 
 平板 768px 到 1199px：
 
@@ -878,7 +902,8 @@ useMemberActivity(team, name)
 
 采用：
 
-- Slack：主时间线、右侧 thread panel、mention 高亮、unread badge。
+- `E:\aigc内容整理\yepanywhere`：进程会话渲染参考其消息预处理、assistant turn 分组、tool_use/tool_result 配对、工具行折叠和滚动保持策略。本项目在此基础上额外按“收到输入/Hook 输入 -> 执行步骤 -> 最终回复”组织每个成员的工作轮次。
+- Slack：群聊信息流、右侧 thread panel、mention 高亮、unread badge。
 - GitHub Actions：状态徽标、折叠详情、失败态突出、日志行深链思路。
 - Linear：左栏导航、主列表、右侧详情、紧凑过滤。
 - Grafana/Datadog：时间范围、局部刷新、结构化日志详情、facet/filter 思路。
@@ -958,11 +983,11 @@ MVP 验收标准：
 
 - 能启动独立 Web server。
 - 能列出 teams。
-- 能打开 team 的 `main` 群聊历史。
+- 能打开 team 的 `main` 群聊历史，且默认是气泡式群聊而不是调试字段列表。
 - 能查看每条消息详情。
 - 能打开 thread 详情。
 - 能查看 lead 和 worker 成员面板。
-- 能查看 worker session 快照。
+- 能查看 lead 和 worker 的进程会话内容。
 - lead 面板不出现“process log/stdout/trace”误导表达。
 - 页面没有写操作入口。
 - API 错误只影响局部面板。
@@ -982,23 +1007,26 @@ MVP 验收标准：
 |---|---|---|
 | 空项目 | 无 `.agent-teams` 或无 team | 显示空 team 状态，不崩溃 |
 | 只有 lead | team 存在，无 worker | 左栏显示 lead，成员区说明暂无 workers |
-| 普通派发 | lead dispatch 给 alice | 主线显示 dispatch，alice mention 高亮 |
-| worker 回复 | alice reply 给 lead | 主线显示 reply，lead inbox count 更新 |
+| 普通派发 | lead dispatch 给 alice | 群聊显示 lead 气泡，alice mention 高亮，不显示 dispatch 徽标 |
+| worker 回复 | alice reply 给 lead | 群聊显示 alice 气泡，lead inbox count 更新，不显示 reply 徽标 |
 | 线程消息 | 多条同 `thread_id` | thread panel 正确分组 |
-| 未知 recipient | `dropped_for` 非空 | 主线显示 partial，详情显示 dropped 原因 |
-| failed delivery | `delivery_status=failed` | 主线红色状态徽标 |
+| 未知 recipient | `dropped_for` 非空 | 群聊轻量显示 partial，详情显示 dropped 原因 |
+| failed delivery | `delivery_status=failed` | 群聊显示失败提示 |
 | removed worker | status removed | 成员列表灰色分组，不算 active worker |
 | 敏感 env | `ANTHROPIC_API_KEY` | 默认显示 `***` |
-| 大消息 | 长正文多行 | 主线折叠，详情完整展示 |
+| 大消息 | 长正文多行 | 群聊气泡不撑破布局，详情完整展示 |
 | API 失败 | team not found | 对应面板局部错误和重试 |
 
 前端视觉验收：
 
 - 1366x768 下三栏不重叠。
+- 桌面默认中间群聊和右栏接近 `1:1`。
+- 主群聊只显示头像、发送者、时间、消息气泡和必要异常状态。
+- 不在主群聊里直接铺开 kind、delivered、thread count、recipients。
 - 390x844 下可单栏使用。
 - 长成员名、长 message id、长单词不会撑破布局。
 - 状态徽标文字不溢出。
-- 右栏 raw JSON 可滚动，不挤压主时间线。
+- 右栏 raw JSON 可滚动，不挤压主群聊。
 
 ---
 
@@ -1055,7 +1083,7 @@ MVP 验收标准：
 - 有独立单元测试覆盖派生规则。
 - DTO 不泄漏不必要内部字段。
 
-### Task 3：Chat Timeline API
+### Task 3：Group Chat API
 
 产出：
 
@@ -1101,7 +1129,8 @@ MVP 验收标准：
 
 产出：
 
-- `MessageRow`
+- `ChatMessageBubble`
+- `ChatSystemNotice`
 - `MentionText`
 - `ThreadDetail`
 - `MessageDetail`
@@ -1109,9 +1138,10 @@ MVP 验收标准：
 验收：
 
 - mention 高亮。
-- thread panel 可打开。
-- 状态徽标准确。
-- 长消息折叠和展开可用。
+- 主群聊默认不显示 kind、delivered、thread count、recipients。
+- 系统状态消息居中弱化显示。
+- 异常状态提示准确。
+- 长消息不撑破布局。
 
 ### Task 7：成员与 Lead UI
 
@@ -1121,10 +1151,16 @@ MVP 验收标准：
 - `MemberDetail`
 - `LeadActivityDetail`
 - `SessionSnapshot`
+- `SessionTranscript`
+- `WorkTurn`
+- `ToolCallRow`
 
 验收：
 
 - lead 不显示伪日志。
+- 右栏默认展示会话阅读视图。
+- 每轮会话能明显区分发给该成员的输入、Hook 注入内容、中间工具步骤和最终回复。
+- 工具调用和工具结果配对展示，并可折叠查看详情。
 - worker execution 默认折叠敏感内容。
 - raw JSON 只读。
 

@@ -9,6 +9,7 @@ pub struct ErrorBody {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCode {
     Ok = 200,
+    Created = 201,
     BadRequest = 400,
     NotFound = 404,
     MethodNotAllowed = 405,
@@ -19,6 +20,7 @@ impl StatusCode {
     pub fn reason_phrase(self) -> &'static str {
         match self {
             Self::Ok => "OK",
+            Self::Created => "Created",
             Self::BadRequest => "Bad Request",
             Self::NotFound => "Not Found",
             Self::MethodNotAllowed => "Method Not Allowed",

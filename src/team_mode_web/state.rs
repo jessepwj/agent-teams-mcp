@@ -1,7 +1,33 @@
+use std::sync::OnceLock;
+
 use crate::team_mode::service::{
     InboxService, MemberService, MessageService, RoomService, TeamService,
 };
 use crate::team_mode::storage::{MemberStore, MessageStore, ProjectionStore, RoomStore, TeamStore};
+
+/// Process-wide override for the `MessageService` used by the web layer.
+///
+/// The daemon constructs ONE `MessageService` wired with both an
+/// `InboxNotifier` (so workers wake up immediately when a new message
+/// arrives) and a `LeadPendingWriter` (so the lead's Stop hook gets
+/// the message in its `system-reminder`). Without those side effects,
+/// a message lands in the message store but the worker only sees it
+/// after its next 30-second poll, and the lead never sees it via hook.
+///
+/// `TeamModeWebState::new` optimistically reads this `OnceLock`. If it's
+/// populated (it always is in production — set by the daemon's toolset
+/// on startup), the web layer borrows the same fully-wired service. If
+/// it's empty (unit tests instantiating the state directly), the web
+/// builds a notifier-less fallback so storage operations still work.
+pub static SHARED_MESSAGE_SERVICE: OnceLock<MessageService> = OnceLock::new();
+
+/// Daemon hook to publish its fully-wired `MessageService` for the web
+/// layer to reuse. Called once during toolset construction. Subsequent
+/// calls are no-ops (`OnceLock` semantics) — that's fine, the daemon
+/// only builds one toolset per process.
+pub fn install_shared_message_service(svc: MessageService) {
+    let _ = SHARED_MESSAGE_SERVICE.set(svc);
+}
 
 #[derive(Debug, Clone)]
 pub struct TeamModeWebState {
@@ -25,12 +51,19 @@ impl TeamModeWebState {
         let team_service = TeamService::new(team_store.clone());
         let member_service = MemberService::new(member_store.clone(), team_store.clone());
         let room_service = RoomService::new(room_store.clone());
-        let message_service = MessageService::new(
-            message_store.clone(),
-            member_store.clone(),
-            room_store.clone(),
-            team_store.clone(),
-        );
+        // Prefer the daemon-installed shared service so writes coming from
+        // the web layer trigger the same inbox-notifier + lead-pending-writer
+        // side effects as MCP-tool writes. Fall back to a service without
+        // those side effects only when the override isn't installed (e.g.
+        // unit tests that construct `TeamModeWebState` standalone).
+        let message_service = SHARED_MESSAGE_SERVICE.get().cloned().unwrap_or_else(|| {
+            MessageService::new(
+                message_store.clone(),
+                member_store.clone(),
+                room_store.clone(),
+                team_store.clone(),
+            )
+        });
         let inbox_service = InboxService::new(projection_store.clone(), message_store.clone());
 
         Self {

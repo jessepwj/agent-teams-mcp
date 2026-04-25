@@ -34,6 +34,13 @@ const FIXED_ELEMENT_IDS = [
   "timelineSubtitle",
   "timelineStats",
   "messageList",
+  "composerForm",
+  "composerMentionLabel",
+  "composerMentionPrefix",
+  "composerMention",
+  "composerInput",
+  "composerSend",
+  "composerStatus",
   "rightSplitter",
   "detailPane",
   "detailPaneTitle",
@@ -57,6 +64,8 @@ class FakeElement {
     this.textContent = "";
     this.value = "";
     this.title = "";
+    this.dataset = {};
+    this.disabled = false;
     this._innerHTML = "";
     this._firstDetailCard = null;
     this.attributes = new Map();
@@ -375,6 +384,13 @@ function basePayloads() {
           text: "pub fn read_member_conversation() {}",
           timestamp: "2026-04-24T00:03:01Z",
         },
+        {
+          id: "4:0",
+          role: "assistant",
+          kind: "text",
+          text: "读取完成，团队状态正常。",
+          timestamp: "2026-04-24T00:04:00Z",
+        },
       ],
       limitations: [
         "The session is matched by cwd and latest modified Claude Code JSONL file.",
@@ -476,6 +492,10 @@ async function flushPromises(times = 4) {
   for (let index = 0; index < times; index += 1) {
     await Promise.resolve();
   }
+}
+
+async function flushTimers() {
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 test("shows explicit empty states when no teams are available", async () => {
@@ -584,6 +604,151 @@ test("balances the chat and detail panes by default", async () => {
   const workspaceStyle = harness.document.getElementById("workspace").style.values;
   assert.equal(workspaceStyle.get("--left-pane-width"), "260px");
   assert.equal(workspaceStyle.get("--right-pane-width"), "494px");
+});
+
+test("renders the timeline as a simple group chat", async () => {
+  const payloads = basePayloads();
+  const harness = createHarness({
+    fetchImpl: async (url) => payloads[url] ?? failedJson(404, "Not Found"),
+  });
+
+  await harness.start();
+
+  const messageList = harness.document.getElementById("messageList").innerHTML;
+  assert.match(messageList, /chat-message/);
+  assert.match(messageList, /chat-avatar/);
+  assert.match(messageList, /chat-bubble/);
+  assert.match(messageList, /Please review/);
+  assert.match(messageList, /@alice/);
+  assert.match(messageList, /Done/);
+  assert.doesNotMatch(messageList, /已投递|delivered|派发|dispatch|回复|reply|1 线程/);
+});
+
+test("keeps the timeline pinned to bottom when new messages arrive", async () => {
+  const payloads = basePayloads();
+  const roomPayload = await payloads["/api/teams/demo/rooms/main?limit=200"].json();
+  payloads["/api/teams/demo/rooms/main?limit=200"] = okJson(roomPayload);
+  const harness = createHarness({
+    fetchImpl: async (url) => payloads[url] ?? failedJson(404, "Not Found"),
+  });
+
+  await harness.start();
+  await flushTimers();
+
+  const messageList = harness.document.getElementById("messageList");
+  messageList.clientHeight = 100;
+  messageList.scrollHeight = 1000;
+  messageList.scrollTop = 900;
+  roomPayload.messages.push({
+    id: "m3",
+    sender: "lead",
+    senderKind: "lead",
+    kind: "dispatch",
+    body: "New bottom message",
+    bodyPreview: "New bottom message",
+    createdAt: "2026-04-24T00:11:00Z",
+    mentions: ["alice"],
+    effectiveRecipients: ["alice"],
+    deliveryStatus: "delivered",
+    readCount: 0,
+    ackedCount: 0,
+    replyTo: null,
+    threadId: "t2",
+    threadReplyCount: 0,
+  });
+
+  await harness.context.refreshCurrentTeam();
+  messageList.scrollHeight = 1300;
+  await flushTimers();
+
+  assert.equal(messageList.scrollTop, 1300);
+});
+
+test("preserves timeline scroll when reading older messages during refresh", async () => {
+  const payloads = basePayloads();
+  const roomPayload = await payloads["/api/teams/demo/rooms/main?limit=200"].json();
+  payloads["/api/teams/demo/rooms/main?limit=200"] = okJson(roomPayload);
+  const harness = createHarness({
+    fetchImpl: async (url) => payloads[url] ?? failedJson(404, "Not Found"),
+  });
+
+  await harness.start();
+  await flushTimers();
+
+  const messageList = harness.document.getElementById("messageList");
+  messageList.clientHeight = 100;
+  messageList.scrollHeight = 1000;
+  messageList.scrollTop = 240;
+  roomPayload.messages.push({
+    id: "m3",
+    sender: "lead",
+    senderKind: "lead",
+    kind: "dispatch",
+    body: "New message while reading history",
+    bodyPreview: "New message while reading history",
+    createdAt: "2026-04-24T00:11:00Z",
+    mentions: ["alice"],
+    effectiveRecipients: ["alice"],
+    deliveryStatus: "delivered",
+    readCount: 0,
+    ackedCount: 0,
+    replyTo: null,
+    threadId: "t2",
+    threadReplyCount: 0,
+  });
+
+  await harness.context.refreshCurrentTeam();
+  messageList.scrollHeight = 1300;
+  await flushTimers();
+
+  assert.equal(messageList.scrollTop, 240);
+});
+
+test("sending a message forces the timeline to the bottom", async () => {
+  const payloads = basePayloads();
+  const roomPayload = await payloads["/api/teams/demo/rooms/main?limit=200"].json();
+  payloads["/api/teams/demo/rooms/main?limit=200"] = okJson(roomPayload);
+  const harness = createHarness({
+    fetchImpl: async (url, options = {}) => {
+      if (url === "/api/teams/demo/rooms/main/messages" && options.method === "POST") {
+        roomPayload.messages.push({
+          id: "m3",
+          sender: "user",
+          senderKind: "member",
+          kind: "dispatch",
+          body: "@alice manual send",
+          bodyPreview: "@alice manual send",
+          createdAt: "2026-04-24T00:11:00Z",
+          mentions: ["alice"],
+          effectiveRecipients: ["alice"],
+          deliveryStatus: "delivered",
+          readCount: 0,
+          ackedCount: 0,
+          replyTo: null,
+          threadId: "t2",
+          threadReplyCount: 0,
+        });
+        return okJson({ id: "m3" });
+      }
+      return payloads[url] ?? failedJson(404, "Not Found");
+    },
+  });
+
+  await harness.start();
+  await flushTimers();
+
+  const messageList = harness.document.getElementById("messageList");
+  messageList.clientHeight = 100;
+  messageList.scrollHeight = 1000;
+  messageList.scrollTop = 240;
+  harness.document.getElementById("composerMention").value = "alice";
+  harness.document.getElementById("composerInput").value = "manual send";
+
+  await harness.context.submitComposer();
+  messageList.scrollHeight = 1300;
+  await flushTimers();
+
+  assert.equal(messageList.scrollTop, 1300);
 });
 
 test("shows a clear state for a missing message deep link", async () => {
@@ -824,8 +989,11 @@ test("process conversation pairs tool calls into collapsible rows", async () => 
   await harness.start();
 
   const html = harness.document.getElementById("detailBody").innerHTML;
+  assert.match(html, /conversation-work-turn/);
   assert.match(html, /assistant-turn/);
   assert.match(html, /message-user-prompt/);
+  assert.match(html, /最终回复/);
+  assert.match(html, /final-reply-block/);
   assert.match(html, /tool-row/);
   assert.match(html, /Read/);
   assert.match(html, /read_model\.rs/);

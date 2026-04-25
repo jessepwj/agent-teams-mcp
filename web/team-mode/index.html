@@ -69,6 +69,23 @@
             <div class="stats" id="timelineStats"></div>
           </div>
           <div class="timeline" id="messageList"></div>
+
+          <form class="composer" id="composerForm" autocomplete="off">
+            <div class="composer-row">
+              <label class="composer-mention" for="composerMention" id="composerMentionLabel">
+                <span class="muted" id="composerMentionPrefix">@</span>
+                <select id="composerMention" class="composer-select"></select>
+              </label>
+              <textarea
+                id="composerInput"
+                class="composer-input"
+                rows="2"
+                placeholder="输入消息，回车发送，Shift+回车换行"
+              ></textarea>
+              <button type="submit" id="composerSend" class="composer-send">发送</button>
+            </div>
+            <div class="composer-status muted" id="composerStatus" aria-live="polite"></div>
+          </form>
         </section>
 
         <div

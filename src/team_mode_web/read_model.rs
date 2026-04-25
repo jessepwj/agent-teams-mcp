@@ -8,11 +8,23 @@ use serde_json::Value;
 
 use crate::runtime::ExecutionSessionState;
 use crate::team_mode::domain::{MemberKind, MemberStatus, Message, MessageKind, Team};
+use crate::team_mode::service::{AddMemberRequest, SendMessageRequest};
 use crate::util::{codex_session_discovery, session_discovery};
 
 use super::dto::*;
 use super::error::WebError;
 use super::state::TeamModeWebState;
+
+/// Reserved sender name for messages originating from the read-only web UI.
+///
+/// Used both as the lazy-created member's `name` and as the sender stamped
+/// on outgoing messages. Picked to be:
+///   * lowercase + a-z only → passes `validate_slug_name`
+///   * unlikely to collide with a real worker name (no one names a worker
+///     after a generic role)
+///   * obvious in transcripts ("user said …" reads naturally)
+pub const WEB_USER_SENDER: &str = "user";
+pub const WEB_USER_ROLE_LABEL: &str = "user";
 
 pub fn redact_env(env: &std::collections::HashMap<String, String>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
@@ -1626,6 +1638,107 @@ fn execution_session_state_label(
             .map(ExecutionSessionState::as_str)
             .unwrap_or("not_spawned")
             .to_string()
+    }
+}
+
+/// POST /api/teams/{team}/rooms/main/messages — Web user sends a message.
+///
+/// Body: `{"body": "...", "mentions": ["lead", ...]}` — `mentions` is
+/// optional; @mentions written into `body` are also parsed by the routing
+/// layer. The message is recorded with `sender = "user"` (a lazy-created
+/// non-managed member; see `WEB_USER_SENDER`) and routed through the
+/// SAME `MessageService::send` that the MCP `send_message` tool uses, so
+/// inbox-notifier wakeups + lead_pending writes happen as usual. Workers
+/// see the message exactly as if the lead had `@`-mentioned them.
+///
+/// `kind = Discussion` (not `Dispatch`) so the agent-loop treats it as a
+/// regular conversational input rather than a task assignment — workers
+/// reply but the type stays neutral. Bug 12's "no auto-add parent.sender"
+/// rule still applies, so a worker reply only goes back to lead (via the
+/// observability rule) unless the worker explicitly mentions someone.
+pub fn post_main_room_message(
+    state: &TeamModeWebState,
+    team_id: &str,
+    body_bytes: &[u8],
+) -> Result<Message, WebError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PostMessageRequest {
+        body: String,
+        #[serde(default)]
+        mentions: Vec<String>,
+    }
+
+    if body_bytes.is_empty() {
+        return Err(WebError::bad_request(
+            "request body is empty; expected JSON {body, mentions?}",
+        ));
+    }
+    let req: PostMessageRequest = serde_json::from_slice(body_bytes)
+        .map_err(|err| WebError::bad_request(format!("invalid JSON body: {err}")))?;
+
+    let body_text = req.body.trim();
+    if body_text.is_empty() {
+        return Err(WebError::bad_request(
+            "message body is empty; type something to send",
+        ));
+    }
+
+    // Confirm the team exists before touching the member store. Without
+    // this, lazy-create would fabricate a `user` member under a non-existent
+    // team and the subsequent `send` would fail with a more confusing error.
+    state
+        .team_service
+        .get(team_id)?
+        .ok_or_else(|| WebError::not_found(format!("team '{team_id}' not found")))?;
+
+    ensure_web_user_member(state, team_id)?;
+
+    let message = state.message_service.send(SendMessageRequest {
+        team_id: team_id.to_string(),
+        room_id: "main".to_string(),
+        sender: WEB_USER_SENDER.to_string(),
+        kind: MessageKind::Discussion,
+        subject: None,
+        body: req.body,
+        mentions: req.mentions,
+        visibility: Vec::new(),
+        audience_policy: None,
+        reply_to: None,
+        thread_id: None,
+        expires_at: None,
+    })?;
+
+    Ok(message)
+}
+
+/// Idempotently make sure the `user` member exists for this team.
+///
+/// Re-creates the member if it was previously soft-removed (status ==
+/// `Removed`). The reactivation path mirrors what worker_add does for
+/// dead workers — operationally equivalent, just without an execution
+/// profile (the web user doesn't spawn a backend process).
+fn ensure_web_user_member(state: &TeamModeWebState, team_id: &str) -> Result<(), WebError> {
+    match state.member_service.get(team_id, WEB_USER_SENDER)? {
+        Some(record) => {
+            if matches!(record.profile.status, MemberStatus::Removed) {
+                state.member_service.mark_active(team_id, WEB_USER_SENDER)?;
+            }
+            Ok(())
+        }
+        None => {
+            state.member_service.add(AddMemberRequest {
+                team_id: team_id.to_string(),
+                name: WEB_USER_SENDER.to_string(),
+                kind: MemberKind::Member,
+                role_label: WEB_USER_ROLE_LABEL.to_string(),
+                role_description: Some(
+                    "Human user sending messages from the web UI. Not a managed agent.".into(),
+                ),
+                execution: None,
+            })?;
+            Ok(())
+        }
     }
 }
 

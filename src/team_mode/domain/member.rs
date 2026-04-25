@@ -52,6 +52,15 @@ pub struct ExecutionProfile {
     /// `None` for backends that don't expose a session id (codex, gemini-cli).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Reasoning-effort override for backends that take one (codex:
+    /// `low|medium|high|xhigh`). `None` means "don't pass `-c
+    /// model_reasoning_effort=…`" — the backend CLI then falls back to
+    /// whatever the user has configured in their own config file (e.g.
+    /// `~/.codex/config.toml`). We deliberately do NOT default to
+    /// `"medium"` in this codebase; doing so would silently override a
+    /// user who set `high` globally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// On-disk envelope for `<base>/<team>/members.json`.
@@ -137,7 +146,7 @@ mod tests {
             skills: vec!["review".into()],
             session_state: Some(ExecutionSessionState::Running),
             session_id: None,
-        };
+                    reasoning_effort: None,};
 
         let json = serde_json::to_string(&execution).unwrap();
         let parsed: ExecutionProfile = serde_json::from_str(&json).unwrap();
@@ -178,7 +187,7 @@ mod tests {
                         skills: vec![],
                         session_state: Some(ExecutionSessionState::Running),
                         session_id: None,
-                    }),
+                    reasoning_effort: None,}),
                 },
             ],
         };

@@ -1,3 +1,33 @@
+//! Message domain types.
+//!
+//! # Routing rules actually enforced today
+//!
+//! Despite the breadth of `AudiencePolicy` / `VisibilityRule` variants
+//! defined here, the live send pipeline (`MessageService::send`)
+//! implements exactly **two** rules — everything else is a reserved
+//! placeholder for future routing modes (role-based fan-out, public/
+//! private rooms, custom policies). They are stored on the message but
+//! NOT consulted to decide who receives it.
+//!
+//! ```text
+//! 1. effective_recipients = @mentions parsed from the body
+//!      (case-insensitive; unknown / removed names go to dropped_for)
+//! 2. lead observability: if sender ≠ lead, lead is auto-added to
+//!      effective_recipients so the team's coordinator never falls behind.
+//! ```
+//!
+//! Worker A → Worker B replies are **not** auto-routed; A must spell
+//! `@b`. This was a deliberate fix for an LLM ping-pong loop where two
+//! workers kept polite-acknowledging each other forever (Bug 12). Lead
+//! observability is the only "automatic" recipient.
+//!
+//! When you add a new variant of `AudiencePolicy` / `VisibilityRule`,
+//! make sure `MessageService::send` is taught to honor it — the type
+//! system won't catch a forgotten match arm because we currently dispatch
+//! on a single `Mentions` path. Read-only consumers (web UI, MCP
+//! resources) can store unknown variants safely; they're surfaced as
+//! diagnostic metadata only.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

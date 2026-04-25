@@ -116,6 +116,10 @@ impl TeamModeToolset {
         )
         .with_inbox_notifier(inbox_notifier.clone())
         .with_lead_pending_writer(lead_pending_writer.clone());
+        // Hand the fully-wired service to the web layer so user-initiated
+        // sends from the browser fire the same notifier + lead-pending writes
+        // as MCP-tool sends. Both sides hit the exact same routing path.
+        crate::team_mode_web::install_shared_message_service(message_service.clone());
         let inbox_service = InboxService::new(projection_store, message_store.clone());
         let runtime_workers = RuntimeWorkerStore::new(base_dir.clone());
 
@@ -185,6 +189,13 @@ impl TeamModeToolset {
                             json!({"type":"string","enum":["claude-code","codex","gemini-cli"]}),
                         ),
                         ("model", json!({"type":"string"})),
+                        // Reasoning effort override (codex only today). Omit
+                        // to inherit the user's global config, e.g.
+                        // `~/.codex/config.toml`'s `model_reasoning_effort`.
+                        (
+                            "effort",
+                            json!({"type":"string","enum":["low","medium","high","xhigh"]}),
+                        ),
                         ("cwd", json!({"type":"string"})),
                         ("system_prompt", json!({"type":"string"})),
                         (
@@ -546,6 +557,16 @@ impl TeamModeToolset {
                 "'lead' is a reserved name and cannot be used for a worker".into(),
             ));
         }
+        // Reserve the synthetic web-UI sender name. If a user named a real
+        // worker `user`, web messages from the browser would land in that
+        // worker's inbox (sender == self), tripping the self-mention guard
+        // and possibly other downstream confusion.
+        if worker_name == crate::team_mode_web::read_model::WEB_USER_SENDER {
+            return Err(Error::Other(format!(
+                "'{}' is reserved for the web-UI sender and cannot be used for a worker",
+                crate::team_mode_web::read_model::WEB_USER_SENDER
+            )));
+        }
         // Same strict slug check as team_create. Without this, names with
         // spaces / uppercase / unicode were accepted but unreachable via
         // @mention — workers existed in members.json but no message could
@@ -617,6 +638,11 @@ impl TeamModeToolset {
                     skills: Vec::new(),
                     session_state: None,
                     session_id: None,
+                    // Optional. None = let the backend's own config file
+                    // (e.g. `~/.codex/config.toml`) decide. Don't default
+                    // to `"medium"` — that would silently override the
+                    // user's global preference.
+                    reasoning_effort: optional_identifier(args, "effort")?,
                 }
             }
         };
@@ -714,7 +740,11 @@ impl TeamModeToolset {
         config.model = execution.model.clone();
         config.cwd = execution.cwd.as_ref().map(PathBuf::from);
         config.env = execution.env.clone();
-        config.reasoning_effort = Some("medium".into());
+        // Pass through whatever the caller stored — `None` means the
+        // backend CLI consults its own config (e.g. `~/.codex/config.toml`).
+        // No project-level hardcoding: a user who set `model_reasoning_effort
+        // = "high"` globally must see that take effect.
+        config.reasoning_effort = execution.reasoning_effort.clone();
 
         let key = spawn_key(&team_name, &worker_name);
         self.runtime_workers.upsert_state(
@@ -970,6 +1000,17 @@ impl TeamModeToolset {
         let workers: Vec<Value> = members
             .into_iter()
             .filter(|r| !matches!(r.profile.kind, MemberKind::Lead))
+            // Exclude the synthetic `user` member auto-created when the web
+            // UI sends its first message. It has no execution profile, so
+            // the liveness probe below would falsely flag it as "dead" and
+            // suggest revival via `worker_add reuse` — confusing UX. The
+            // web user is a sender identity, not a worker.
+            .filter(|r| {
+                let label = r.profile.role_label.as_str();
+                let name = r.profile.name.as_str();
+                label != crate::team_mode_web::read_model::WEB_USER_ROLE_LABEL
+                    && name != crate::team_mode_web::read_model::WEB_USER_SENDER
+            })
             .map(|record| {
                 let adapter = record
                     .execution

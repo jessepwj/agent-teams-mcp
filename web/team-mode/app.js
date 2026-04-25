@@ -2,6 +2,7 @@ const REFRESH_INTERVAL_MS = 2000;
 const COLUMN_WIDTHS_STORAGE_KEY = "team-mode-web-column-widths";
 const DEFAULT_COLUMN_WIDTHS = { left: 260, right: null };
 const FALLBACK_RIGHT_PANE_WIDTH = 360;
+const TIMELINE_BOTTOM_THRESHOLD_PX = 120;
 const COLUMN_LIMITS = {
   left: { min: 180, max: 520 },
   right: { min: 260, max: 680 },
@@ -37,6 +38,9 @@ const state = {
   memberConversation: null,
   detailRequestSeq: 0,
   language: "zh",
+  composerMention: "",
+  composerSending: false,
+  timelineForceScrollBottom: false,
   columnWidths: loadColumnWidths(),
   detailTab: "session",
 };
@@ -60,7 +64,7 @@ const STRINGS = {
     resetFilters: "重置筛选",
     leadActivity: "负责人活动",
     noFilters: "未启用筛选。",
-    timeline: "聊天时间线",
+    timeline: "群聊",
     selectTeam: "选择团队以加载消息。",
     detailPane: "详情面板",
     sessionTab: "会话",
@@ -73,6 +77,12 @@ const STRINGS = {
     sessionFile: "会话文件",
     matchedBy: "匹配方式",
     sessionSetup: "会话初始化",
+    workTurn: "工作轮次",
+    receivedInput: "收到输入",
+    hookInput: "Hook 输入",
+    executionSteps: "执行步骤",
+    finalReply: "最终回复",
+    noFinalReply: "暂无最终回复",
     thinking: "思考",
     running: "运行中",
     complete: "完成",
@@ -107,6 +117,13 @@ const STRINGS = {
     missing: "缺失",
     ready: "就绪",
     loading: "加载中",
+    composerSend: "发送",
+    composerSending: "发送中...",
+    composerPlaceholder: "输入消息，回车发送，Shift+回车换行",
+    composerEmpty: "请输入要发送的消息。",
+    composerNoTeam: "请先选择团队再发送。",
+    composerSentTo: "已发送给",
+    composerSendFailed: "发送失败：",
     error: "错误",
     refreshFailedFlag: "刷新失败",
     livePrefix: "状态",
@@ -145,6 +162,7 @@ const STRINGS = {
     loadError: "加载错误",
     messageNotFound: "找不到消息",
     message: "消息",
+    messageUnit: "条消息",
     messageMissing: "当前时间线中没有该消息。",
     teamLabel: "团队",
     routing: "路由",
@@ -205,7 +223,7 @@ const STRINGS = {
     resetFilters: "Reset filters",
     leadActivity: "Lead Activity",
     noFilters: "No filters active.",
-    timeline: "Chat Timeline",
+    timeline: "Group Chat",
     selectTeam: "Select a team to load messages.",
     detailPane: "Detail Pane",
     sessionTab: "Session",
@@ -218,6 +236,12 @@ const STRINGS = {
     sessionFile: "Session File",
     matchedBy: "Matched By",
     sessionSetup: "Session setup",
+    workTurn: "Work turn",
+    receivedInput: "Received input",
+    hookInput: "Hook input",
+    executionSteps: "Execution steps",
+    finalReply: "Final reply",
+    noFinalReply: "No final reply",
     thinking: "Thinking",
     running: "Running",
     complete: "Complete",
@@ -251,6 +275,13 @@ const STRINGS = {
     available: "available",
     missing: "missing",
     ready: "ready",
+    composerSend: "Send",
+    composerSending: "Sending...",
+    composerPlaceholder: "Type a message — Enter to send, Shift+Enter for newline",
+    composerEmpty: "Type something before sending.",
+    composerNoTeam: "Pick a team first.",
+    composerSentTo: "Sent to",
+    composerSendFailed: "Send failed: ",
     loading: "loading",
     error: "error",
     refreshFailedFlag: "refresh failed",
@@ -290,6 +321,7 @@ const STRINGS = {
     loadError: "Load error",
     messageNotFound: "Message not found",
     message: "Message",
+    messageUnit: "messages",
     messageMissing: "is not present in the current timeline.",
     teamLabel: "Team",
     routing: "Routing",
@@ -343,6 +375,10 @@ function t(key) {
 
 function localizedError(key, error) {
   return state.language === "zh" ? `${t(key)}：${error.message}` : `${t(key)}: ${error.message}`;
+}
+
+function messageCountLabel(count) {
+  return `${count} ${t("messageUnit")}`;
 }
 
 function na() {
@@ -557,6 +593,30 @@ async function api(path) {
   return response.json();
 }
 
+async function apiPost(path, payload) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  // Always try to parse JSON — both success (Created) and structured error
+  // bodies come back as JSON. If parsing fails fall back to status text.
+  let parsed = null;
+  try {
+    parsed = await response.json();
+  } catch (_) {
+    parsed = null;
+  }
+  if (!response.ok) {
+    const detail = parsed && parsed.error ? parsed.error : `${response.status} ${response.statusText}`;
+    throw new Error(detail);
+  }
+  return parsed;
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -564,6 +624,53 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+/// Stable HSL hue (0..360) derived from a sender name.
+///
+/// We use a simple djb2-style hash so the same name always lands on the
+/// same hue across sessions. Special-casing keeps the two highest-signal
+/// senders visually distinct regardless of name:
+///   * `lead`  -> 188 (cyan, matches the brand accent so the eye still
+///                 reads it as "the coordinator")
+///   * `user`  -> 28  (warm orange — the human input shouldn't blend into
+///                 the wash of AI workers)
+/// All other names hash freely. The pre-skipped slice of hue space (the
+/// orange/cyan bands) stays large enough that random workers still cover
+/// blue/green/purple/red without clashing with the reserved colors.
+function senderHue(name) {
+  if (!name) return 200;
+  if (name === "lead") return 188;
+  if (name === "user") return 28;
+  let hash = 5381;
+  for (let i = 0; i < name.length; i += 1) {
+    hash = ((hash << 5) + hash + name.charCodeAt(i)) & 0xffffffff;
+  }
+  // Skip the 14..50 (orange) and 175..205 (cyan) bands so workers don't
+  // accidentally collide with `user` / `lead`. We have a comfortable
+  // ~290° of remaining hue real estate, which is plenty for normal team sizes.
+  const usable = 360 - 36 - 30; // 294 degrees
+  let bucket = Math.abs(hash) % usable;
+  if (bucket >= 14) bucket += 36; // jump past 14..50
+  if (bucket >= 175) bucket += 30; // jump past 175..205
+  return bucket;
+}
+
+/// Render a senderName as the colored pill used everywhere a member's
+/// name appears (timeline rows, detail panels, member list). Caller is
+/// responsible for HTML-escaping `senderName` if it ever flows from
+/// untrusted input — names are validated to a strict slug, so within
+/// this codebase they're safe to interpolate.
+function renderSenderBadge(senderName, senderKind, extraClass = "") {
+  const hue = senderHue(senderName);
+  const kindClass =
+    senderName === "user"
+      ? "is-user"
+      : senderKind === "lead" || senderName === "lead"
+        ? "is-lead"
+        : "";
+  const cls = ["sender-badge", kindClass, extraClass].filter(Boolean).join(" ");
+  return `<span class="${cls}" style="--sender-hue: ${hue}">${escapeHtml(senderName)}</span>`;
 }
 
 function escapeAttr(value) {
@@ -898,9 +1005,129 @@ function renderShell() {
   renderHeader();
   renderLeftPane();
   renderTimeline();
+  renderComposer();
   renderDetail();
   bindDiagnosticsRetryButton();
   renderFooter();
+}
+
+/// Recipient candidates for the composer's @ dropdown.
+///
+/// Order: lead first (so it's the natural default), then alphabetized
+/// active workers. Synthetic `user` is excluded — sending @user to yourself
+/// is rejected by the server's self-mention guard, so showing it is
+/// guaranteed-fail UX.
+function composerRecipientCandidates() {
+  const all = state.members || [];
+  const lead = all.find((m) => m.kind === "lead");
+  const workers = all
+    .filter((m) => m.kind !== "lead")
+    .filter((m) => m.name !== "user")
+    .filter((m) => (m.status || "active") === "active")
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return lead ? [lead, ...workers] : workers;
+}
+
+function renderComposer() {
+  const form = document.getElementById("composerForm");
+  if (!form) return;
+  const select = document.getElementById("composerMention");
+  const input = document.getElementById("composerInput");
+  const button = document.getElementById("composerSend");
+  if (!select || !input || !button) return;
+
+  // Populate placeholder + button text on every render so language toggle
+  // takes effect immediately.
+  input.placeholder = t("composerPlaceholder");
+  if (!state.composerSending) {
+    button.textContent = t("composerSend");
+    button.disabled = false;
+  } else {
+    button.textContent = t("composerSending");
+    button.disabled = true;
+  }
+
+  const candidates = composerRecipientCandidates();
+  const previous = state.composerMention || (candidates[0] && candidates[0].name) || "";
+  const stillExists = candidates.some((m) => m.name === previous);
+  const chosen = stillExists ? previous : candidates[0] && candidates[0].name;
+
+  // Repopulate the <select> only when the membership list changed; otherwise
+  // re-renders during typing would reset the focused option to the first
+  // entry and surprise the user.
+  const desired = candidates.map((m) => m.name).join(",");
+  if (select.dataset.populatedFor !== desired) {
+    select.innerHTML = candidates
+      .map(
+        (m) =>
+          `<option value="${escapeAttr(m.name)}">${escapeHtml(m.name)}${
+            m.kind === "lead" ? ` (${escapeHtml(label("lead"))})` : ""
+          }</option>`,
+      )
+      .join("");
+    select.dataset.populatedFor = desired;
+  }
+  if (chosen) {
+    select.value = chosen;
+    state.composerMention = chosen;
+  }
+
+  form.style.display = state.teamId && candidates.length ? "" : "none";
+}
+
+async function submitComposer() {
+  const input = document.getElementById("composerInput");
+  const select = document.getElementById("composerMention");
+  const status = document.getElementById("composerStatus");
+  if (!input || !select || !status) return;
+
+  if (!state.teamId) {
+    setComposerStatus("error", t("composerNoTeam"));
+    return;
+  }
+  const text = (input.value || "").trim();
+  if (!text) {
+    setComposerStatus("error", t("composerEmpty"));
+    return;
+  }
+  const recipient = select.value;
+  if (!recipient) {
+    setComposerStatus("error", t("composerNoTeam"));
+    return;
+  }
+
+  // The recipient is added explicitly so the server doesn't have to scan
+  // the body for an @mention; user-typed @ in the body is also honored
+  // (combined deduped server-side).
+  const body = text.startsWith(`@${recipient}`) ? text : `@${recipient} ${text}`;
+
+  state.composerSending = true;
+  setComposerStatus("info", t("composerSending"));
+  renderComposer();
+
+  try {
+    await apiPost(
+      `/api/teams/${encodeURIComponent(state.teamId)}/rooms/main/messages`,
+      { body, mentions: [recipient] },
+    );
+    input.value = "";
+    setComposerStatus("success", `${t("composerSentTo")} @${recipient}`);
+    state.timelineForceScrollBottom = true;
+    // Refresh room messages so the just-sent message appears immediately.
+    await loadTeam(state.teamId);
+  } catch (err) {
+    setComposerStatus("error", `${t("composerSendFailed")}${err.message || err}`);
+  } finally {
+    state.composerSending = false;
+    renderComposer();
+  }
+}
+
+function setComposerStatus(level, text) {
+  const status = document.getElementById("composerStatus");
+  if (!status) return;
+  status.textContent = text;
+  status.className = `composer-status ${level === "success" ? "success" : level === "error" ? "error" : "muted"}`;
 }
 
 function renderStaticText() {
@@ -937,7 +1164,7 @@ function renderHeader() {
   $("timelineSubtitle").textContent = state.loadingTeam
     ? t("loadingTeamData")
     : team
-      ? `${team.name} · ${state.members.length} ${t("members")} · ${allMessages().length} ${t("message")}`
+      ? `${team.name} · ${state.members.length} ${t("members")} · ${messageCountLabel(allMessages().length)}`
       : state.loadingTeams
         ? t("loadingTeams")
         : t("noTeamsAvailable");
@@ -975,10 +1202,11 @@ function renderLeftPane() {
       .map((member) => {
         const active = member.name === state.selectedMemberName ? " active" : "";
         const badge = member.kind === "lead" ? "lead" : "worker";
+        const hue = senderHue(member.name);
         return `
-          <button class="list-button${active}" type="button" data-member="${escapeHtml(member.name)}">
+          <button class="list-button${active}" type="button" data-member="${escapeHtml(member.name)}" style="--sender-hue: ${hue}">
             <div class="message-head">
-              <span class="sender">${escapeHtml(member.name)}</span>
+              ${renderSenderBadge(member.name, member.kind)}
               <span class="badge ${badge}">${escapeHtml(label(member.sessionState || "unknown"))}</span>
             </div>
             <div class="subtle">${escapeHtml(label(member.roleLabel || ""))}</div>
@@ -1003,66 +1231,69 @@ function renderLeftPane() {
 }
 
 function renderTimeline() {
+  const scrollSnapshot = captureTimelineScroll();
   const messages = filteredMessages();
-  $("timelineStats").innerHTML = `
-    <span class="pill">${messages.length} ${t("visible")}</span>
-    <span class="pill">${allMessages().length} ${t("total")}</span>
-  `;
+  const totalMessages = allMessages().length;
+  const hasActiveFilters = Boolean(state.senderFilter || state.mentionFilter || state.search.trim());
+  $("timelineStats").innerHTML = hasActiveFilters
+    ? `<span class="chat-count">${messages.length}/${messageCountLabel(totalMessages)}</span>`
+    : `<span class="chat-count">${messageCountLabel(totalMessages)}</span>`;
 
   if (!state.teamId) {
     $("messageList").innerHTML = `<div class="empty">${t("noMessages")}</div>`;
+    restoreTimelineScroll(scrollSnapshot);
     return;
   }
 
   if (state.loadingTeam) {
     $("messageList").innerHTML = `<div class="empty">${t("loadingMessages")}</div>`;
+    restoreTimelineScroll(scrollSnapshot);
     return;
   }
 
   if (allMessages().length === 0) {
     $("messageList").innerHTML = `<div class="empty">${t("noMessages")}</div>`;
+    restoreTimelineScroll(scrollSnapshot);
     return;
   }
 
   if (messages.length === 0) {
     $("messageList").innerHTML = `<div class="empty">${t("noMessagesMatch")}</div>`;
+    restoreTimelineScroll(scrollSnapshot);
     return;
   }
 
   $("messageList").innerHTML = messages
     .map((message) => {
       const active = message.id === state.selectedMessageId ? " active" : "";
-      const statusClass =
-        message.deliveryStatus === "failed" || message.deliveryStatus === "expired"
-          ? "fail"
-          : message.deliveryStatus === "partial"
-            ? "warn"
-            : "";
-      const threadCount = message.threadReplyCount || 0;
-      const mentions = (message.mentions || [])
-        .map(
-          (mention) =>
-            `<button class="link-button" type="button" data-mention="${escapeHtml(mention)}">@${escapeHtml(mention)}</button>`,
-        )
-        .join(" ");
-      const recipients = (message.effectiveRecipients || [])
-        .map((recipient) => `<span class="pill">${escapeHtml(recipient)}</span>`)
-        .join(" ");
+      if (isSystemChatMessage(message)) {
+        return `
+          <article class="chat-system${active}" data-message="${escapeHtml(message.id)}">
+            <div class="chat-system-time">${fmtTime(message.createdAt)}</div>
+            <div class="chat-system-text">${renderChatText(message.bodyPreview || message.body || "")}</div>
+          </article>
+        `;
+      }
+      const status = renderChatDeliveryStatus(message);
+      const senderHueValue = senderHue(message.sender);
+      const avatarKind =
+        message.sender === "user"
+          ? "user"
+          : message.senderKind === "lead" || message.sender === "lead"
+            ? "lead"
+            : "worker";
       return `
-        <article class="message-row${active}" data-message="${escapeHtml(message.id)}">
-          <div class="message-head">
-            <div class="message-meta">
-              <button class="link-button sender" type="button" data-sender="${escapeHtml(message.sender)}">${escapeHtml(message.sender)}</button>
-              <span class="badge ${message.senderKind === "lead" ? "lead" : "worker"}">${escapeHtml(label(message.kind))}</span>
-              <span class="badge ${statusClass}">${escapeHtml(label(message.deliveryStatus))}</span>
-              <span class="pill">${fmtTime(message.createdAt)}</span>
+        <article class="chat-message${active}" data-message="${escapeHtml(message.id)}" style="--sender-hue: ${senderHueValue}">
+          <button class="chat-avatar ${avatarKind} sender-tinted" type="button" data-sender="${escapeHtml(message.sender)}" aria-label="${escapeHtml(message.sender)}" style="--sender-hue: ${senderHueValue}">
+            ${escapeHtml(avatarInitials(message.sender))}
+          </button>
+          <div class="chat-content">
+            <div class="chat-meta">
+              <button class="link-button chat-name" type="button" data-sender="${escapeHtml(message.sender)}" style="color: hsl(${senderHueValue}, 80%, 75%)">${escapeHtml(message.sender)}</button>
+              <span class="chat-time">${fmtTime(message.createdAt)}</span>
+              ${status}
             </div>
-            <span class="pill">${threadCount} ${t("thread")}</span>
-          </div>
-          <div class="message-body">${escapeHtml(message.bodyPreview || message.body || "")}</div>
-          <div class="message-links">
-            ${mentions}
-            ${recipients}
+            <div class="chat-bubble">${renderChatText(message.bodyPreview || message.body || "")}</div>
           </div>
         </article>
       `;
@@ -1096,6 +1327,73 @@ function renderTimeline() {
       renderShell();
     });
   });
+
+  restoreTimelineScroll(scrollSnapshot);
+}
+
+function captureTimelineScroll() {
+  const list = $("messageList");
+  if (!list) {
+    return { list: null, nearBottom: true, top: 0 };
+  }
+  const distanceToBottom = list.scrollHeight - list.scrollTop - list.clientHeight;
+  const nearBottom =
+    !Number.isFinite(distanceToBottom) || distanceToBottom <= TIMELINE_BOTTOM_THRESHOLD_PX;
+  return {
+    list,
+    nearBottom,
+    top: list.scrollTop || 0,
+  };
+}
+
+function restoreTimelineScroll(snapshot) {
+  const list = snapshot?.list || $("messageList");
+  if (!list) {
+    return;
+  }
+  const shouldStickToBottom = Boolean(state.timelineForceScrollBottom || snapshot?.nearBottom);
+  const shouldClearForce = !state.loadingTeam;
+  nextFrame(() => {
+    if (shouldStickToBottom) {
+      list.scrollTop = list.scrollHeight;
+    } else {
+      list.scrollTop = snapshot?.top || 0;
+    }
+    if (shouldClearForce) {
+      state.timelineForceScrollBottom = false;
+    }
+  });
+}
+
+function isSystemChatMessage(message) {
+  return message.kind === "status" || String(message.body || "").startsWith("[SYSTEM]");
+}
+
+function avatarInitials(name) {
+  const trimmed = String(name || "?").trim();
+  if (!trimmed) return "?";
+  const parts = trimmed.split(/[\s._-]+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
+  }
+  return trimmed.slice(0, 2).toUpperCase();
+}
+
+function renderChatDeliveryStatus(message) {
+  const status = message.deliveryStatus;
+  if (!["failed", "expired", "partial"].includes(status)) {
+    return "";
+  }
+  const className = status === "partial" ? "warn" : "fail";
+  return `<span class="chat-status ${className}">${escapeHtml(label(status))}</span>`;
+}
+
+function renderChatText(text) {
+  const escaped = escapeHtml(text || "");
+  return escaped.replace(
+    /@([\p{L}\p{N}_.-]+)/gu,
+    '<button class="link-button mention-token" type="button" data-mention="$1">@$1</button>',
+  );
 }
 
 function renderDiagnosticsSections() {
@@ -1367,7 +1665,7 @@ async function renderMessageDetail(message) {
   $("detailBody").innerHTML = `
     <div class="detail-card">
       <div class="detail-head">
-        <span class="badge ${message.senderKind === "lead" ? "lead" : "worker"}">${escapeHtml(message.sender)}</span>
+        ${renderSenderBadge(message.sender, message.senderKind)}
         <span class="pill">${escapeHtml(label(message.kind))}</span>
         <span class="pill">${escapeHtml(label(message.deliveryStatus))}</span>
       </div>
@@ -1412,7 +1710,7 @@ async function renderMessageDetail(message) {
                 (item) => `
                   <div class="detail-item">
                     <div class="detail-head">
-                      <span class="badge ${item.senderKind === "lead" ? "lead" : "worker"}">${escapeHtml(item.sender)}</span>
+                      ${renderSenderBadge(item.sender, item.senderKind)}
                       <span class="pill">${fmtTime(item.createdAt)}</span>
                     </div>
                     <div class="message-body">${escapeHtml(item.bodyPreview || item.body || "")}</div>
@@ -1683,29 +1981,57 @@ function preprocessConversationItems(items) {
 
 function groupConversationItemsIntoTurns(items) {
   const groups = [];
-  let currentAssistantGroup = [];
+  let currentTurn = null;
+  let turnIndex = 0;
+
+  const flushTurn = () => {
+    if (currentTurn && (currentTurn.prompt || currentTurn.items.length)) {
+      groups.push(currentTurn);
+    }
+    currentTurn = null;
+  };
+
   for (const item of items) {
-    if (item.type === "user_prompt" || item.type === "session_setup") {
-      if (currentAssistantGroup.length) {
-        groups.push({ isUserPrompt: false, items: currentAssistantGroup });
-        currentAssistantGroup = [];
-      }
-      groups.push({ isUserPrompt: true, items: [item] });
+    if (item.type === "session_setup") {
+      flushTurn();
+      groups.push({ type: "session_setup", items: [item] });
+      continue;
+    }
+
+    if (item.type === "user_prompt") {
+      flushTurn();
+      turnIndex += 1;
+      currentTurn = {
+        type: "work_turn",
+        index: turnIndex,
+        prompt: item,
+        items: [],
+      };
     } else {
-      currentAssistantGroup.push(item);
+      if (!currentTurn) {
+        turnIndex += 1;
+        currentTurn = {
+          type: "work_turn",
+          index: turnIndex,
+          prompt: null,
+          items: [],
+        };
+      }
+      currentTurn.items.push(item);
     }
   }
-  if (currentAssistantGroup.length) {
-    groups.push({ isUserPrompt: false, items: currentAssistantGroup });
-  }
+  flushTurn();
   return groups;
 }
 
 function renderConversationGroup(group) {
-  if (group.isUserPrompt) {
+  if (group.type === "session_setup") {
     return group.items.map(renderConversationRenderItem).join("");
   }
-  const first = group.items[0] || {};
+  if (group.type === "work_turn") {
+    return renderWorkTurn(group);
+  }
+  const first = group.items?.[0] || {};
   return `
     <div class="assistant-turn" data-turn-id="${escapeHtml(first.id || "")}">
       ${group.items.map(renderConversationRenderItem).join("")}
@@ -1713,10 +2039,80 @@ function renderConversationGroup(group) {
   `;
 }
 
-function renderConversationRenderItem(item) {
+function renderWorkTurn(group) {
+  const finalText = findFinalTextItem(group.items);
+  const stepCount = group.items.filter((item) => item.type !== "text").length;
+  const promptKind = classifyConversationPrompt(group.prompt);
+  return `
+    <section class="conversation-work-turn" data-turn-id="${escapeHtml(group.prompt?.id || group.items[0]?.id || "")}">
+      <div class="work-turn-header">
+        <div>
+          <div class="work-turn-title">${t("workTurn")} ${group.index}</div>
+          <div class="work-turn-subtitle">
+            <span>${promptKind.label}</span>
+            <span>${stepCount} ${t("executionSteps")}</span>
+            <span>${finalText ? t("finalReply") : t("noFinalReply")}</span>
+          </div>
+        </div>
+        ${group.prompt?.timestamp ? `<span class="conversation-timestamp">${fmtTime(group.prompt.timestamp)}</span>` : ""}
+      </div>
+      ${
+        group.prompt
+          ? renderUserPromptItem(group.prompt, {
+              label: promptKind.label,
+              variant: promptKind.variant,
+            })
+          : ""
+      }
+      <div class="work-turn-steps assistant-turn">
+        ${
+          group.items.length
+            ? group.items
+                .map((item) =>
+                  renderConversationRenderItem(item, {
+                    isFinalReply: Boolean(finalText && item.id === finalText.id),
+                  }),
+                )
+                .join("")
+            : `<div class="empty-inline">${t("noFinalReply")}</div>`
+        }
+      </div>
+    </section>
+  `;
+}
+
+function findFinalTextItem(items) {
+  let hasToolAfter = false;
+  for (const item of [...items].reverse()) {
+    if (item.type === "tool_call") {
+      hasToolAfter = true;
+      continue;
+    }
+    if (item.type === "text" && String(item.text || "").trim() && !hasToolAfter) {
+      return item;
+    }
+  }
+  return null;
+}
+
+function classifyConversationPrompt(item) {
+  const text = String(item?.content || "");
+  const isHook =
+    /\bhook\b/i.test(text) ||
+    /<system-reminder/i.test(text) ||
+    /lead[_ -]?pending/i.test(text) ||
+    /\binjected\b/i.test(text) ||
+    /\[SYSTEM\]/i.test(text);
+  return {
+    label: isHook ? t("hookInput") : t("receivedInput"),
+    variant: isHook ? "hook" : "received",
+  };
+}
+
+function renderConversationRenderItem(item, options = {}) {
   switch (item.type) {
     case "user_prompt":
-      return renderUserPromptItem(item);
+      return renderUserPromptItem(item, options);
     case "session_setup":
       return renderSessionSetupItem(item);
     case "thinking":
@@ -1727,15 +2123,17 @@ function renderConversationRenderItem(item) {
       return renderSystemItem(item);
     case "text":
     default:
-      return renderTextItem(item);
+      return renderTextItem(item, options);
   }
 }
 
-function renderUserPromptItem(item) {
+function renderUserPromptItem(item, options = {}) {
+  const label = options.label || t("receivedInput");
+  const variant = options.variant || "received";
   return `
-    <div class="conversation-user-prompt" data-render-id="${escapeHtml(item.id)}">
+    <div class="conversation-user-prompt ${variant === "hook" ? "conversation-user-prompt-hook" : ""}" data-render-id="${escapeHtml(item.id)}">
+      <div class="conversation-step-label">${escapeHtml(label)}</div>
       <div class="message-user-prompt">${renderMarkdownText(item.content || "")}</div>
-      ${item.timestamp ? `<div class="conversation-timestamp">${fmtTime(item.timestamp)}</div>` : ""}
     </div>
   `;
 }
@@ -1753,9 +2151,11 @@ function renderSessionSetupItem(item) {
   `;
 }
 
-function renderTextItem(item) {
+function renderTextItem(item, options = {}) {
+  const isFinalReply = Boolean(options.isFinalReply);
   return `
-    <div class="text-block timeline-item" data-render-id="${escapeHtml(item.id)}">
+    <div class="text-block timeline-item ${isFinalReply ? "final-reply-block" : ""}" data-render-id="${escapeHtml(item.id)}">
+      ${isFinalReply ? `<div class="conversation-step-label final-reply-label">${t("finalReply")}</div>` : ""}
       <button type="button" class="text-block-copy" data-copy-text="${escapeAttr(item.text || "")}" title="${t("copy")}" aria-label="${t("copy")}">⧉</button>
       ${renderMarkdownText(item.text || "")}
       ${item.timestamp ? `<div class="conversation-timestamp">${fmtTime(item.timestamp)}</div>` : ""}
@@ -2055,6 +2455,7 @@ function renderMemberDetailContent(name, data, activity) {
   $("detailBody").innerHTML = `
       <div class="detail-card">
         <div class="detail-head">
+          ${renderSenderBadge(profile.name || name, profile.kind)}
           <span class="badge ${isLead ? "lead" : "worker"}">${escapeHtml(label(profile.kind || "member"))}</span>
           <span class="pill">${escapeHtml(label(execution.sessionState || "unknown"))}</span>
           <span class="pill">${escapeHtml(label(profile.roleLabel || ""))}</span>
@@ -2395,6 +2796,30 @@ function bindEvents() {
       renderShell();
     }
   });
+
+  const composerForm = document.getElementById("composerForm");
+  if (composerForm) {
+    composerForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitComposer();
+    });
+  }
+  const composerInput = document.getElementById("composerInput");
+  if (composerInput) {
+    // Enter sends; Shift+Enter inserts a newline.
+    composerInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        submitComposer();
+      }
+    });
+  }
+  const composerSelect = document.getElementById("composerMention");
+  if (composerSelect) {
+    composerSelect.addEventListener("change", (event) => {
+      state.composerMention = event.target.value;
+    });
+  }
 }
 
 window.addEventListener("DOMContentLoaded", async () => {

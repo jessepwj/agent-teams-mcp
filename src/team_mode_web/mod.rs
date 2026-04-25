@@ -6,4 +6,4 @@ pub mod routes;
 pub mod state;
 
 pub use app::{TeamModeWebApp, router, serve, serve_listener};
-pub use state::TeamModeWebState;
+pub use state::{TeamModeWebState, install_shared_message_service};

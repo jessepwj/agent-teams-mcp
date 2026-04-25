@@ -172,8 +172,94 @@ select {
 
 .timeline-pane {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  /* header / scrollable timeline / sticky composer at the bottom */
+  grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
+}
+
+.composer {
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  padding: 10px 14px 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.composer-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.composer-mention {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.composer-select {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 6px 4px;
+  outline: none;
+  cursor: pointer;
+  /* Cap at the longest worker name so ultra-long custom names don't push
+     the textarea off-screen. */
+  max-width: 160px;
+}
+
+.composer-input {
+  resize: vertical;
+  min-height: 36px;
+  max-height: 200px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: inherit;
+  font: inherit;
+  line-height: 1.4;
+}
+
+.composer-input:focus,
+.composer-select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.composer-send {
+  padding: 0 18px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-fg, #fff);
+  font: inherit;
+  cursor: pointer;
+}
+
+.composer-send:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.composer-status {
+  min-height: 1em;
+  font-size: 0.85em;
+}
+
+.composer-status.error {
+  color: var(--danger, #c0392b);
+}
+
+.composer-status.success {
+  color: var(--success, #1e8a3c);
 }
 
 .timeline {
@@ -228,12 +314,17 @@ select {
   gap: 8px;
 }
 
+.timeline {
+  gap: 14px;
+  align-content: start;
+  padding: 16px;
+}
+
 .simple-list {
   margin-top: 10px;
 }
 
 .list-button,
-.message-row,
 .detail-card {
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -251,15 +342,6 @@ select {
 .list-button.active {
   border-color: var(--accent);
   box-shadow: inset 0 0 0 1px rgba(73, 180, 195, 0.18);
-}
-
-.message-row {
-  padding: 12px 14px;
-  cursor: pointer;
-}
-
-.message-row.active {
-  border-color: var(--accent-2);
 }
 
 .message-head,
@@ -281,6 +363,128 @@ select {
 
 .sender {
   font-weight: 600;
+}
+
+.chat-count {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.chat-message {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  max-width: 82%;
+  cursor: pointer;
+}
+
+.chat-message.active .chat-bubble,
+.chat-system.active .chat-system-text {
+  box-shadow: 0 0 0 1px var(--accent-2);
+}
+
+.chat-avatar {
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #162231;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.chat-avatar.lead {
+  color: var(--accent);
+}
+
+.chat-avatar.worker {
+  color: var(--accent-2);
+}
+
+.chat-content {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.chat-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.chat-name {
+  color: var(--text);
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-time {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.chat-bubble {
+  width: fit-content;
+  max-width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #151f2a;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-status {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.chat-status.fail {
+  color: var(--bad);
+}
+
+.chat-status.warn {
+  color: var(--warn);
+}
+
+.mention-token {
+  color: var(--accent);
+  font: inherit;
+}
+
+.chat-system {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.chat-system-time {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat-system-text {
+  max-width: min(680px, 86%);
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #101820;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .muted {
@@ -315,17 +519,51 @@ select {
   color: var(--warn);
 }
 
+/* Per-sender colored badge.
+ *
+ * Each member (lead, worker, web user) gets a stable hue derived from
+ * their name (see senderHue() in app.js). The badge stays dim-tinted for
+ * non-overpowering UI density: 18% saturation background + 60% saturation
+ * border + full-saturation text on the same hue. lead and the web `user`
+ * member receive special handling in JS to stand out further (lead uses
+ * a fixed cyan hue matching the brand accent; user gets a warm orange so
+ * human input is unmistakable in transcripts dominated by AI senders). */
+.sender-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid hsl(var(--sender-hue, 200), 60%, 55%);
+  background: hsl(var(--sender-hue, 200), 50%, 18%);
+  color: hsl(var(--sender-hue, 200), 90%, 78%);
+  font-weight: 500;
+}
+
+.sender-badge.is-lead {
+  /* Slightly stronger to keep lead visually anchored. */
+  background: hsl(var(--sender-hue, 188), 55%, 22%);
+  color: hsl(var(--sender-hue, 188), 95%, 82%);
+}
+
+.sender-badge.is-user {
+  /* The human is fronted clearly — slightly brighter than agents. */
+  background: hsl(var(--sender-hue, 28), 60%, 24%);
+  color: hsl(var(--sender-hue, 28), 95%, 84%);
+}
+
+/* Avatar dot used in the timeline; reuse the same hue. */
+.chat-avatar.sender-tinted {
+  background: hsl(var(--sender-hue, 200), 55%, 35%);
+  border: 1px solid hsl(var(--sender-hue, 200), 60%, 55%);
+  color: hsl(var(--sender-hue, 200), 95%, 92%);
+}
+
 .message-body {
   white-space: pre-wrap;
   line-height: 1.5;
   overflow-wrap: anywhere;
-}
-
-.message-links {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 10px;
 }
 
 .link-button {
@@ -373,6 +611,52 @@ select {
   display: grid;
   gap: 14px;
   padding-top: 10px;
+}
+
+.conversation-work-turn {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+}
+
+.work-turn-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.work-turn-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.work-turn-subtitle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.work-turn-subtitle span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.work-turn-steps {
+  gap: 10px;
+  padding-left: 18px;
 }
 
 .conversation-source,
@@ -439,6 +723,18 @@ select {
   gap: 4px;
 }
 
+.conversation-step-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.conversation-user-prompt-hook .message-user-prompt {
+  border: 1px dashed var(--line);
+  background: color-mix(in srgb, var(--panel) 84%, transparent);
+  color: var(--muted);
+}
+
 .message-user-prompt {
   width: fit-content;
   max-width: 86%;
@@ -497,6 +793,18 @@ select {
   position: relative;
   line-height: 1.58;
   overflow-wrap: anywhere;
+}
+
+.final-reply-block {
+  padding: 10px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--line));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent) 9%, var(--panel));
+}
+
+.final-reply-label {
+  margin-bottom: 6px;
+  color: var(--accent);
 }
 
 .text-block-copy {

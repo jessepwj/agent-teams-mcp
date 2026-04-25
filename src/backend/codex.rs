@@ -81,6 +81,24 @@ impl CodexBackend {
                 .arg(format!("model_reasoning_effort=\"{effort}\""));
         }
 
+        // Force full-access sandbox for managed workers.
+        //
+        // Why hardcode (consistent with `--permission-mode bypassPermissions`
+        // on claude-code): this is the headless app-server transport. There
+        // is no operator at a terminal who can react to a sandbox denial.
+        // If the user's `~/.codex/config.toml` left `sandbox_mode` at
+        // `read-only` or `workspace-write`, every shell/file tool the agent
+        // tries silently gets blocked and the worker stalls. Passing the
+        // override at spawn keeps each managed worker on equal footing
+        // regardless of global config — a non-negotiable protocol invariant
+        // for non-interactive agents, not a user preference.
+        //
+        // This pairs with `approvalPolicy: "never"` on `thread/start` (set
+        // below in the spawn flow) to give the worker the same "act, don't
+        // ask" semantics that `bypassPermissions` gives the claude-code
+        // backend.
+        cmd.arg("-c").arg("sandbox_mode=\"danger-full-access\"");
+
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         // Discard stderr to avoid pipe-buffer deadlock: if the child writes

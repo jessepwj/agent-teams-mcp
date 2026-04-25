@@ -74,21 +74,54 @@ impl WebResponse {
 }
 
 pub fn handle_request(state: &Arc<TeamModeWebState>, method: &str, target: &str) -> WebResponse {
-    if method != "GET" {
-        return WebResponse::json(
-            StatusCode::MethodNotAllowed,
-            &ErrorBody {
-                error: "team-mode-web is read-only; only GET is supported".into(),
-            },
-        );
-    }
+    handle_request_with_body(state, method, target, &[])
+}
 
+/// Body-aware variant. The HTTP layer parses the request body (Content-Length
+/// bytes after the headers) and passes it through. GET handlers ignore the
+/// `body` slice; mutating routes (POST) read JSON from it.
+pub fn handle_request_with_body(
+    state: &Arc<TeamModeWebState>,
+    method: &str,
+    target: &str,
+    body: &[u8],
+) -> WebResponse {
     let (path, query) = split_target(target);
     let segments = path
         .trim_matches('/')
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
+
+    // POST routes — kept apart from the GET match so a typo in a GET path
+    // doesn't accidentally accept a body it didn't ask for.
+    if method == "POST" {
+        let result = match segments.as_slice() {
+            ["api", "teams", team, "rooms", "main", "messages"] => {
+                read_model::post_main_room_message(state, team, body)
+                    .map(|body| WebResponse::json(StatusCode::Created, &body))
+            }
+            _ => Err(WebError::not_found(format!(
+                "route 'POST {path}' not found"
+            ))),
+        };
+        return match result {
+            Ok(response) => response,
+            Err(err) => error_response(err),
+        };
+    }
+
+    if method != "GET" {
+        return WebResponse::json(
+            StatusCode::MethodNotAllowed,
+            &ErrorBody {
+                error: format!(
+                    "method '{method}' not supported on '{path}'; team-mode-web accepts \
+                     GET for reads and POST for sending messages"
+                ),
+            },
+        );
+    }
 
     let result = match segments.as_slice() {
         [] => return WebResponse::html(StatusCode::Ok, INDEX_HTML),

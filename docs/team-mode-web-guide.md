@@ -1,19 +1,41 @@
 # Team Mode Web 实现与排查指南
 
 > 状态：当前仓库实现对应说明  
-> 适用范围：`team_mode_web` 只读 Web 前端、诊断层、运行/排查/验收
+> 适用范围：`team_mode_web` Web 前端（含人类用户发消息）、诊断层、运行/排查/验收
 
 ---
 
 ## 1. 当前已实现范围
 
-当前 `team_mode_web` 已实现的是一个**只读**的 Team Mode Web 前端，目标是：
+`team_mode_web` 是 Team Mode 的 Web 前端，跑在 daemon 内部线程，监听 `127.0.0.1:8787+`：
 
-1. 查看 team 的群聊历史。
-2. 查看成员与 lead 的活动/会话快照。
-3. 查看和排查相关的日志/诊断信息。
+1. **群聊视图**：以聊天时间线方式查看 team `main` 房间历史。
+2. **成员会话**：查看成员对应进程的会话内容（claude-code JSONL + codex rollout 都已支持）。
+3. **诊断与详情**：右侧面板查看消息路由元数据、成员档案、token 用量、诊断来源等原始数据。
+4. **人类发送消息**（2026-04-25 新增）：底部发送条让坐在浏览器前的人发消息进群聊，sender 固定为 `user`（非 lead 非 worker，独立身份）。
 
-当前前端**没有任何写操作入口**，不会发送消息、启动/停止 worker、ack/read、删除 team 或删除成员。
+仍**没有**的写操作：启动/停止 worker、删除 team / 成员、ack/read 标记、修改成员配置。这些走 MCP 工具。
+
+### 1.1 发消息功能（POST 端点）
+
+- 路由：`POST /api/teams/<team>/rooms/main/messages`
+- Body：`{"body": "...", "mentions": ["lead" | "<worker>"]}`
+- 行为：
+  - sender 写死 `user`（常量 `WEB_USER_SENDER` 在 `read_model.rs`）
+  - 首次 POST 时 lazy-create 该成员（kind=Member, role_label="user", 无 execution profile）
+  - 调用同一个 `MessageService::send`（与 MCP `send_message` 工具完全相同的路径），所以路由规则、`InboxNotifier` 唤醒、`LeadPendingWriter` 写 `lead_pending.jsonl` 都生效
+  - kind=`Discussion`（非 dispatch / reply）
+- 前端：`#composerForm` 在时间线下方 sticky；左侧 `<select>` 选 @ 谁（默认 `lead`），中间 textarea，右侧"发送"按钮。Enter 发送，Shift+Enter 换行
+- `worker_list` 工具自动过滤 `role_label="user"` 的成员（避免它被当 worker 误标记 dead）
+- `worker_add` 拒绝 `name="user"`（保留名）
+
+### 1.2 成员颜色区分
+
+每个成员（含 `user`）在群聊里有独立颜色：
+- `lead` → 固定青色（hue 188，匹配品牌 accent）
+- `user` → 固定暖橙色（hue 28，让人类输入在 AI 群聊里一眼可辨）
+- 其他 worker → 名字 djb2 hash → hue（避开 14..50 / 175..205 两段保留色）
+- 实现：`web/team-mode/app.js` 的 `senderHue()` + `renderSenderBadge()`，CSS 用 `hsl(var(--sender-hue), …)`
 
 ---
 
@@ -41,15 +63,19 @@
 
 ### 相关辅助
 
-- `src/util/session_discovery.rs`
+- `src/util/session_discovery.rs` — Claude Code JSONL 自动发现
+- `src/util/codex_session_discovery.rs` — Codex `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` 扫描 + 5s TTL 缓存
 
 ### 实现对应关系
 
 - 群聊/成员/diagnostics 聚合逻辑：`src/team_mode_web/read_model.rs`
-- HTTP 路由挂载：`src/team_mode_web/routes.rs`
-- std-only HTTP 服务与访问日志：`src/team_mode_web/app.rs`
-- diagnostics DTO：`src/team_mode_web/dto.rs`
+- POST 发消息 + lazy-create user：`read_model::post_main_room_message` + `ensure_web_user_member`
+- HTTP 路由挂载（含 POST 分支）：`src/team_mode_web/routes.rs`
+- std-only HTTP 服务（含 Content-Length body 解析、256 KiB body cap、10s read timeout）：`src/team_mode_web/app.rs`
+- 跨进程共享 `MessageService`（让 web POST 触发 inbox notifier + lead_pending writer）：`SHARED_MESSAGE_SERVICE: OnceLock<MessageService>` in `state.rs`，daemon 在 toolset 构造时调用 `install_shared_message_service()`
 - Claude session 自动发现与解析：`src/util/session_discovery.rs`
+- Codex rollout 解析（response_item / function_call / reasoning）：`parse_codex_conversation` in `read_model.rs`
+- diagnostics DTO：`src/team_mode_web/dto.rs`
 - 前端状态管理与渲染：`web/team-mode/app.js`
 
 ---
@@ -69,7 +95,7 @@
 
 其中：
 
-- `rooms/main` 用于主时间线。
+- `rooms/main` 用于主群聊。
 - `members/:name/activity` 是从消息派生出的活动摘要，不是进程日志。
 - `diagnostics` 是文件/会话级排查视图，不是 per-member stdout/stderr。
 
@@ -77,21 +103,66 @@
 
 ## 4. 前端信息架构
 
-页面仍保持三栏结构：
+页面保持三栏结构：
 
-- 左栏：Rooms / Members / Filters
-- 中栏：Chat Timeline
-- 右栏：Detail Pane
+- 左栏：房间、成员、筛选。
+- 中栏：群聊。
+- 右栏：会话、详情、诊断。
 
-右栏当前支持展示：
+### 4.1 中栏群聊
 
-- Message Detail
-- Member Detail
-- Lead Activity
-- Team Diagnostics
-- Diagnostics Sources
-- Lead Session Diagnostics
-- Raw JSON
+中栏不是 diagnostics 列表，也不是事件调试流。它按类似微信群聊的方式显示：
+
+- 发送人头像缩写。
+- 发送人名称。
+- 发送时间。
+- 消息气泡。
+- `@mention` 高亮并可点击筛选。
+- 系统状态消息居中显示为灰色提示。
+
+默认不会在群聊列表里铺开这些调试字段：
+
+- `kind`
+- `delivery_status`
+- `thread_reply_count`
+- `effective_recipients`
+- `read_by`
+- `acked_by`
+
+这些字段仍可通过点击消息后在右侧详情里查看。异常投递状态，例如 `failed`、`expired`、`partial`，会在群聊气泡旁保留轻量提示。
+
+### 4.2 右栏
+
+右栏默认展示成员对应的**进程会话**，目的是让用户阅读该成员实际会话内容，而不是阅读大量诊断字段。
+
+右栏页签：
+
+- `会话`：默认页签。展示成员/lead 对应 Claude session 内容，按“工作轮次”组织。每轮先显示收到的输入或 Hook 输入，再显示中间执行步骤，最后突出最终回复。工具调用和工具结果会配对为可折叠行。
+- `详情`：展示消息、成员、lead activity 的结构化详情。
+- `诊断`：展示 Team Diagnostics、Diagnostics Sources、Lead Session Diagnostics 和 Raw JSON。诊断内容默认不作为主要阅读界面。
+
+选中消息时，右栏切到 `详情`。选中成员时，右栏切到 `会话`。
+
+会话阅读规则：
+
+- 用户/Hook 输入显示为本轮起点。
+- `tool_use` 和 `tool_result` 按 `toolUseId` 配对，作为执行步骤展示。
+- 每轮最后一个没有后续工具调用的 assistant 文本会标记为 `最终回复`。
+- 如果一轮只有工具或系统事件，没有最终文本回复，会显示 `暂无最终回复`。
+- session setup、thinking、system/error 仍保留，但弱化为辅助信息。
+
+### 4.3 分栏与刷新
+
+桌面端默认：
+
+- 左栏固定约 `260px`，可拖拽调整。
+- 中栏群聊和右栏默认按剩余空间 `1:1`。
+- 右栏可拖拽调整，手动调整后会持久化到 `localStorage`。
+- 窗口尺寸变化时，如果右栏没有被用户手动改过，会重新计算 `1:1`。
+
+页面每 2 秒刷新当前 team 的基本数据、主群聊和成员列表，因此新增 worker、worker 回复、lead 新消息会自动显示。手动刷新按钮仍然可用。
+
+### 4.4 深链
 
 深链已支持：
 
@@ -106,6 +177,8 @@
 - 错误态重试
 - team 列表为空时回到 `no teams`
 - 筛选状态下 thread detail 仍显示完整线程
+- 默认中文 UI，并提供 English 切换按钮
+- 群聊列表保持简洁，诊断信息不污染主阅读区
 
 ---
 
@@ -260,15 +333,30 @@ $env:SystemRoot='C:\Windows'
 bun test web/team-mode/app.smoke.test.mjs
 ```
 
+当前前端 smoke 结果：
+
+```text
+19 pass
+0 fail
+```
+
 当前 smoke 覆盖：
 
 - 空态
 - `#message=` 深链恢复
 - `#member=lead` 深链恢复
+- 默认中文与 English 切换
+- 左/右分栏拖拽调整
+- 中栏群聊和右栏默认 `1:1`
+- 群聊列表按气泡方式渲染，不直接铺开投递、线程、kind 等调试字段
 - diagnostics UI 渲染
 - 筛选状态下 thread detail 完整性
 - 刷新失败与 Retry 恢复
 - stale detail error 清理后重新打开 Lead Activity
+- 成员进程会话打开
+- 会话内容中工具调用和工具结果配对渲染
+- 会话按工作轮次展示，并突出最终回复
+- 后台成员刷新失败时保留已缓存详情
 
 ### 8.2 当前机器受限
 
@@ -327,14 +415,16 @@ WinError 10106 无法加载或初始化请求的服务提供程序
 
 - 1366x768
 - 三栏不重叠
-- 诊断卡片不把右栏撑坏
+- 中栏群聊和右栏默认接近等宽
+- 群聊列表只显示头像、发送者、时间、消息气泡和必要异常状态
+- 诊断内容只在右栏 `诊断` 页签里查看，不把默认会话页撑坏
 - 长路径、长日志预览可滚动
 
 ### 平板断点
 
 - 960px 左右
 - 顶栏换行正常
-- 右栏 diagnostics 不遮挡主时间线
+- 右栏 diagnostics 不遮挡主群聊
 
 ### 手机断点
 
@@ -387,7 +477,7 @@ $env:TEAM_MODE_WEB_AUTO_OPEN='0'
 
 CI / cargo test 进程会自动禁用该行为，避免测试时弹浏览器。
 
-页面打开后会每 2 秒刷新当前 team 的基本数据、主时间线和成员列表，因此新增 worker、worker 回复、lead 新消息会自动显示。手动刷新按钮仍然可用。
+页面打开后会每 2 秒刷新当前 team 的基本数据、主群聊和成员列表，因此新增 worker、worker 回复、lead 新消息会自动显示。手动刷新按钮仍然可用。
 
 ### 10.2 手动启动
 
@@ -476,7 +566,7 @@ cargo run --features team-mode-web --bin team_mode_web -- --data-dir .agent-team
 
 1. 没有真正的 per-member stdout/stderr 流。
 2. diagnostics 预览是截断视图，不是原始全量日志。
-3. lead session 目前只解析最新发现的一份 Claude session。
+3. lead session 目前优先使用成员 execution 里持久化的 `session_id` 精确匹配；缺失时会回退到 cwd 最新 session，仍可能不是用户期望的会话。
 4. 浏览器级验证在当前机器因 socket/运行环境问题不完整。
 5. `cargo test` / `cargo build` 仍受 `link.exe` 缺失影响。
 
