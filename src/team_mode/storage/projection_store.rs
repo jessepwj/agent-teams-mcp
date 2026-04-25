@@ -65,7 +65,11 @@ impl ProjectionStore {
         Ok(items)
     }
 
-    pub fn project_thread(&self, team_id: &str, thread_id: impl AsRef<str>) -> Result<Vec<Message>> {
+    pub fn project_thread(
+        &self,
+        team_id: &str,
+        thread_id: impl AsRef<str>,
+    ) -> Result<Vec<Message>> {
         let thread_id = thread_id.as_ref();
         let mut messages = self.message_store.list_by_thread(team_id, thread_id)?;
         messages.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));

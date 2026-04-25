@@ -65,6 +65,7 @@ mod tests {
                 description: Some("Main team".into()),
                 cwd: None,
                 lead_member_id: Some("lead".into()),
+                owner_cc_pid: None,
             })
             .unwrap();
         assert_eq!(team.status, TeamStatus::Active);

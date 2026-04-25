@@ -28,6 +28,9 @@ dirs = "6"
 which = "7"
 fs2 = "0.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
+# Used to resolve our own parent-process PID (= CC client) so team ownership
+# can be bound at team_create time for push-routing on multi-CC hosts.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # CLI
 clap = { version = "4", features = ["derive"], optional = true }
@@ -48,13 +51,23 @@ crossterm = { version = "0.28", optional = true }
 default = []
 cli = ["clap"]
 dashboard = ["axum", "tower-http"]
+team-mode-web = []
 checkpoint = ["git2", "sha2"]
 tui = ["ratatui", "crossterm", "checkpoint"]
+
+[lib]
+name = "agent_teams"
+path = "src/lib.rs"
 
 [[bin]]
 name = "agent-teams"
 path = "src/bin/agent_teams.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "team_mode_web"
+path = "src/bin/team_mode_web.rs"
+required-features = ["team-mode-web"]
 
 [dependencies.tracing-subscriber]
 version = "0.3"

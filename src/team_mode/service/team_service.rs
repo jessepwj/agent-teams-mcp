@@ -13,6 +13,10 @@ pub struct CreateTeamRequest {
     pub description: Option<String>,
     pub cwd: Option<String>,
     pub lead_member_id: Option<String>,
+    /// PID of the Claude Code process that owns this team. Set by the MCP
+    /// dispatch layer to `std::process::parent_id()` so push routing can
+    /// later filter messages to the correct CC client.
+    pub owner_cc_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +68,7 @@ impl TeamService {
             cwd: request.cwd,
             status: TeamStatus::Active,
             lead_member_id: request.lead_member_id,
+            owner_cc_pid: request.owner_cc_pid,
             created_at: now,
             updated_at: now,
         };
@@ -132,6 +137,7 @@ mod tests {
                 description: None,
                 cwd: None,
                 lead_member_id: None,
+                owner_cc_pid: None,
             })
             .unwrap();
         assert_eq!(first.id, "team-1");
@@ -142,6 +148,7 @@ mod tests {
             description: None,
             cwd: None,
             lead_member_id: None,
+            owner_cc_pid: None,
         });
         assert!(matches!(
             duplicate_name,
@@ -154,6 +161,7 @@ mod tests {
             description: None,
             cwd: None,
             lead_member_id: None,
+            owner_cc_pid: None,
         });
         assert!(matches!(duplicate_id, Err(Error::TeamAlreadyExists { .. })));
     }

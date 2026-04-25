@@ -19,7 +19,11 @@ use agent_teams::models::task::TaskFile;
 use agent_teams::task::DependencyGraph;
 
 #[derive(Parser)]
-#[command(name = "agent-teams", version, about = "Agent Teams CLI: DAG analysis & checkpoint management")]
+#[command(
+    name = "agent-teams",
+    version,
+    about = "Agent Teams CLI: DAG analysis & checkpoint management"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -324,7 +328,8 @@ fn load_tasks(base: &PathBuf, team: &str) -> Vec<TaskFile> {
 
 #[cfg(feature = "checkpoint")]
 fn repo_path(custom: Option<PathBuf>) -> PathBuf {
-    custom.unwrap_or_else(|| std::env::current_dir().expect("Could not determine current directory"))
+    custom
+        .unwrap_or_else(|| std::env::current_dir().expect("Could not determine current directory"))
 }
 
 fn main() {
@@ -341,7 +346,10 @@ fn main() {
 
 fn handle_dag(action: DagAction) {
     match action {
-        DagAction::Validate { team, tasks_dir: custom } => {
+        DagAction::Validate {
+            team,
+            tasks_dir: custom,
+        } => {
             let base = tasks_dir(custom);
             let tasks = load_tasks(&base, &team);
             let graph = DependencyGraph::from_tasks(&tasks);
@@ -358,7 +366,11 @@ fn handle_dag(action: DagAction) {
             }
         }
 
-        DagAction::Show { team, format, tasks_dir: custom } => {
+        DagAction::Show {
+            team,
+            format,
+            tasks_dir: custom,
+        } => {
             let base = tasks_dir(custom);
             let tasks = load_tasks(&base, &team);
 
@@ -377,7 +389,10 @@ fn handle_dag(action: DagAction) {
             }
         }
 
-        DagAction::Next { team, tasks_dir: custom } => {
+        DagAction::Next {
+            team,
+            tasks_dir: custom,
+        } => {
             let base = tasks_dir(custom);
             let tasks = load_tasks(&base, &team);
             let graph = DependencyGraph::from_tasks(&tasks);
@@ -385,8 +400,7 @@ fn handle_dag(action: DagAction) {
             let ready: Vec<&TaskFile> = tasks
                 .iter()
                 .filter(|t| {
-                    t.status == agent_teams::TaskStatus::Pending
-                        && graph.is_ready(&t.id, &tasks)
+                    t.status == agent_teams::TaskStatus::Pending && graph.is_ready(&t.id, &tasks)
                 })
                 .collect();
 
@@ -401,7 +415,10 @@ fn handle_dag(action: DagAction) {
             }
         }
 
-        DagAction::CriticalPath { team, tasks_dir: custom } => {
+        DagAction::CriticalPath {
+            team,
+            tasks_dir: custom,
+        } => {
             let base = tasks_dir(custom);
             let tasks = load_tasks(&base, &team);
             let graph = DependencyGraph::from_tasks(&tasks);
@@ -413,10 +430,8 @@ fn handle_dag(action: DagAction) {
                 return;
             }
 
-            let task_map: std::collections::HashMap<&str, &TaskFile> = tasks
-                .iter()
-                .map(|t| (t.id.as_str(), t))
-                .collect();
+            let task_map: std::collections::HashMap<&str, &TaskFile> =
+                tasks.iter().map(|t| (t.id.as_str(), t)).collect();
 
             println!("Critical path ({} tasks):", path.len());
             for (i, id) in path.iter().enumerate() {
@@ -433,7 +448,9 @@ fn handle_dag(action: DagAction) {
 
 #[cfg(feature = "checkpoint")]
 fn handle_checkpoint(action: CheckpointAction) {
-    use agent_teams::checkpoint::{CheckpointCollector, CheckpointQuery, CheckpointStore, CheckpointFilter};
+    use agent_teams::checkpoint::{
+        CheckpointCollector, CheckpointFilter, CheckpointQuery, CheckpointStore,
+    };
     use agent_teams::models::checkpoint::CheckpointSession;
     use agent_teams::util::session_discovery;
 
@@ -489,7 +506,9 @@ fn handle_checkpoint(action: CheckpointAction) {
                     // Auto-discover session files
                     let sessions = session_discovery::discover_sessions(&path);
                     if sessions.is_empty() {
-                        eprintln!("Warning: --extended but no session files found for auto-discovery");
+                        eprintln!(
+                            "Warning: --extended but no session files found for auto-discovery"
+                        );
                         eprintln!("  Use --session-jsonl <PATH> to specify explicitly");
                     } else {
                         eprintln!(
@@ -520,17 +539,28 @@ fn handle_checkpoint(action: CheckpointAction) {
             match store.save(&checkpoint) {
                 Ok(()) => {
                     println!("Checkpoint created: {}", checkpoint.id);
-                    println!("  Commit: {} ({})", &checkpoint.commit_sha[..7.min(checkpoint.commit_sha.len())], checkpoint.branch);
+                    println!(
+                        "  Commit: {} ({})",
+                        &checkpoint.commit_sha[..7.min(checkpoint.commit_sha.len())],
+                        checkpoint.branch
+                    );
                     println!("  Agent:  {}", checkpoint.session.agent_name);
                     println!("  Files:  {}", checkpoint.files.len());
                     if let Some(ref team_state) = checkpoint.team {
-                        println!("  Team:   {} ({} members)", team_state.team_name, team_state.members.len());
+                        println!(
+                            "  Team:   {} ({} members)",
+                            team_state.team_name,
+                            team_state.members.len()
+                        );
                     }
                     if !checkpoint.tasks.is_empty() {
                         println!("  Tasks:  {}", checkpoint.tasks.len());
                     }
                     if checkpoint.has_extended_data() {
-                        println!("  Extended: yes ({} tool calls)", checkpoint.tool_calls.len());
+                        println!(
+                            "  Extended: yes ({} tool calls)",
+                            checkpoint.tool_calls.len()
+                        );
                     }
                 }
                 Err(e) => {
@@ -540,7 +570,11 @@ fn handle_checkpoint(action: CheckpointAction) {
             }
         }
 
-        CheckpointAction::Show { commit, format, repo } => {
+        CheckpointAction::Show {
+            commit,
+            format,
+            repo,
+        } => {
             let path = repo_path(repo);
             let store = match CheckpointStore::open(&path) {
                 Ok(s) => s,
@@ -723,7 +757,12 @@ fn handle_checkpoint(action: CheckpointAction) {
             }
         }
 
-        CheckpointAction::Cost { branch, agent, repo, json } => {
+        CheckpointAction::Cost {
+            branch,
+            agent,
+            repo,
+            json,
+        } => {
             let path = repo_path(repo);
 
             // Gather token usage from checkpoints
@@ -756,8 +795,10 @@ fn handle_checkpoint(action: CheckpointAction) {
                 cache_read_tokens: None,
                 cache_write_tokens: None,
             };
-            let mut per_agent: std::collections::HashMap<String, agent_teams::models::token::TokenUsage> =
-                std::collections::HashMap::new();
+            let mut per_agent: std::collections::HashMap<
+                String,
+                agent_teams::models::token::TokenUsage,
+            > = std::collections::HashMap::new();
             let mut count = 0;
 
             for ckpt in &checkpoints {
@@ -775,23 +816,21 @@ fn handle_checkpoint(action: CheckpointAction) {
 
             // Also try auto-discovered sessions
             let discovered = session_discovery::discover_sessions(&path);
-            let session_cost = session_discovery::aggregate_cost(
-                &discovered,
-                agent.as_deref(),
-            ).unwrap_or_else(|e| {
-                eprintln!("Warning: session discovery failed: {e}");
-                agent_teams::models::token::CostSummary {
-                    total_usage: agent_teams::models::token::TokenUsage {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_read_tokens: None,
-                        cache_write_tokens: None,
-                    },
-                    session_count: 0,
-                    per_agent: vec![],
-                    estimated_cost_usd: 0.0,
-                }
-            });
+            let session_cost = session_discovery::aggregate_cost(&discovered, agent.as_deref())
+                .unwrap_or_else(|e| {
+                    eprintln!("Warning: session discovery failed: {e}");
+                    agent_teams::models::token::CostSummary {
+                        total_usage: agent_teams::models::token::TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                        },
+                        session_count: 0,
+                        per_agent: vec![],
+                        estimated_cost_usd: 0.0,
+                    }
+                });
 
             if json {
                 let summary = serde_json::json!({
@@ -810,7 +849,10 @@ fn handle_checkpoint(action: CheckpointAction) {
                 println!();
 
                 if count > 0 {
-                    println!("From checkpoints ({count}/{} have token data):", checkpoints.len());
+                    println!(
+                        "From checkpoints ({count}/{} have token data):",
+                        checkpoints.len()
+                    );
                     println!("  Input tokens:  {:>12}", total.input_tokens);
                     println!("  Output tokens: {:>12}", total.output_tokens);
                     if let Some(cr) = total.cache_read_tokens {
@@ -850,12 +892,15 @@ fn handle_checkpoint(action: CheckpointAction) {
                         "From auto-discovered sessions ({} files):",
                         session_cost.session_count
                     );
-                    println!("  Input tokens:  {:>12}", session_cost.total_usage.input_tokens);
-                    println!("  Output tokens: {:>12}", session_cost.total_usage.output_tokens);
                     println!(
-                        "  Estimated cost: ${:.4}",
-                        session_cost.estimated_cost_usd
+                        "  Input tokens:  {:>12}",
+                        session_cost.total_usage.input_tokens
                     );
+                    println!(
+                        "  Output tokens: {:>12}",
+                        session_cost.total_usage.output_tokens
+                    );
+                    println!("  Estimated cost: ${:.4}", session_cost.estimated_cost_usd);
                 } else {
                     println!("No auto-discovered session data found.");
                 }
@@ -887,7 +932,10 @@ fi
             let hooks_dir = path.join(".git").join("hooks");
 
             if !hooks_dir.exists() {
-                eprintln!("Error: not a git repository (no .git/hooks): {}", path.display());
+                eprintln!(
+                    "Error: not a git repository (no .git/hooks): {}",
+                    path.display()
+                );
                 process::exit(1);
             }
 
@@ -952,7 +1000,12 @@ fi
                 }
                 if skip {
                     // Skip until we find a line that's not part of our script
-                    if line.starts_with('#') || line.starts_with("if ") || line.starts_with("    ") || line.starts_with("fi") || line.is_empty() {
+                    if line.starts_with('#')
+                        || line.starts_with("if ")
+                        || line.starts_with("    ")
+                        || line.starts_with("fi")
+                        || line.is_empty()
+                    {
                         continue;
                     }
                     skip = false;
@@ -982,9 +1035,8 @@ fi
 
 #[cfg(feature = "tui")]
 fn handle_tui(team: Option<String>, repo: Option<PathBuf>) {
-    let repo_path = repo.unwrap_or_else(|| {
-        std::env::current_dir().expect("Could not determine current directory")
-    });
+    let repo_path = repo
+        .unwrap_or_else(|| std::env::current_dir().expect("Could not determine current directory"));
 
     match agent_teams::tui::run(team, Some(repo_path)) {
         Ok(()) => {}
@@ -999,7 +1051,10 @@ fn handle_tui(team: Option<String>, repo: Option<PathBuf>) {
 fn print_checkpoint_summary(ckpt: &agent_teams::models::checkpoint::Checkpoint) {
     println!("Checkpoint: {}", ckpt.id);
     println!("  Commit:  {} ({})", ckpt.commit_sha, ckpt.branch);
-    println!("  Created: {}", ckpt.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "  Created: {}",
+        ckpt.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
     println!();
 
     println!("Session:");
@@ -1014,11 +1069,14 @@ fn print_checkpoint_summary(ckpt: &agent_teams::models::checkpoint::Checkpoint) 
         println!("  CWD:     {}", cwd.display());
     }
     if let Some(ref prompt) = ckpt.session.prompt_summary {
-        println!("  Prompt:  {}", if prompt.len() > 80 {
-            format!("{}...", &prompt[..77])
-        } else {
-            prompt.clone()
-        });
+        println!(
+            "  Prompt:  {}",
+            if prompt.len() > 80 {
+                format!("{}...", &prompt[..77])
+            } else {
+                prompt.clone()
+            }
+        );
     }
 
     if let Some(ref team) = ckpt.team {
@@ -1079,7 +1137,13 @@ fn print_checkpoint_summary(ckpt: &agent_teams::models::checkpoint::Checkpoint) 
             let input = tc
                 .input_summary
                 .as_deref()
-                .map(|s| if s.len() > 60 { format!("{}...", &s[..57]) } else { s.to_string() })
+                .map(|s| {
+                    if s.len() > 60 {
+                        format!("{}...", &s[..57])
+                    } else {
+                        s.to_string()
+                    }
+                })
                 .unwrap_or_default();
             println!("  {} {}", tc.tool_name, input);
         }

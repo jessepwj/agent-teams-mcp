@@ -196,21 +196,24 @@ async fn main() -> agent_teams::Result<()> {
     let result = orch.resolve_consensus(&responses, ConsensusStrategy::Weighted);
     println!("\n[Weighted Vote]");
     println!("  Decision: {:?}", result.decision);
-    println!(
-        "  Weight breakdown: approve={:.0}, changes={:.0}",
-        3.0, 1.0
-    );
+    println!("  Weight breakdown: approve={:.0}, changes={:.0}", 3.0, 1.0);
 
     // --- Unanimous (will fail since they disagree) ---
     let result = orch.resolve_consensus(&responses, ConsensusStrategy::Unanimous);
     println!("\n[Unanimous Vote]");
     println!("  Decision: {:?}", result.decision);
-    println!("  Consensus reached: {} (expected: false)", result.consensus_reached);
+    println!(
+        "  Consensus reached: {} (expected: false)",
+        result.consensus_reached
+    );
 
     // --- Human-in-the-loop ---
     let result = orch.resolve_consensus(&responses, ConsensusStrategy::HumanInTheLoop);
     println!("\n[Human-in-the-Loop]");
-    println!("  Decision: {:?} (always None — human decides)", result.decision);
+    println!(
+        "  Decision: {:?} (always None — human decides)",
+        result.decision
+    );
     for r in &result.responses {
         println!("    {} (weight={:.1}): {}", r.agent, r.weight, r.content);
     }
@@ -257,7 +260,10 @@ async fn main() -> agent_teams::Result<()> {
     println!("  Assistant: Implemented token rotation.");
 
     println!("\n[Memory state]");
-    println!("  Turns stored: {} (max_turns=3, oldest evicted)", memory.len());
+    println!(
+        "  Turns stored: {} (max_turns=3, oldest evicted)",
+        memory.len()
+    );
 
     let context = memory.format_context();
     println!("\n[Formatted context for injection]\n{context}");
@@ -294,7 +300,10 @@ async fn main() -> agent_teams::Result<()> {
     let mut mem = ConversationMemory::with_defaults();
     mem.record_turn(Role::User, "Hello from persistent memory!");
     mgr.save("demo", "test-agent", &mem)?;
-    println!("  Saved memory to {}/demo/memory/test-agent.json", teams_dir.display());
+    println!(
+        "  Saved memory to {}/demo/memory/test-agent.json",
+        teams_dir.display()
+    );
 
     let loaded = mgr.load("demo", "test-agent")?;
     println!(

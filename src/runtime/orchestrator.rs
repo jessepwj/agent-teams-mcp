@@ -254,6 +254,14 @@ impl RuntimeOrchestrator {
         Ok(managed.session.is_alive().await)
     }
 
+    /// Returns the backend-assigned session id for the given managed
+    /// member, if the backend exposes one. Currently only Claude Code
+    /// backends populate this — the id matches the
+    /// `~/.claude/projects/<cwd>/<id>.jsonl` filename.
+    pub fn session_id_of(&self, member_id: impl AsRef<str>) -> Option<String> {
+        self.sessions.get(member_id.as_ref())?.session.session_id()
+    }
+
     pub async fn shutdown_managed_member(&mut self, member_id: impl AsRef<str>) -> Result<()> {
         let member_id = member_id.as_ref().to_string();
         tracing::info!(member_id = %member_id, "shutting down managed member");

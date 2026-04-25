@@ -60,8 +60,7 @@ async fn main() -> agent_teams::Result<()> {
             CreateTaskRequest {
                 subject: "Explain Rust ownership in one sentence".into(),
                 description: Some(
-                    "Give a single-sentence explanation of Rust's ownership model."
-                        .into(),
+                    "Give a single-sentence explanation of Rust's ownership model.".into(),
                 ),
                 active_form: Some("Explaining ownership".into()),
                 metadata: None,
@@ -90,7 +89,8 @@ async fn main() -> agent_teams::Result<()> {
     println!("[4/7] Spawning Claude Code agent 'thinker'...");
     let claude_config = SpawnConfig {
         name: "thinker".into(),
-        prompt: "You are a concise Rust expert. Answer in ONE sentence only. Do not use any tools.".into(),
+        prompt: "You are a concise Rust expert. Answer in ONE sentence only. Do not use any tools."
+            .into(),
         model: Some("sonnet".into()),
         cwd: Some(tmp.path().to_path_buf()),
         max_turns: Some(2),
@@ -174,19 +174,13 @@ async fn main() -> agent_teams::Result<()> {
     let inbox_mgr = FileInboxManager::new(&teams_dir);
 
     let coder_msgs = inbox_mgr.read_inbox("live-test", "coder").await?;
-    println!(
-        "\n  coder's inbox: {} message(s)",
-        coder_msgs.len()
-    );
+    println!("\n  coder's inbox: {} message(s)", coder_msgs.len());
     for msg in &coder_msgs {
         println!("    from {}: \"{}\"", msg.from, truncate(&msg.content, 60));
     }
 
     let thinker_msgs = inbox_mgr.read_inbox("live-test", "thinker").await?;
-    println!(
-        "  thinker's inbox: {} message(s)",
-        thinker_msgs.len()
-    );
+    println!("  thinker's inbox: {} message(s)", thinker_msgs.len());
     for msg in &thinker_msgs {
         println!("    from {}: \"{}\"", msg.from, truncate(&msg.content, 60));
     }

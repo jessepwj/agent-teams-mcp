@@ -1,12 +1,34 @@
 #![allow(dead_code)]
 
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing_core::{Event, Level, Metadata, Subscriber, subscriber::Interest};
 use tracing_core::span::{Attributes, Id, Record};
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+// Optional append-mode log file, activated via TEAM_MODE_LOG_FILE env var.
+// Mirrors every stderr log line to the file for post-mortem diagnosis when
+// the MCP is spawned by a host that captures stderr silently.
+static LOG_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+
+fn log_file_handle() -> Option<&'static Mutex<File>> {
+    LOG_FILE
+        .get_or_init(|| {
+            std::env::var("TEAM_MODE_LOG_FILE").ok().and_then(|path| {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .ok()
+                    .map(Mutex::new)
+            })
+        })
+        .as_ref()
+}
 
 // ---- EnvFilter ----
 
@@ -218,6 +240,12 @@ impl Subscriber for StderrSubscriber {
         };
 
         let _ = std::io::stderr().write_all(line.as_bytes());
+        if let Some(lock) = log_file_handle() {
+            if let Ok(mut f) = lock.lock() {
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.flush();
+            }
+        }
     }
 
     fn enter(&self, _span: &Id) {}

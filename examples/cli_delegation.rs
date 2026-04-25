@@ -9,8 +9,8 @@
 //! Run with:
 //!   cargo run --example cli_delegation
 
-use agent_teams::backend::delegation::{format_delegation_prompt, CliDelegation};
 use agent_teams::SpawnConfig;
+use agent_teams::backend::delegation::{CliDelegation, format_delegation_prompt};
 
 fn main() {
     println!("=== CLI Delegation Examples ===\n");
@@ -18,13 +18,16 @@ fn main() {
     // -----------------------------------------------------------------------
     // 1. Claude agent that delegates code generation to Codex
     // -----------------------------------------------------------------------
-    let coder = SpawnConfig::builder("coder", "You are a Rust developer. Write clean, tested code.")
-        .delegate(
-            CliDelegation::codex()
-                .with_description("Use for code generation and implementation tasks."),
-        )
-        .model("haiku")
-        .build();
+    let coder = SpawnConfig::builder(
+        "coder",
+        "You are a Rust developer. Write clean, tested code.",
+    )
+    .delegate(
+        CliDelegation::codex()
+            .with_description("Use for code generation and implementation tasks."),
+    )
+    .model("haiku")
+    .build();
 
     println!("--- Coder Agent (Claude + Codex) ---");
     println!("Name: {}", coder.name);
@@ -60,8 +63,7 @@ fn main() {
     // -----------------------------------------------------------------------
     let multi = SpawnConfig::builder("lead", "You coordinate code reviews and implementation.")
         .delegate(
-            CliDelegation::codex()
-                .with_description("Use for generating implementation code."),
+            CliDelegation::codex().with_description("Use for generating implementation code."),
         )
         .delegate(
             CliDelegation::gemini("gemini-2.5-pro")

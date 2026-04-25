@@ -29,3 +29,17 @@ debug
 
 # Cargo.lock is checked in for binaries but not for libraries
 Cargo.lock
+
+# team-mode runtime artifacts
+.agent-teams/
+/lead_pending.jsonl
+/.lead-pending-wake.log
+/.lead_pending.lock
+/.ancestor-cache.json
+/.stop-hook-cooldown
+
+# Playwright MCP output (ephemeral test artifacts)
+.playwright-mcp/
+
+# Scratch / working notes not meant for the repo
+docs/中间内容.txt

@@ -3,9 +3,7 @@
 //! These tests parse JSON fixtures matching the format produced by
 //! Claude Code's team/task/inbox systems.
 
-use agent_teams::models::{
-    InboxMessage, StructuredMessage, TaskFile, TaskStatus, TeamConfig,
-};
+use agent_teams::models::{InboxMessage, StructuredMessage, TaskFile, TaskStatus, TeamConfig};
 
 #[test]
 fn parse_claude_code_team_config() {
@@ -129,10 +127,7 @@ fn parse_structured_message_shutdown_request() {
 
     let msg: StructuredMessage = serde_json::from_str(json).unwrap();
     match msg {
-        StructuredMessage::ShutdownRequest {
-            request_id,
-            reason,
-        } => {
+        StructuredMessage::ShutdownRequest { request_id, reason } => {
             assert_eq!(request_id.as_deref(), Some("req-abc"));
             assert_eq!(reason.as_deref(), Some("All tasks completed"));
         }

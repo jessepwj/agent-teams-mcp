@@ -53,6 +53,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
@@ -106,6 +107,13 @@ struct StreamEvent {
     #[serde(default)]
     #[allow(dead_code)]
     subtype: Option<String>,
+    /// Present on `system` (init) and `result` events. Used to associate
+    /// this worker session with its `~/.claude/projects/{path}/<id>.jsonl`
+    /// file so the web UI can display the worker's actual conversation
+    /// rather than picking the most-recently-modified file in the directory
+    /// (which is usually the lead CC's session, not the worker's).
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,13 +173,15 @@ impl ClaudeCodeBackend {
 
         // Allowed tools.
         if !config.allowed_tools.is_empty() {
-            cmd.arg("--allowedTools").arg(config.allowed_tools.join(","));
+            cmd.arg("--allowedTools")
+                .arg(config.allowed_tools.join(","));
         }
 
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
-        // Discard stderr to avoid pipe-buffer deadlock.
-        cmd.stderr(std::process::Stdio::null());
+        // Capture stderr so we can log any CLI-side errors. A background
+        // reader task drains it to prevent pipe-buffer deadlock.
+        cmd.stderr(std::process::Stdio::piped());
 
         if let Some(ref cwd) = config.cwd {
             cmd.current_dir(cwd);
@@ -188,6 +198,14 @@ impl ClaudeCodeBackend {
                 cmd.env(git_bash_key, val);
             }
         }
+
+        // Mark this as an internal worker subprocess so any project-level
+        // Stop hooks (like team-mode's lead-pending-wake.js) can short-circuit
+        // and not block worker turn completion. Without this flag, a worker's
+        // own claude CLI picks up our Stop hook and waits 30 minutes for lead
+        // messages that will never come — blocking its own `type:result`
+        // event and starving the agent_loop.
+        cmd.env("TEAM_MODE_WORKER", "1");
 
         cmd.kill_on_drop(true);
 
@@ -230,9 +248,35 @@ impl AgentBackend for ClaudeCodeBackend {
             name: agent_name.clone(),
             reason: "Failed to capture stdout".into(),
         })?;
+        let stderr = child.stderr.take();
 
         let stdin_writer = BufWriter::new(stdin);
         let stdout_reader = BufReader::new(stdout);
+
+        // Drain + log stderr so CLI errors become visible (without this the
+        // pipe buffer can fill up and block the child, and spawn failures are
+        // silent).
+        if let Some(stderr_pipe) = stderr {
+            let stderr_name = agent_name.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = BufReader::new(stderr_pipe);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim_end_matches(&['\n', '\r'][..]);
+                            if !trimmed.is_empty() {
+                                warn!(agent = %stderr_name, "claude stderr: {trimmed}");
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
 
         let (output_tx, output_rx) = mpsc::channel(OUTPUT_CHANNEL_SIZE);
         let alive = Arc::new(AtomicBool::new(true));
@@ -253,6 +297,9 @@ impl AgentBackend for ClaudeCodeBackend {
         let reader_idle = idle.clone();
         let reader_idle_notify = idle_notify.clone();
 
+        let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let reader_session_id = session_id.clone();
+
         let reader_handle = tokio::spawn(background_reader(
             stdout_reader,
             reader_tx,
@@ -260,6 +307,7 @@ impl AgentBackend for ClaudeCodeBackend {
             reader_name,
             reader_idle,
             reader_idle_notify,
+            reader_session_id,
         ));
 
         let session = ClaudeCodeSession {
@@ -272,6 +320,7 @@ impl AgentBackend for ClaudeCodeBackend {
             idle,
             idle_notify,
             reader_handle: Some(reader_handle),
+            session_id,
         };
 
         Ok(Box::new(session))
@@ -304,6 +353,12 @@ struct ClaudeCodeSession {
     idle_notify: Arc<Notify>,
     /// Handle to the background stdout reader task.
     reader_handle: Option<JoinHandle<()>>,
+    /// Last-known Claude session_id (UUID matching the JSONL filename in
+    /// `~/.claude/projects/<encoded-cwd>/`). Captured by the background
+    /// reader from `system`/`init` and `result` events. Used by the web
+    /// UI to fetch the worker's actual conversation file rather than
+    /// guessing by mtime.
+    session_id: Arc<Mutex<Option<String>>>,
 }
 
 #[async_trait]
@@ -360,13 +415,10 @@ impl AgentSession for ClaudeCodeSession {
                 name: self.name.clone(),
                 reason: format!("Failed to write NDJSON to claude stdin: {e}"),
             })?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| Error::SpawnFailed {
-                name: self.name.clone(),
-                reason: format!("Failed to flush claude stdin: {e}"),
-            })?;
+        self.stdin.flush().await.map_err(|e| Error::SpawnFailed {
+            name: self.name.clone(),
+            reason: format!("Failed to flush claude stdin: {e}"),
+        })?;
 
         Ok(())
     }
@@ -425,6 +477,10 @@ impl AgentSession for ClaudeCodeSession {
 
         Ok(())
     }
+
+    fn session_id(&self) -> Option<String> {
+        self.session_id.lock().ok().and_then(|s| s.clone())
+    }
 }
 
 impl Drop for ClaudeCodeSession {
@@ -450,6 +506,7 @@ async fn background_reader(
     agent_name: String,
     idle: Arc<AtomicBool>,
     idle_notify: Arc<Notify>,
+    session_id_slot: Arc<Mutex<Option<String>>>,
 ) {
     debug!(agent = %agent_name, "Background claude reader started");
     let mut line_buf = String::new();
@@ -481,22 +538,28 @@ async fn background_reader(
 
                 match serde_json::from_str::<StreamEvent>(trimmed) {
                     Ok(event) => {
+                        // Capture session_id when present (system/init events
+                        // carry it at session start, result events at turn end).
+                        // This is the UUID that names the
+                        // `~/.claude/projects/<cwd>/<id>.jsonl` file.
+                        if let Some(ref sid) = event.session_id {
+                            if !sid.is_empty() {
+                                let mut slot = session_id_slot.lock().unwrap();
+                                if slot.as_deref() != Some(sid.as_str()) {
+                                    debug!(agent = %agent_name, session_id = %sid, "captured Claude session_id");
+                                    *slot = Some(sid.clone());
+                                }
+                            }
+                        }
                         // A `result` event marks the end of the current turn; the
                         // session is ready for the next user message.
                         if event.kind == "result" {
                             idle.store(true, Ordering::Release);
                             idle_notify.notify_waiters();
                         }
-                        if let Some(output) =
-                            map_event_to_output(&event, &agent_name)
-                        {
-                            let send_result = send_agent_output(
-                                &output_tx,
-                                output,
-                                &alive,
-                                &agent_name,
-                            )
-                            .await;
+                        if let Some(output) = map_event_to_output(&event, &agent_name) {
+                            let send_result =
+                                send_agent_output(&output_tx, output, &alive, &agent_name).await;
 
                             if send_result.is_err() {
                                 // Channel closed.

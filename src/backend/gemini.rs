@@ -590,7 +590,10 @@ mod tests {
     #[test]
     fn test_build_history_prompt_with_history() {
         let history = vec![
-            ("What is Rust?".to_string(), "Rust is a systems language.".to_string()),
+            (
+                "What is Rust?".to_string(),
+                "Rust is a systems language.".to_string(),
+            ),
             ("Is it fast?".to_string(), "Yes, very fast.".to_string()),
         ];
         let result = build_history_prompt("You are a helper", &history, "Tell me more.");

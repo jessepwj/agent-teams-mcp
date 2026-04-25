@@ -43,6 +43,15 @@ pub struct ExecutionProfile {
     pub skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_state: Option<ExecutionSessionState>,
+    /// Backend-assigned conversation session identifier. For Claude Code
+    /// workers this is the UUID Claude Code assigns when it starts the
+    /// stream-json session and uses for the
+    /// `~/.claude/projects/<encoded-cwd>/<id>.jsonl` filename. The web UI
+    /// uses it to display the worker's exact conversation rather than
+    /// guessing by mtime among multiple jsonl files in the same directory.
+    /// `None` for backends that don't expose a session id (codex, gemini-cli).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// On-disk envelope for `<base>/<team>/members.json`.
@@ -127,6 +136,7 @@ mod tests {
             system_prompt: Some("You are Alice.".into()),
             skills: vec!["review".into()],
             session_state: Some(ExecutionSessionState::Running),
+            session_id: None,
         };
 
         let json = serde_json::to_string(&execution).unwrap();
@@ -167,6 +177,7 @@ mod tests {
                         system_prompt: None,
                         skills: vec![],
                         session_state: Some(ExecutionSessionState::Running),
+                        session_id: None,
                     }),
                 },
             ],

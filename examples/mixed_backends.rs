@@ -36,16 +36,16 @@
 //! For real usage, replace MockClaudeBackend/MockCodexBackend with
 //! ClaudeCodeBackend::new() and CodexBackend::new().
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use agent_teams::Result;
 use agent_teams::backend::{AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig};
 use agent_teams::models::{CreateTaskRequest, TaskStatus, TaskUpdate};
 use agent_teams::orchestrator::TeamOrchestrator;
-use agent_teams::Result;
 
 // ---------------------------------------------------------------------------
 // Mock backends (replace with real ones in production)
@@ -152,8 +152,8 @@ async fn main() -> Result<()> {
     let orch = TeamOrchestrator::builder()
         .teams_base(tmp.path().join("teams"))
         .tasks_base(tmp.path().join("tasks"))
-        .with_claude_code(MockClaudeBackend)  // In production: ClaudeCodeBackend::new()
-        .with_codex(MockCodexBackend)          // In production: CodexBackend::new()?
+        .with_claude_code(MockClaudeBackend) // In production: ClaudeCodeBackend::new()
+        .with_codex(MockCodexBackend) // In production: CodexBackend::new()?
         .build()?;
 
     // 2. Create team
@@ -174,7 +174,7 @@ async fn main() -> Result<()> {
             memory_config: None,
             ..SpawnConfig::new("", "")
         },
-        BackendType::ClaudeCode,  // ← Claude Code backend
+        BackendType::ClaudeCode, // ← Claude Code backend
     )
     .await?;
 
@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
             memory_config: None,
             ..SpawnConfig::new("", "")
         },
-        BackendType::ClaudeCode,  // ← Claude Code backend
+        BackendType::ClaudeCode, // ← Claude Code backend
     )
     .await?;
 
@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
             memory_config: None,
             ..SpawnConfig::new("", "")
         },
-        BackendType::Codex,  // ← Codex backend
+        BackendType::Codex, // ← Codex backend
     )
     .await?;
 
@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
             memory_config: None,
             ..SpawnConfig::new("", "")
         },
-        BackendType::Codex,  // ← Codex backend
+        BackendType::Codex, // ← Codex backend
     )
     .await?;
 
@@ -227,54 +227,81 @@ async fn main() -> Result<()> {
     println!("\n[Creating task pipeline]");
 
     let t_plan = orch
-        .create_task("mixed", CreateTaskRequest {
-            subject: "Design API for user service".into(),
-            description: Some("Define routes, data models, and error types".into()),
-            active_form: Some("Designing API".into()),
-            metadata: None,
-        })
+        .create_task(
+            "mixed",
+            CreateTaskRequest {
+                subject: "Design API for user service".into(),
+                description: Some("Define routes, data models, and error types".into()),
+                active_form: Some("Designing API".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     let t_impl = orch
-        .create_task("mixed", CreateTaskRequest {
-            subject: "Implement user service endpoints".into(),
-            description: Some("Write axum handlers per the design doc".into()),
-            active_form: Some("Implementing endpoints".into()),
-            metadata: None,
-        })
+        .create_task(
+            "mixed",
+            CreateTaskRequest {
+                subject: "Implement user service endpoints".into(),
+                description: Some("Write axum handlers per the design doc".into()),
+                active_form: Some("Implementing endpoints".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     let t_test = orch
-        .create_task("mixed", CreateTaskRequest {
-            subject: "Write integration tests".into(),
-            description: Some("Test all endpoints with mock DB".into()),
-            active_form: Some("Writing tests".into()),
-            metadata: None,
-        })
+        .create_task(
+            "mixed",
+            CreateTaskRequest {
+                subject: "Write integration tests".into(),
+                description: Some("Test all endpoints with mock DB".into()),
+                active_form: Some("Writing tests".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     let t_review = orch
-        .create_task("mixed", CreateTaskRequest {
-            subject: "Code review implementation".into(),
-            description: Some("Review code quality, error handling, and style".into()),
-            active_form: Some("Reviewing code".into()),
-            metadata: None,
-        })
+        .create_task(
+            "mixed",
+            CreateTaskRequest {
+                subject: "Code review implementation".into(),
+                description: Some("Review code quality, error handling, and style".into()),
+                active_form: Some("Reviewing code".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     // Dependencies: plan -> impl -> (test, review)
-    orch.update_task("mixed", &t_impl.id, TaskUpdate {
-        add_blocked_by: Some(vec![t_plan.id.clone()]),
-        ..Default::default()
-    }).await?;
-    orch.update_task("mixed", &t_test.id, TaskUpdate {
-        add_blocked_by: Some(vec![t_impl.id.clone()]),
-        ..Default::default()
-    }).await?;
-    orch.update_task("mixed", &t_review.id, TaskUpdate {
-        add_blocked_by: Some(vec![t_impl.id.clone()]),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        "mixed",
+        &t_impl.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t_plan.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
+    orch.update_task(
+        "mixed",
+        &t_test.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t_impl.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
+    orch.update_task(
+        "mixed",
+        &t_review.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t_impl.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     println!("  #{} Design API (planner/claude)", t_plan.id);
     println!("    └─► #{} Implement (coder/codex)", t_impl.id);
@@ -289,28 +316,48 @@ async fn main() -> Result<()> {
     println!("  #{} -> planner (Claude Code)", t_plan.id);
 
     // Simulate planner completing
-    orch.update_task("mixed", &t_plan.id, TaskUpdate {
-        status: Some(TaskStatus::InProgress),
-        ..Default::default()
-    }).await?;
-    orch.update_task("mixed", &t_plan.id, TaskUpdate {
-        status: Some(TaskStatus::Completed),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        "mixed",
+        &t_plan.id,
+        TaskUpdate {
+            status: Some(TaskStatus::InProgress),
+            ..Default::default()
+        },
+    )
+    .await?;
+    orch.update_task(
+        "mixed",
+        &t_plan.id,
+        TaskUpdate {
+            status: Some(TaskStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
     println!("  #{} ✓ planner completed design", t_plan.id);
 
     // coder (Codex) implements
     orch.assign_task("mixed", &t_impl.id, "coder").await?;
     println!("  #{} -> coder (Codex)", t_impl.id);
 
-    orch.update_task("mixed", &t_impl.id, TaskUpdate {
-        status: Some(TaskStatus::InProgress),
-        ..Default::default()
-    }).await?;
-    orch.update_task("mixed", &t_impl.id, TaskUpdate {
-        status: Some(TaskStatus::Completed),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        "mixed",
+        &t_impl.id,
+        TaskUpdate {
+            status: Some(TaskStatus::InProgress),
+            ..Default::default()
+        },
+    )
+    .await?;
+    orch.update_task(
+        "mixed",
+        &t_impl.id,
+        TaskUpdate {
+            status: Some(TaskStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
     println!("  #{} ✓ coder completed implementation", t_impl.id);
 
     // Now test and review can run IN PARALLEL on different backends
@@ -323,13 +370,23 @@ async fn main() -> Result<()> {
     println!("\n[Cross-backend messaging]");
 
     // Codex agent sends message to Claude agent
-    orch.send_message("mixed", "coder", "reviewer", "Implementation done, please review src/handlers.rs")
-        .await?;
+    orch.send_message(
+        "mixed",
+        "coder",
+        "reviewer",
+        "Implementation done, please review src/handlers.rs",
+    )
+    .await?;
     println!("  coder (Codex) -> reviewer (Claude): review request");
 
     // Claude agent replies to Codex agent
-    orch.send_message("mixed", "reviewer", "coder", "Found 2 issues, please fix error handling in create_user()")
-        .await?;
+    orch.send_message(
+        "mixed",
+        "reviewer",
+        "coder",
+        "Found 2 issues, please fix error handling in create_user()",
+    )
+    .await?;
     println!("  reviewer (Claude) -> coder (Codex): review feedback");
 
     // Broadcast from lead to all

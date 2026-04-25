@@ -19,7 +19,6 @@ use agent_teams::consensus::{AgentResponse, ConsensusStrategy};
 use agent_teams::models::{CreateTaskRequest, TaskStatus, TaskUpdate};
 use agent_teams::orchestrator::TeamOrchestrator;
 
-
 #[tokio::main]
 async fn main() -> agent_teams::Result<()> {
     tracing_subscriber::fmt()
@@ -60,8 +59,7 @@ async fn main() -> agent_teams::Result<()> {
             CreateTaskRequest {
                 subject: "Codex: Low-level code review".into(),
                 description: Some(
-                    "Review backend/mod.rs for correctness, safety, and concurrency issues"
-                        .into(),
+                    "Review backend/mod.rs for correctness, safety, and concurrency issues".into(),
                 ),
                 active_form: Some("Codex reviewing code".into()),
                 metadata: None,
@@ -88,9 +86,7 @@ async fn main() -> agent_teams::Result<()> {
             "review",
             CreateTaskRequest {
                 subject: "Synthesize review findings".into(),
-                description: Some(
-                    "Combine Codex + Gemini findings into actionable items".into(),
-                ),
+                description: Some("Combine Codex + Gemini findings into actionable items".into()),
                 active_form: Some("Synthesizing findings".into()),
                 metadata: None,
             },
@@ -263,7 +259,10 @@ async fn main() -> agent_teams::Result<()> {
     // =========================================================================
     // Step 4: Display results
     // =========================================================================
-    println!("[4/5] Review results ({:.1}s wall time):\n", review_time.as_secs_f64());
+    println!(
+        "[4/5] Review results ({:.1}s wall time):\n",
+        review_time.as_secs_f64()
+    );
 
     println!("─────────── [Codex] Low-level Code Review ───────────");
     if codex_output.is_empty() {
@@ -319,7 +318,10 @@ async fn main() -> agent_teams::Result<()> {
 
     let result = orch.resolve_consensus(&responses, ConsensusStrategy::HumanInTheLoop);
     println!("\n  Consensus (HumanInTheLoop):");
-    println!("  Decision: {:?} (human reviews all findings)", result.decision);
+    println!(
+        "  Decision: {:?} (human reviews all findings)",
+        result.decision
+    );
     for r in &result.responses {
         let status = if r.timed_out { "TIMEOUT" } else { "OK" };
         println!("    [{status}] {}: {}", r.agent, r.content);

@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::error::Result;
 use crate::team_mode::domain::{Message, MessageKind};
@@ -40,6 +41,11 @@ pub struct LeadPendingEntry {
     pub ts: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// PID of the Claude Code process that owns this entry's target team.
+    /// The hook script filters lines by matching this against its own
+    /// `process.ppid` so each CC only injects messages addressed to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_cc_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +64,136 @@ impl LeadPendingWriter {
         self.base_dir.join(PENDING_FILENAME)
     }
 
+    /// Remove entries whose `team` field matches the given id. Called from
+    /// `team_delete` so that messages queued for a team we're about to
+    /// destroy don't later surface to the lead as a stale reminder.
+    ///
+    /// Returns the count of entries removed. Best-effort — errors reading
+    /// or writing the file are logged but not propagated; failing to prune
+    /// is noise, not a correctness issue.
+    pub fn prune_team(&self, team_id: &str) -> usize {
+        let path = self.path();
+        let Ok(content) = fs::read_to_string(&path) else {
+            return 0;
+        };
+
+        let mut kept = Vec::new();
+        let mut removed = 0usize;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<LeadPendingEntry>(line) {
+                Ok(entry) if entry.team == team_id => {
+                    removed += 1;
+                }
+                _ => kept.push(line.to_string()),
+            }
+        }
+
+        if removed == 0 {
+            return 0;
+        }
+
+        let _lock = match FileLock::acquire(&self.base_dir.join(LOCK_FILENAME)) {
+            Ok(l) => l,
+            Err(err) => {
+                tracing::warn!(error = %err, "prune_team: lock failed, skipping");
+                return 0;
+            }
+        };
+        let body = if kept.is_empty() {
+            String::new()
+        } else {
+            let mut s = kept.join("\n");
+            s.push('\n');
+            s
+        };
+        if let Err(err) = fs::write(&path, body) {
+            tracing::warn!(error = %err, path = %path.display(), "prune_team: write failed");
+            return 0;
+        }
+        tracing::info!(
+            team = %team_id,
+            removed,
+            "pruned lead_pending entries for deleted team"
+        );
+        removed
+    }
+
+    /// Remove entries whose `owner_cc_pid` points at a process that no
+    /// longer exists. Called once at MCP startup to keep the pending queue
+    /// from accumulating zombies from prior CC sessions that exited before
+    /// draining their messages.
+    ///
+    /// Entries without an `owner_cc_pid` are preserved (legacy / unbound
+    /// entries — the hook's "no owner = treat as mine" fallback still
+    /// handles them). Malformed lines are also preserved unchanged so we
+    /// never silently lose data on parse errors.
+    ///
+    /// Returns the count of entries removed. Best-effort — errors reading
+    /// or writing the file are logged but not propagated, because this is
+    /// a housekeeping step and must never block MCP startup.
+    pub fn prune_dead_owners(&self) -> usize {
+        let path = self.path();
+        let Ok(content) = fs::read_to_string(&path) else {
+            return 0; // no file yet, or unreadable — nothing to do
+        };
+
+        // Enumerate current live PIDs once.
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        let is_live = |pid: u32| -> bool { sys.process(Pid::from_u32(pid)).is_some() };
+
+        let mut kept = Vec::new();
+        let mut removed = 0usize;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<LeadPendingEntry>(line) {
+                Ok(entry) => match entry.owner_cc_pid {
+                    Some(pid) if !is_live(pid) => {
+                        removed += 1;
+                    }
+                    _ => kept.push(line.to_string()),
+                },
+                Err(_) => {
+                    // Preserve malformed lines rather than drop data.
+                    kept.push(line.to_string());
+                }
+            }
+        }
+
+        if removed == 0 {
+            return 0;
+        }
+
+        let _lock = match FileLock::acquire(&self.base_dir.join(LOCK_FILENAME)) {
+            Ok(l) => l,
+            Err(err) => {
+                tracing::warn!(error = %err, "prune_dead_owners: lock failed, skipping");
+                return 0;
+            }
+        };
+        let body = if kept.is_empty() {
+            String::new()
+        } else {
+            let mut s = kept.join("\n");
+            s.push('\n');
+            s
+        };
+        if let Err(err) = fs::write(&path, body) {
+            tracing::warn!(error = %err, path = %path.display(), "prune_dead_owners: write failed");
+            return 0;
+        }
+        tracing::info!(
+            removed,
+            "pruned stale lead_pending entries from dead CC processes"
+        );
+        removed
+    }
+
     /// Append an entry if the message's `effective_recipients` include the
     /// lead. Returns `Ok(true)` when an entry was written.
     pub fn maybe_write(
@@ -65,6 +201,7 @@ impl LeadPendingWriter {
         message: &Message,
         lead_member_id: &str,
         from_display_name: &str,
+        owner_cc_pid: Option<u32>,
     ) -> Result<bool> {
         if !message
             .effective_recipients
@@ -86,6 +223,7 @@ impl LeadPendingWriter {
             text: message.body.clone(),
             ts: message.created_at,
             reply_to: message.reply_to.clone(),
+            owner_cc_pid,
         };
 
         let json = serde_json::to_string(&entry)?;
@@ -150,12 +288,15 @@ mod tests {
         let writer = LeadPendingWriter::new(dir.path());
 
         let msg = sample_message(vec!["demo-lead", "demo-bob"]);
-        let wrote = writer.maybe_write(&msg, "demo-lead", "alice").unwrap();
+        let wrote = writer
+            .maybe_write(&msg, "demo-lead", "alice", None)
+            .unwrap();
         assert!(wrote);
 
         let content = fs::read_to_string(writer.path()).unwrap();
         assert_eq!(content.lines().count(), 1);
-        let entry: LeadPendingEntry = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        let entry: LeadPendingEntry =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(entry.team, "demo");
         assert_eq!(entry.from, "alice");
         assert_eq!(entry.from_id, "demo-alice");
@@ -171,7 +312,9 @@ mod tests {
         let writer = LeadPendingWriter::new(dir.path());
 
         let msg = sample_message(vec!["demo-bob"]);
-        let wrote = writer.maybe_write(&msg, "demo-lead", "alice").unwrap();
+        let wrote = writer
+            .maybe_write(&msg, "demo-lead", "alice", None)
+            .unwrap();
         assert!(!wrote);
         assert!(!writer.path().exists());
     }
@@ -182,9 +325,15 @@ mod tests {
         let writer = LeadPendingWriter::new(dir.path());
 
         let msg = sample_message(vec!["demo-lead"]);
-        writer.maybe_write(&msg, "demo-lead", "alice").unwrap();
-        writer.maybe_write(&msg, "demo-lead", "alice").unwrap();
-        writer.maybe_write(&msg, "demo-lead", "alice").unwrap();
+        writer
+            .maybe_write(&msg, "demo-lead", "alice", None)
+            .unwrap();
+        writer
+            .maybe_write(&msg, "demo-lead", "alice", None)
+            .unwrap();
+        writer
+            .maybe_write(&msg, "demo-lead", "alice", None)
+            .unwrap();
 
         let content = fs::read_to_string(writer.path()).unwrap();
         assert_eq!(content.lines().count(), 3);

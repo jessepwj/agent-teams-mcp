@@ -23,10 +23,14 @@ fn req(id: u64, method: &str, params: Option<Value>) -> JsonRpcRequest {
 
 fn call(runtime: &mut TeamModeMcpRuntime, id: u64, tool: &str, args: Value) -> Value {
     let (resp, _) = runtime
-        .handle_request(req(id, "tools/call", Some(json!({
-            "name": tool,
-            "arguments": args
-        }))))
+        .handle_request(req(
+            id,
+            "tools/call",
+            Some(json!({
+                "name": tool,
+                "arguments": args
+            })),
+        ))
         .unwrap();
     resp.unwrap()
 }
@@ -38,10 +42,14 @@ fn call_with_notifs(
     args: Value,
 ) -> (Value, Vec<Value>) {
     let (resp, notifs) = runtime
-        .handle_request(req(id, "tools/call", Some(json!({
-            "name": tool,
-            "arguments": args
-        }))))
+        .handle_request(req(
+            id,
+            "tools/call",
+            Some(json!({
+                "name": tool,
+                "arguments": args
+            })),
+        ))
         .unwrap();
     (resp.unwrap(), notifs)
 }
@@ -53,7 +61,10 @@ fn assert_tool_ok(resp: &Value) {
         result["isError"].is_null() || result["isError"] == json!(false),
         "tool returned isError: {resp}"
     );
-    assert!(result["content"].is_array(), "expected content array, got: {resp}");
+    assert!(
+        result["content"].is_array(),
+        "expected content array, got: {resp}"
+    );
 }
 
 /// Assert that the tool call result has isError = true.
@@ -88,11 +99,12 @@ fn reject_requests_before_initialize() {
     let dir = tempdir().unwrap();
     let mut rt = TeamModeMcpRuntime::new(dir.path());
 
-    let (resp, _) = rt
-        .handle_request(req(1, "tools/list", None))
-        .unwrap();
+    let (resp, _) = rt.handle_request(req(1, "tools/list", None)).unwrap();
     let resp = resp.unwrap();
-    assert!(resp["error"].is_object(), "expected error before init: {resp}");
+    assert!(
+        resp["error"].is_object(),
+        "expected error before init: {resp}"
+    );
     assert_eq!(resp["error"]["code"], json!(-32000));
 }
 
@@ -101,9 +113,7 @@ fn initialize_returns_capabilities() {
     let dir = tempdir().unwrap();
     let mut rt = TeamModeMcpRuntime::new(dir.path());
 
-    let (resp, notifs) = rt
-        .handle_request(req(1, "initialize", None))
-        .unwrap();
+    let (resp, notifs) = rt.handle_request(req(1, "initialize", None)).unwrap();
     let resp = resp.unwrap();
     assert!(resp["result"]["capabilities"]["tools"].is_object());
     assert!(notifs.is_empty());
@@ -115,21 +125,22 @@ fn tools_list_exposes_minimal_7_surface() {
     let mut rt = TeamModeMcpRuntime::new(dir.path());
     rt.handle_request(req(1, "initialize", None)).unwrap();
 
-    let (resp, _) = rt
-        .handle_request(req(2, "tools/list", None))
-        .unwrap();
+    let (resp, _) = rt.handle_request(req(2, "tools/list", None)).unwrap();
     let resp = resp.unwrap();
     let tools = resp["result"]["tools"].as_array().unwrap();
 
-    let names: Vec<&str> = tools.iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
-    // The final-minimal MCP surface: 7 tools only.
+    // The MCP surface: 8 tools.
     let expected: &[&str] = &[
-        "team_create", "team_list", "team_delete",
-        "worker_add", "worker_list", "worker_remove",
+        "team_create",
+        "team_list",
+        "team_delete",
+        "worker_add",
+        "worker_list",
+        "worker_remove",
         "send_message",
+        "inbox_read",
     ];
     for name in expected {
         assert!(names.contains(name), "missing tool: {name}");
@@ -142,15 +153,27 @@ fn tools_list_exposes_minimal_7_surface() {
 
     // Removed legacy tools must not come back.
     for gone in &[
-        "team_get", "member_get", "member_update",
-        "member_add", "member_remove", "member_list",
-        "room_post_message", "room_read_messages", "room_list",
-        "inbox_peek", "inbox_read", "inbox_ack", "inbox_count",
-        "thread_read", "thread_reply",
+        "team_get",
+        "member_get",
+        "member_update",
+        "member_add",
+        "member_remove",
+        "member_list",
+        "room_post_message",
+        "room_read_messages",
+        "room_list",
+        "inbox_peek",
+        "inbox_ack",
+        "inbox_count",
+        "thread_read",
+        "thread_reply",
         "execution_profile_set",
-        "spawn_member", "shutdown_member",
-        "member_spawn_managed", "member_shutdown_managed",
-        "member_resume_managed", "member_session_status",
+        "spawn_member",
+        "shutdown_member",
+        "member_spawn_managed",
+        "member_shutdown_managed",
+        "member_resume_managed",
+        "member_session_status",
     ] {
         assert!(!names.contains(gone), "removed tool still exposed: {gone}");
     }
@@ -162,9 +185,7 @@ fn unknown_method_returns_method_not_found() {
     let mut rt = TeamModeMcpRuntime::new(dir.path());
     rt.handle_request(req(1, "initialize", None)).unwrap();
 
-    let (resp, _) = rt
-        .handle_request(req(2, "no_such_method", None))
-        .unwrap();
+    let (resp, _) = rt.handle_request(req(2, "no_such_method", None)).unwrap();
     let resp = resp.unwrap();
     assert_eq!(resp["error"]["code"], json!(-32601));
 }
@@ -175,9 +196,7 @@ fn ping_returns_empty_result() {
     let mut rt = TeamModeMcpRuntime::new(dir.path());
     rt.handle_request(req(1, "initialize", None)).unwrap();
 
-    let (resp, _) = rt
-        .handle_request(req(2, "ping", None))
-        .unwrap();
+    let (resp, _) = rt.handle_request(req(2, "ping", None)).unwrap();
     let resp = resp.unwrap();
     assert!(resp["result"].is_object());
     assert!(resp["error"].is_null());
@@ -197,10 +216,15 @@ fn team_create_sets_up_lead_and_supports_worker_list() {
     rt.handle_request(req(1, "initialize", None)).unwrap();
 
     // 1. create team
-    let resp = call(&mut rt, 2, "team_create", json!({
-        "name": "alpha",
-        "cwd": "E:\\project"
-    }));
+    let resp = call(
+        &mut rt,
+        2,
+        "team_create",
+        json!({
+            "name": "alpha",
+            "cwd": "E:\\project"
+        }),
+    );
     assert_tool_ok(&resp);
 
     // 2. team_list shows alpha with a lead auto-bound
@@ -209,7 +233,7 @@ fn team_create_sets_up_lead_and_supports_worker_list() {
     let list = first_json(&resp);
     let teams = list["teams"].as_array().unwrap();
     let team = teams.iter().find(|t| t["name"] == "alpha").unwrap();
-    assert_eq!(team["leadMemberId"].as_str(), Some("alpha-lead"));
+    assert_eq!(team["leadMemberId"].as_str(), Some("lead"));
     assert_eq!(team["cwd"].as_str(), Some("E:\\project"));
 
     // 3. worker_list should be empty (lead is never listed).
@@ -220,9 +244,13 @@ fn team_create_sets_up_lead_and_supports_worker_list() {
 
     // 4. reading the lead's inbox resource works
     let (resp, _) = rt
-        .handle_request(req(5, "resources/read", Some(json!({
-            "uri": "team://alpha/members/alpha-lead/inbox"
-        }))))
+        .handle_request(req(
+            5,
+            "resources/read",
+            Some(json!({
+                "uri": "team://alpha/members/alpha-lead/inbox"
+            })),
+        ))
         .unwrap();
     let resp = resp.unwrap();
     assert!(resp["result"]["contents"].is_array());
@@ -233,7 +261,10 @@ fn team_create_sets_up_lead_and_supports_worker_list() {
 
     let resp = call(&mut rt, 7, "team_list", json!({}));
     let text = first_text(&resp);
-    assert!(!text.contains("alpha"), "deleted team still in list: {text}");
+    assert!(
+        !text.contains("alpha"),
+        "deleted team still in list: {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -259,11 +290,16 @@ fn worker_add_to_nonexistent_team_returns_error() {
     let mut rt = TeamModeMcpRuntime::new(dir.path());
     rt.handle_request(req(1, "initialize", None)).unwrap();
 
-    let resp = call(&mut rt, 2, "worker_add", json!({
-        "team": "does-not-exist",
-        "name": "alice",
-        "adapter": "claude-code"
-    }));
+    let resp = call(
+        &mut rt,
+        2,
+        "worker_add",
+        json!({
+            "team": "does-not-exist",
+            "name": "alice",
+            "adapter": "claude-code"
+        }),
+    );
     assert_tool_err(&resp);
     let text = first_text(&resp);
     assert!(
@@ -279,10 +315,15 @@ fn send_message_rejects_no_mention_in_text() {
     rt.handle_request(req(1, "initialize", None)).unwrap();
 
     call(&mut rt, 2, "team_create", json!({"name": "t1"}));
-    let resp = call(&mut rt, 3, "send_message", json!({
-        "team": "t1",
-        "text": "talking into the void"
-    }));
+    let resp = call(
+        &mut rt,
+        3,
+        "send_message",
+        json!({
+            "team": "t1",
+            "text": "talking into the void"
+        }),
+    );
     assert_tool_err(&resp);
     let text = first_text(&resp);
     assert!(
@@ -309,11 +350,16 @@ fn worker_add_refuses_reserved_name_lead() {
     rt.handle_request(req(1, "initialize", None)).unwrap();
 
     call(&mut rt, 2, "team_create", json!({"name": "t1"}));
-    let resp = call(&mut rt, 3, "worker_add", json!({
-        "team": "t1",
-        "name": "lead",
-        "adapter": "claude-code"
-    }));
+    let resp = call(
+        &mut rt,
+        3,
+        "worker_add",
+        json!({
+            "team": "t1",
+            "name": "lead",
+            "adapter": "claude-code"
+        }),
+    );
     assert_tool_err(&resp);
     let text = first_text(&resp);
     assert!(
@@ -335,23 +381,32 @@ fn resources_list_and_read_after_team_created() {
     call(&mut rt, 2, "team_create", json!({"name": "res-team"}));
 
     // resources/list
-    let (resp, _) = rt
-        .handle_request(req(3, "resources/list", None))
-        .unwrap();
+    let (resp, _) = rt.handle_request(req(3, "resources/list", None)).unwrap();
     let resp = resp.unwrap();
     let resources = resp["result"]["resources"].as_array().unwrap();
-    assert!(!resources.is_empty(), "expected resources after team creation");
+    assert!(
+        !resources.is_empty(),
+        "expected resources after team creation"
+    );
 
-    let uris: Vec<&str> = resources.iter()
+    let uris: Vec<&str> = resources
+        .iter()
         .map(|r| r["uri"].as_str().unwrap_or(""))
         .collect();
-    assert!(uris.iter().any(|u| u.contains("res-team")), "team URI missing: {uris:?}");
+    assert!(
+        uris.iter().any(|u| u.contains("res-team")),
+        "team URI missing: {uris:?}"
+    );
 
     // resources/read for team
     let (resp, _) = rt
-        .handle_request(req(4, "resources/read", Some(json!({
-            "uri": "team://res-team"
-        }))))
+        .handle_request(req(
+            4,
+            "resources/read",
+            Some(json!({
+                "uri": "team://res-team"
+            })),
+        ))
         .unwrap();
     let resp = resp.unwrap();
     assert!(resp["result"]["contents"].is_array());
@@ -370,27 +425,41 @@ fn subscribe_triggers_notification_after_team_delete() {
 
     // subscribe to team URI
     let (resp, _) = rt
-        .handle_request(req(3, "resources/subscribe", Some(json!({
-            "uri": "team://sub-team"
-        }))))
+        .handle_request(req(
+            3,
+            "resources/subscribe",
+            Some(json!({
+                "uri": "team://sub-team"
+            })),
+        ))
         .unwrap();
     let resp = resp.unwrap();
     assert!(resp["error"].is_null(), "subscribe failed: {resp}");
 
     // delete the team — should trigger notification on team URI
-    let (resp, notifs) = call_with_notifs(&mut rt, 4, "team_delete", json!({
-        "name": "sub-team"
-    }));
+    let (resp, notifs) = call_with_notifs(
+        &mut rt,
+        4,
+        "team_delete",
+        json!({
+            "name": "sub-team"
+        }),
+    );
     assert_tool_ok(&resp);
 
-    let notif_uris: Vec<&str> = notifs.iter()
+    let notif_uris: Vec<&str> = notifs
+        .iter()
         .filter_map(|n| n["params"]["uri"].as_str())
         .collect();
     assert!(
         notif_uris.contains(&"team://sub-team"),
         "expected team URI in notifications, got: {notif_uris:?}"
     );
-    assert!(notifs.iter().all(|n| n["method"] == json!("notifications/resources/updated")));
+    assert!(
+        notifs
+            .iter()
+            .all(|n| n["method"] == json!("notifications/resources/updated"))
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -57,77 +57,112 @@ async fn main() -> agent_teams::Result<()> {
     println!("[1/6] Creating diamond DAG (6 tasks, 3 phases)...\n");
 
     let t1 = orch
-        .create_task(TEAM, CreateTaskRequest {
-            subject: "CC: Concurrency analysis".into(),
-            description: Some("Analyze async patterns in orchestrator and backend".into()),
-            active_form: Some("CC analyzing concurrency".into()),
-            metadata: None,
-        })
+        .create_task(
+            TEAM,
+            CreateTaskRequest {
+                subject: "CC: Concurrency analysis".into(),
+                description: Some("Analyze async patterns in orchestrator and backend".into()),
+                active_form: Some("CC analyzing concurrency".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     let t2 = orch
-        .create_task(TEAM, CreateTaskRequest {
-            subject: "Codex: Security audit".into(),
-            description: Some("Audit for env leaks, input validation, unsafe patterns".into()),
-            active_form: Some("Codex auditing security".into()),
-            metadata: None,
-        })
+        .create_task(
+            TEAM,
+            CreateTaskRequest {
+                subject: "Codex: Security audit".into(),
+                description: Some("Audit for env leaks, input validation, unsafe patterns".into()),
+                active_form: Some("Codex auditing security".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     let t3 = orch
-        .create_task(TEAM, CreateTaskRequest {
-            subject: "Gemini: API design review".into(),
-            description: Some("Review trait hierarchy and public API surface".into()),
-            active_form: Some("Gemini reviewing API".into()),
-            metadata: None,
-        })
+        .create_task(
+            TEAM,
+            CreateTaskRequest {
+                subject: "Gemini: API design review".into(),
+                description: Some("Review trait hierarchy and public API surface".into()),
+                active_form: Some("Gemini reviewing API".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     let t4 = orch
-        .create_task(TEAM, CreateTaskRequest {
-            subject: "Codex: Fix proposals".into(),
-            description: Some("Propose fixes for concurrency + security findings".into()),
-            active_form: Some("Codex proposing fixes".into()),
-            metadata: None,
-        })
+        .create_task(
+            TEAM,
+            CreateTaskRequest {
+                subject: "Codex: Fix proposals".into(),
+                description: Some("Propose fixes for concurrency + security findings".into()),
+                active_form: Some("Codex proposing fixes".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     let t5 = orch
-        .create_task(TEAM, CreateTaskRequest {
-            subject: "Gemini: Refactoring roadmap".into(),
-            description: Some("Create refactoring priorities from security + API findings".into()),
-            active_form: Some("Gemini planning refactoring".into()),
-            metadata: None,
-        })
+        .create_task(
+            TEAM,
+            CreateTaskRequest {
+                subject: "Gemini: Refactoring roadmap".into(),
+                description: Some(
+                    "Create refactoring priorities from security + API findings".into(),
+                ),
+                active_form: Some("Gemini planning refactoring".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     let t6 = orch
-        .create_task(TEAM, CreateTaskRequest {
-            subject: "CC: Final synthesis report".into(),
-            description: Some("Combine all findings into actionable report".into()),
-            active_form: Some("CC synthesizing report".into()),
-            metadata: None,
-        })
+        .create_task(
+            TEAM,
+            CreateTaskRequest {
+                subject: "CC: Final synthesis report".into(),
+                description: Some("Combine all findings into actionable report".into()),
+                active_form: Some("CC synthesizing report".into()),
+                metadata: None,
+            },
+        )
         .await?;
 
     // Wire up the diamond DAG
     // T4 blocked by T1 + T2
-    orch.update_task(TEAM, &t4.id, TaskUpdate {
-        add_blocked_by: Some(vec![t1.id.clone(), t2.id.clone()]),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t4.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t1.id.clone(), t2.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // T5 blocked by T2 + T3
-    orch.update_task(TEAM, &t5.id, TaskUpdate {
-        add_blocked_by: Some(vec![t2.id.clone(), t3.id.clone()]),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t5.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t2.id.clone(), t3.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // T6 blocked by T4 + T5
-    orch.update_task(TEAM, &t6.id, TaskUpdate {
-        add_blocked_by: Some(vec![t4.id.clone(), t5.id.clone()]),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t6.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t4.id.clone(), t5.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // Show the initial DAG (terminal rendering with ANSI colors)
     let dag_view = orch.export_task_graph_terminal(TEAM).await?;
@@ -139,12 +174,21 @@ async fn main() -> agent_teams::Result<()> {
     println!("[2/6] Phase 1: Spawning 3 agents in parallel...\n");
 
     // Mark Phase 1 tasks in-progress
-    for (tid, owner) in [(&t1.id, "cc-analyst"), (&t2.id, "codex-auditor"), (&t3.id, "gemini-reviewer")] {
-        orch.update_task(TEAM, tid, TaskUpdate {
-            status: Some(TaskStatus::InProgress),
-            owner: Some(owner.into()),
-            ..Default::default()
-        }).await?;
+    for (tid, owner) in [
+        (&t1.id, "cc-analyst"),
+        (&t2.id, "codex-auditor"),
+        (&t3.id, "gemini-reviewer"),
+    ] {
+        orch.update_task(
+            TEAM,
+            tid,
+            TaskUpdate {
+                status: Some(TaskStatus::InProgress),
+                owner: Some(owner.into()),
+                ..Default::default()
+            },
+        )
+        .await?;
     }
 
     // Read source files
@@ -182,7 +226,10 @@ async fn main() -> agent_teams::Result<()> {
         delegations: Vec::new(),
     };
 
-    match orch.spawn_teammate(TEAM, cc_config, BackendType::ClaudeCode).await {
+    match orch
+        .spawn_teammate(TEAM, cc_config, BackendType::ClaudeCode)
+        .await
+    {
         Ok(()) => println!("  ✓ cc-analyst (Claude Code/Sonnet) → concurrency analysis"),
         Err(e) => println!("  ✗ cc-analyst failed: {e}"),
     }
@@ -214,7 +261,10 @@ async fn main() -> agent_teams::Result<()> {
         delegations: Vec::new(),
     };
 
-    match orch.spawn_teammate(TEAM, codex_config, BackendType::Codex).await {
+    match orch
+        .spawn_teammate(TEAM, codex_config, BackendType::Codex)
+        .await
+    {
         Ok(()) => println!("  ✓ codex-auditor (Codex/high) → security audit"),
         Err(e) => println!("  ✗ codex-auditor failed: {e}"),
     }
@@ -246,12 +296,18 @@ async fn main() -> agent_teams::Result<()> {
         delegations: Vec::new(),
     };
 
-    match orch.spawn_teammate(TEAM, gemini_config, BackendType::GeminiCli).await {
+    match orch
+        .spawn_teammate(TEAM, gemini_config, BackendType::GeminiCli)
+        .await
+    {
         Ok(()) => println!("  ✓ gemini-reviewer (Gemini/2.5-flash) → API design review"),
         Err(e) => println!("  ✗ gemini-reviewer failed: {e}"),
     }
 
-    println!("\n  Phase 1: 3 agents spawned in {:.1}s\n", start.elapsed().as_secs_f64());
+    println!(
+        "\n  Phase 1: 3 agents spawned in {:.1}s\n",
+        start.elapsed().as_secs_f64()
+    );
 
     // --- Collect Phase 1 outputs in parallel ---
     println!("[3/6] Collecting Phase 1 reviews (3 agents in parallel)...\n");
@@ -262,9 +318,24 @@ async fn main() -> agent_teams::Result<()> {
         let codex_rx = orch.take_output_receiver(TEAM, "codex-auditor").await?;
         let gemini_rx = orch.take_output_receiver(TEAM, "gemini-reviewer").await?;
 
-        let h1 = tokio::spawn(async { ("cc-analyst".to_string(), collect_output(cc_rx, TIMEOUT_SECS).await) });
-        let h2 = tokio::spawn(async { ("codex-auditor".to_string(), collect_output(codex_rx, TIMEOUT_SECS).await) });
-        let h3 = tokio::spawn(async { ("gemini-reviewer".to_string(), collect_output(gemini_rx, TIMEOUT_SECS).await) });
+        let h1 = tokio::spawn(async {
+            (
+                "cc-analyst".to_string(),
+                collect_output(cc_rx, TIMEOUT_SECS).await,
+            )
+        });
+        let h2 = tokio::spawn(async {
+            (
+                "codex-auditor".to_string(),
+                collect_output(codex_rx, TIMEOUT_SECS).await,
+            )
+        });
+        let h3 = tokio::spawn(async {
+            (
+                "gemini-reviewer".to_string(),
+                collect_output(gemini_rx, TIMEOUT_SECS).await,
+            )
+        });
 
         for handle in [h1, h2, h3] {
             let (name, output) = handle.await.unwrap();
@@ -298,10 +369,15 @@ async fn main() -> agent_teams::Result<()> {
 
     // Mark Phase 1 tasks complete
     for tid in [&t1.id, &t2.id, &t3.id] {
-        orch.update_task(TEAM, tid, TaskUpdate {
-            status: Some(TaskStatus::Completed),
-            ..Default::default()
-        }).await?;
+        orch.update_task(
+            TEAM,
+            tid,
+            TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await?;
     }
 
     // Shutdown Phase 1 agents (free resources before Phase 2)
@@ -328,22 +404,41 @@ async fn main() -> agent_teams::Result<()> {
     }
 
     // Prepare Phase 1 summaries for context injection
-    let cc_findings = phase1_outputs.get("cc-analyst").cloned().unwrap_or_default();
-    let codex_findings = phase1_outputs.get("codex-auditor").cloned().unwrap_or_default();
-    let gemini_findings = phase1_outputs.get("gemini-reviewer").cloned().unwrap_or_default();
+    let cc_findings = phase1_outputs
+        .get("cc-analyst")
+        .cloned()
+        .unwrap_or_default();
+    let codex_findings = phase1_outputs
+        .get("codex-auditor")
+        .cloned()
+        .unwrap_or_default();
+    let gemini_findings = phase1_outputs
+        .get("gemini-reviewer")
+        .cloned()
+        .unwrap_or_default();
 
     // Mark Phase 2 tasks in-progress
-    orch.update_task(TEAM, &t4.id, TaskUpdate {
-        status: Some(TaskStatus::InProgress),
-        owner: Some("codex-fixer".into()),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t4.id,
+        TaskUpdate {
+            status: Some(TaskStatus::InProgress),
+            owner: Some("codex-fixer".into()),
+            ..Default::default()
+        },
+    )
+    .await?;
 
-    orch.update_task(TEAM, &t5.id, TaskUpdate {
-        status: Some(TaskStatus::InProgress),
-        owner: Some("gemini-planner".into()),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t5.id,
+        TaskUpdate {
+            status: Some(TaskStatus::InProgress),
+            owner: Some("gemini-planner".into()),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // T4: Codex — Fix proposals (uses CC concurrency + Codex security findings)
     let codex2_prompt = format!(
@@ -368,7 +463,10 @@ async fn main() -> agent_teams::Result<()> {
         delegations: Vec::new(),
     };
 
-    match orch.spawn_teammate(TEAM, codex2_config, BackendType::Codex).await {
+    match orch
+        .spawn_teammate(TEAM, codex2_config, BackendType::Codex)
+        .await
+    {
         Ok(()) => println!("  ✓ codex-fixer (Phase 2) → fix proposals"),
         Err(e) => println!("  ✗ codex-fixer failed: {e}"),
     }
@@ -396,7 +494,10 @@ async fn main() -> agent_teams::Result<()> {
         delegations: Vec::new(),
     };
 
-    match orch.spawn_teammate(TEAM, gemini2_config, BackendType::GeminiCli).await {
+    match orch
+        .spawn_teammate(TEAM, gemini2_config, BackendType::GeminiCli)
+        .await
+    {
         Ok(()) => println!("  ✓ gemini-planner (Phase 2) → refactoring roadmap"),
         Err(e) => println!("  ✗ gemini-planner failed: {e}"),
     }
@@ -409,8 +510,18 @@ async fn main() -> agent_teams::Result<()> {
         let codex_rx = orch.take_output_receiver(TEAM, "codex-fixer").await?;
         let gemini_rx = orch.take_output_receiver(TEAM, "gemini-planner").await?;
 
-        let h1 = tokio::spawn(async { ("codex-fixer".to_string(), collect_output(codex_rx, TIMEOUT_SECS).await) });
-        let h2 = tokio::spawn(async { ("gemini-planner".to_string(), collect_output(gemini_rx, TIMEOUT_SECS).await) });
+        let h1 = tokio::spawn(async {
+            (
+                "codex-fixer".to_string(),
+                collect_output(codex_rx, TIMEOUT_SECS).await,
+            )
+        });
+        let h2 = tokio::spawn(async {
+            (
+                "gemini-planner".to_string(),
+                collect_output(gemini_rx, TIMEOUT_SECS).await,
+            )
+        });
 
         for handle in [h1, h2] {
             let (name, output) = handle.await.unwrap();
@@ -420,7 +531,11 @@ async fn main() -> agent_teams::Result<()> {
 
     // Print Phase 2 results
     for (name, output) in &phase2_outputs {
-        let backend = if name.contains("codex") { "Codex" } else { "Gemini" };
+        let backend = if name.contains("codex") {
+            "Codex"
+        } else {
+            "Gemini"
+        };
         println!("─────────── [P2][{backend}] {name} ───────────");
         if output.is_empty() {
             println!("  (no output)");
@@ -438,10 +553,15 @@ async fn main() -> agent_teams::Result<()> {
 
     // Mark Phase 2 complete
     for tid in [&t4.id, &t5.id] {
-        orch.update_task(TEAM, tid, TaskUpdate {
-            status: Some(TaskStatus::Completed),
-            ..Default::default()
-        }).await?;
+        orch.update_task(
+            TEAM,
+            tid,
+            TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await?;
     }
 
     // Shutdown Phase 2 agents
@@ -458,14 +578,25 @@ async fn main() -> agent_teams::Result<()> {
     println!("[5/6] Phase 3: CC synthesizing final report...\n");
 
     // Mark T6 in-progress
-    orch.update_task(TEAM, &t6.id, TaskUpdate {
-        status: Some(TaskStatus::InProgress),
-        owner: Some("cc-synthesizer".into()),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t6.id,
+        TaskUpdate {
+            status: Some(TaskStatus::InProgress),
+            owner: Some("cc-synthesizer".into()),
+            ..Default::default()
+        },
+    )
+    .await?;
 
-    let fix_proposals = phase2_outputs.get("codex-fixer").cloned().unwrap_or_default();
-    let refactor_roadmap = phase2_outputs.get("gemini-planner").cloned().unwrap_or_default();
+    let fix_proposals = phase2_outputs
+        .get("codex-fixer")
+        .cloned()
+        .unwrap_or_default();
+    let refactor_roadmap = phase2_outputs
+        .get("gemini-planner")
+        .cloned()
+        .unwrap_or_default();
 
     let cc3_prompt = format!(
         "You are the team lead synthesizing a final code review report for the `agent-teams` Rust crate.\n\
@@ -493,7 +624,10 @@ async fn main() -> agent_teams::Result<()> {
         delegations: Vec::new(),
     };
 
-    match orch.spawn_teammate(TEAM, cc3_config, BackendType::ClaudeCode).await {
+    match orch
+        .spawn_teammate(TEAM, cc3_config, BackendType::ClaudeCode)
+        .await
+    {
         Ok(()) => println!("  ✓ cc-synthesizer (Claude Code/Sonnet) → final report"),
         Err(e) => println!("  ✗ cc-synthesizer failed: {e}"),
     }
@@ -513,10 +647,15 @@ async fn main() -> agent_teams::Result<()> {
     println!("═══════════════════════════════════════════════════════\n");
 
     // Mark T6 complete
-    orch.update_task(TEAM, &t6.id, TaskUpdate {
-        status: Some(TaskStatus::Completed),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t6.id,
+        TaskUpdate {
+            status: Some(TaskStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // =========================================================================
     // Step 5: Final DAG state + cleanup
@@ -536,7 +675,10 @@ async fn main() -> agent_teams::Result<()> {
     let total = start.elapsed();
     println!("\n╔═══════════════════════════════════════════════════════╗");
     println!("║  Review complete!                                     ║");
-    println!("║  3 phases · 6 tasks · 3 backends · {:.0}s total         ║", total.as_secs_f64());
+    println!(
+        "║  3 phases · 6 tasks · 3 backends · {:.0}s total         ║",
+        total.as_secs_f64()
+    );
     println!("╚═══════════════════════════════════════════════════════╝");
 
     Ok(())
@@ -551,7 +693,11 @@ fn read_file(project_dir: &std::path::Path, path: &str, max_lines: usize) -> Str
     let content = std::fs::read_to_string(project_dir.join(path))
         .unwrap_or_else(|_| format!("(could not read {path})"));
     if max_lines > 0 {
-        content.lines().take(max_lines).collect::<Vec<_>>().join("\n")
+        content
+            .lines()
+            .take(max_lines)
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
         content
     }

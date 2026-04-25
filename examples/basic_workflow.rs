@@ -26,8 +26,13 @@ async fn main() -> agent_teams::Result<()> {
         .build()?;
 
     // 2. Create a team
-    let team = orch.create_team("demo-project", Some("A demo team")).await?;
-    println!("[Team] Created: {} — {:?}", team.team_name, team.description);
+    let team = orch
+        .create_team("demo-project", Some("A demo team"))
+        .await?;
+    println!(
+        "[Team] Created: {} — {:?}",
+        team.team_name, team.description
+    );
 
     // 3. Create tasks with dependencies
     let t1 = orch

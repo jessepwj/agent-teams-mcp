@@ -89,10 +89,16 @@ async fn gemini_spawn_and_receive_output() {
     .await;
 
     assert!(timeout.is_ok(), "Timed out waiting for Gemini response");
-    assert!(got_turn_complete, "Should receive TurnComplete after process exits");
+    assert!(
+        got_turn_complete,
+        "Should receive TurnComplete after process exits"
+    );
     // The initial prompt is the system prompt itself -- Gemini should produce some output
     // (even if it's just acknowledging the system prompt)
-    println!("Initial output ({} bytes):\n{collected_text}", collected_text.len());
+    println!(
+        "Initial output ({} bytes):\n{collected_text}",
+        collected_text.len()
+    );
 
     // Now send a follow-up input (spawns a new process)
     session
@@ -127,8 +133,14 @@ async fn gemini_spawn_and_receive_output() {
     })
     .await;
 
-    assert!(timeout2.is_ok(), "Timed out waiting for second Gemini response");
-    assert!(got_second_complete, "Should receive TurnComplete for second turn");
+    assert!(
+        timeout2.is_ok(),
+        "Timed out waiting for second Gemini response"
+    );
+    assert!(
+        got_second_complete,
+        "Should receive TurnComplete for second turn"
+    );
     println!("Second turn output:\n{second_text}");
     assert!(
         second_text.contains('4'),
@@ -198,9 +210,13 @@ async fn gemini_via_orchestrator() {
     assert!(timeout.is_ok(), "Timed out on initial prompt");
 
     // Send a review request via orchestrator
-    orch.send_input("gemini-team", "reviewer", "Review this: fn add(a: i32, b: i32) -> i32 { a + b }")
-        .await
-        .unwrap();
+    orch.send_input(
+        "gemini-team",
+        "reviewer",
+        "Review this: fn add(a: i32, b: i32) -> i32 { a + b }",
+    )
+    .await
+    .unwrap();
 
     let mut review_text = String::new();
     let timeout2 = tokio::time::timeout(Duration::from_secs(60), async {

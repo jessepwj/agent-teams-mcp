@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use crate::error::Result;
 use crate::team_mode::data_dir;
 use crate::team_mode::domain::Room;
-use crate::team_mode::storage::{acquire_lock_path, ensure_dir, read_json_opt, validate_storage_name};
+use crate::team_mode::storage::{
+    acquire_lock_path, ensure_dir, read_json_opt, validate_storage_name,
+};
 use crate::util::atomic_write::atomic_write_json;
 
 /// Single-room-per-team store. Current product only uses the "main" room.

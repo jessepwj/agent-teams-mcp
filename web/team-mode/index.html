@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>团队模式 Web</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <div class="banner" id="banner" hidden></div>
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-kicker" id="brandKicker">团队模式 Web</div>
+          <h1 id="brandTitle">团队模式</h1>
+        </div>
+        <div class="topbar-controls">
+          <label class="field">
+            <span id="teamLabel">团队</span>
+            <select id="teamSelect"></select>
+          </label>
+          <label class="field grow">
+            <span id="searchLabel">搜索</span>
+            <input id="searchInput" type="search" placeholder="筛选消息、成员或提及" />
+          </label>
+          <div class="live-pill" id="liveStatus">状态：空闲</div>
+          <button id="languageToggleButton" class="chip" type="button" title="Switch language">English</button>
+          <button id="reloadButton" class="icon-button" type="button" title="刷新">↻</button>
+        </div>
+      </header>
+
+      <main class="workspace" id="workspace">
+        <aside class="sidebar left-pane">
+          <section class="pane-section">
+            <div class="section-title" id="roomsTitle">房间</div>
+            <div class="simple-list" id="roomList"></div>
+          </section>
+          <section class="pane-section">
+            <div class="section-title" id="membersTitle">成员</div>
+            <div class="simple-list" id="memberList"></div>
+          </section>
+          <section class="pane-section">
+            <div class="section-title" id="filtersTitle">筛选</div>
+            <div class="filter-row">
+              <button class="chip" id="clearFiltersButton" type="button">重置筛选</button>
+              <button class="chip" id="focusLeadButton" type="button">负责人活动</button>
+            </div>
+            <div class="filter-summary" id="filterSummary">未启用筛选。</div>
+          </section>
+        </aside>
+
+        <div
+          class="splitter"
+          id="leftSplitter"
+          role="separator"
+          tabindex="0"
+          aria-orientation="vertical"
+          aria-label="调整左侧栏宽度"
+          title="拖动调整左侧栏宽度"
+        ></div>
+
+        <section class="timeline-pane">
+          <div class="pane-header">
+            <div>
+              <div class="section-title" id="timelineTitle">聊天时间线</div>
+              <div class="subtle" id="timelineSubtitle">选择团队以加载消息。</div>
+            </div>
+            <div class="stats" id="timelineStats"></div>
+          </div>
+          <div class="timeline" id="messageList"></div>
+        </section>
+
+        <div
+          class="splitter"
+          id="rightSplitter"
+          role="separator"
+          tabindex="0"
+          aria-orientation="vertical"
+          aria-label="调整详情栏宽度"
+          title="拖动调整详情栏宽度"
+        ></div>
+
+        <aside class="sidebar detail-pane" id="detailPane">
+          <section class="pane-section">
+            <div class="section-title" id="detailPaneTitle">详情面板</div>
+            <div class="detail-tabs" role="tablist" aria-label="右侧栏内容">
+              <button class="detail-tab active" id="sessionTabButton" type="button">会话</button>
+              <button class="detail-tab" id="detailTabButton" type="button">详情</button>
+              <button class="detail-tab" id="diagnosticsTabButton" type="button">诊断</button>
+            </div>
+            <div class="detail-title" id="detailTitle">未选择</div>
+            <div class="detail-body" id="detailBody">请选择消息或成员。</div>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="statusbar">
+        <div id="statusSummary">只读</div>
+        <div id="countsSummary">0 条消息</div>
+      </footer>
+    </div>
+  </body>
+</html>

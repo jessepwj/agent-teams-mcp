@@ -10,6 +10,7 @@ pub mod error;
 pub mod models;
 pub mod runtime;
 pub mod team_mode;
+pub mod team_mode_daemon;
 pub mod util;
 
 // Legacy workflow-oriented modules retained during the migration.
@@ -28,6 +29,8 @@ pub mod dashboard;
 
 #[cfg(feature = "checkpoint")]
 pub mod checkpoint;
+
+pub mod team_mode_web;
 
 #[cfg(feature = "tui")]
 pub mod tui;
@@ -61,12 +64,15 @@ pub use team_mode::mcp::{
     ResourceDescriptor, ResourcesUpdatedParams, TeamModeMcpRuntime, TeamModeResourceRegistry,
     TeamModeToolset, TextResourceContents, ToolCallResult, ToolDescriptor,
 };
+pub use team_mode::runtime_workers::{RuntimeWorkerRecord, RuntimeWorkerStore, RuntimeWorkersFile};
 pub use team_mode::service::{
     AddMemberRequest, CreateTeamRequest, InboxCount, InboxService, MemberRecord, MemberService,
     MessageService, ReplyToThreadRequest, RoomService, SendMessageRequest, TeamService,
     ThreadService, UpdateMemberRequest,
 };
 pub use team_mode::storage::{MemberStore, MessageStore, ProjectionStore, RoomStore, TeamStore};
+
+pub use team_mode_web::{TeamModeWebState, router as team_mode_web_router};
 
 /// Convenience re-exports for common usage patterns.
 ///

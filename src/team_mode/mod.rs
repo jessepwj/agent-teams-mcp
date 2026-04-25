@@ -7,10 +7,12 @@
 pub mod data_dir;
 pub mod domain;
 pub mod mcp;
+pub mod runtime_workers;
 pub mod service;
 pub mod storage;
 
 pub use domain::*;
 pub use mcp::*;
+pub use runtime_workers::*;
 pub use service::*;
 pub use storage::*;

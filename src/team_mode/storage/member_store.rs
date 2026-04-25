@@ -8,7 +8,9 @@ use crate::team_mode::data_dir::{self, MEMBERS_FILE_VERSION};
 use crate::team_mode::domain::{
     ExecutionProfile, MemberKind, MemberProfile, MemberStatus, MembersFile, UnifiedMember,
 };
-use crate::team_mode::storage::{acquire_lock_path, ensure_dir, read_json_opt, validate_storage_name};
+use crate::team_mode::storage::{
+    acquire_lock_path, ensure_dir, read_json_opt, validate_storage_name,
+};
 use crate::util::atomic_write::atomic_write_json;
 
 /// Convenient bundle returned by `get()` — mirrors what services expect.
@@ -117,7 +119,11 @@ impl MemberStore {
             .collect())
     }
 
-    pub fn get(&self, team_id: impl AsRef<str>, name: impl AsRef<str>) -> Result<Option<MemberRecord>> {
+    pub fn get(
+        &self,
+        team_id: impl AsRef<str>,
+        name: impl AsRef<str>,
+    ) -> Result<Option<MemberRecord>> {
         let team_id = team_id.as_ref();
         let name = name.as_ref();
         validate_storage_name(team_id)?;
@@ -154,7 +160,11 @@ impl MemberStore {
         validate_storage_name(&team_id)?;
         validate_storage_name(&record.profile.name)?;
         let mut file = self.load_file(&team_id)?;
-        if let Some(slot) = file.members.iter_mut().find(|m| m.name == record.profile.name) {
+        if let Some(slot) = file
+            .members
+            .iter_mut()
+            .find(|m| m.name == record.profile.name)
+        {
             *slot = record.into_unified();
         } else {
             file.members.push(record.into_unified());
@@ -288,6 +298,7 @@ mod tests {
                 system_prompt: None,
                 skills: vec![],
                 session_state: Some(ExecutionSessionState::Running),
+                session_id: None,
             }),
         }
     }

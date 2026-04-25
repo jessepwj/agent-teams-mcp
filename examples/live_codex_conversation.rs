@@ -35,7 +35,8 @@ async fn main() -> agent_teams::Result<()> {
         .with_codex(codex_backend)
         .build()?;
 
-    orch.create_team("conv-test", Some("Conversation test")).await?;
+    orch.create_team("conv-test", Some("Conversation test"))
+        .await?;
 
     // --- Spawn Codex agent ---
     println!("[1] Spawning Codex agent 'codex-coder'...");
@@ -53,14 +54,17 @@ async fn main() -> agent_teams::Result<()> {
         delegations: Vec::new(),
     };
 
-    orch.spawn_teammate("conv-test", codex_config, BackendType::Codex).await?;
+    orch.spawn_teammate("conv-test", codex_config, BackendType::Codex)
+        .await?;
     println!("  ✓ codex-coder spawned\n");
 
     // --- Spawn Claude Code agent ---
     println!("[2] Spawning Claude Code agent 'claude-thinker'...");
     let claude_config = SpawnConfig {
         name: "claude-thinker".into(),
-        prompt: "What is Rust's ownership model? Answer in exactly ONE sentence. Do not use any tools.".into(),
+        prompt:
+            "What is Rust's ownership model? Answer in exactly ONE sentence. Do not use any tools."
+                .into(),
         model: Some("haiku".into()),
         cwd: Some(tmp.path().to_path_buf()),
         max_turns: Some(1),
@@ -72,7 +76,8 @@ async fn main() -> agent_teams::Result<()> {
         delegations: Vec::new(),
     };
 
-    orch.spawn_teammate("conv-test", claude_config, BackendType::ClaudeCode).await?;
+    orch.spawn_teammate("conv-test", claude_config, BackendType::ClaudeCode)
+        .await?;
     println!("  ✓ claude-thinker spawned\n");
 
     // --- Collect Codex output ---

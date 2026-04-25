@@ -1,7 +1,8 @@
 //! Auto-discovery of Claude Code JSONL session files.
 //!
 //! Claude Code stores session logs at `~/.claude/projects/{encoded-path}/`
-//! where path encoding replaces `/` with `-`. For example:
+//! where path encoding replaces path separators and drive colons with `-`.
+//! For example:
 //! `/Users/alex/myproject` → `-Users-alex-myproject`
 //!
 //! This module auto-discovers matching session files, parses token usage,
@@ -30,31 +31,78 @@ pub struct SessionFile {
     pub size: u64,
 }
 
-/// Encode a project path the way Claude Code does: replace `/` with `-`.
+/// Encode a project path the way Claude Code does: replace path separators and
+/// other non-ASCII filename-unsafe characters with `-`.
 ///
 /// `/Users/alex/myproject` → `-Users-alex-myproject`
 pub fn encode_project_path(path: &Path) -> String {
     let s = path.to_string_lossy();
-    s.replace('/', "-")
+    s.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
 }
 
 /// Discover JSONL session files for a given repository path.
 ///
 /// Looks in `~/.claude/projects/{encoded-path}/` for `*.jsonl` files.
 /// Returns an empty vec if the directory doesn't exist or can't be read.
+///
+/// Windows quirk: `std::fs::canonicalize` returns a path with the `\\?\`
+/// extended-length prefix (e.g. `\\?\E:\foo`). If we encode that directly
+/// we get `---E--foo` which does NOT match what the `claude` CLI writes
+/// (the CLI encodes from the non-prefixed form → `E--foo`). So on Windows
+/// we strip the `\\?\` prefix before encoding. We also try a few path
+/// variants as a fallback in case the CLI used a slightly different form
+/// (e.g. called with short path vs. canonical path).
 pub fn discover_sessions(repo_path: &Path) -> Vec<SessionFile> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
+    let projects_root = home.join(".claude").join("projects");
 
-    // Canonicalize the repo path for consistent encoding
-    let canonical = repo_path
-        .canonicalize()
-        .unwrap_or_else(|_| repo_path.to_path_buf());
-    let encoded = encode_project_path(&canonical);
-    let projects_dir = home.join(".claude").join("projects").join(&encoded);
+    // Candidate paths to encode — try each until we find a matching dir.
+    let canonical = repo_path.canonicalize().ok();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(ref c) = canonical {
+        candidates.push(strip_windows_ext_prefix(c));
+        candidates.push(c.clone());
+    }
+    candidates.push(repo_path.to_path_buf());
 
-    discover_sessions_in(&projects_dir)
+    for cand in &candidates {
+        let encoded = encode_project_path(cand);
+        let dir = projects_root.join(&encoded);
+        let sessions = discover_sessions_in(&dir);
+        if !sessions.is_empty() {
+            return sessions;
+        }
+    }
+
+    // No candidate matched. Return whatever the first candidate would have
+    // yielded (usually empty) so callers still get the "not found" path
+    // they're used to.
+    let first = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| repo_path.to_path_buf());
+    discover_sessions_in(&projects_root.join(encode_project_path(&first)))
+}
+
+/// Windows: strip the `\\?\` extended-length prefix that `canonicalize`
+/// adds. Other platforms: return the path unchanged.
+fn strip_windows_ext_prefix(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        // Handle both `\\?\C:\...` and `\\?\UNC\server\share\...` variants.
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Discover JSONL session files in a specific directory.
@@ -295,6 +343,21 @@ mod tests {
     fn encode_project_path_root() {
         let path = Path::new("/");
         assert_eq!(encode_project_path(path), "-");
+    }
+
+    #[test]
+    fn encode_project_path_windows_style() {
+        let path = Path::new(r"C:\Users\msi\.codex\ascii-workspaces\afc10e97887a");
+        assert_eq!(
+            encode_project_path(path),
+            "C--Users-msi--codex-ascii-workspaces-afc10e97887a"
+        );
+    }
+
+    #[test]
+    fn encode_project_path_replaces_non_ascii_segments() {
+        let path = Path::new("/mnt/e/aigc内容整理/opencode");
+        assert_eq!(encode_project_path(path), "-mnt-e-aigc-----opencode");
     }
 
     #[test]

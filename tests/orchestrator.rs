@@ -1,14 +1,12 @@
 //! Integration tests for the TeamOrchestrator using a mock backend.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use agent_teams::backend::{
-    AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig,
-};
+use agent_teams::backend::{AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig};
 use agent_teams::models::{CreateTaskRequest, TaskStatus, TaskUpdate};
 use agent_teams::orchestrator::TeamOrchestrator;
 use agent_teams::{Error, Result};
@@ -29,10 +27,7 @@ impl AgentBackend for MockBackend {
         let (tx, rx) = mpsc::channel(16);
         // Send a greeting as the first output
         let _ = tx
-            .send(AgentOutput::Message(format!(
-                "Hello, I'm {}",
-                config.name
-            )))
+            .send(AgentOutput::Message(format!("Hello, I'm {}", config.name)))
             .await;
         let _ = tx.send(AgentOutput::TurnComplete).await;
 
@@ -105,7 +100,10 @@ async fn full_team_lifecycle() {
     let orch = make_orchestrator(dir.path());
 
     // Create team
-    let config = orch.create_team("test-team", Some("Test team")).await.unwrap();
+    let config = orch
+        .create_team("test-team", Some("Test team"))
+        .await
+        .unwrap();
     assert_eq!(config.team_name, "test-team");
 
     // List teams
@@ -127,7 +125,9 @@ async fn full_team_lifecycle() {
     assert!(orch.is_alive("test-team", "worker-1").await);
 
     // Shutdown teammate
-    orch.shutdown_teammate("test-team", "worker-1").await.unwrap();
+    orch.shutdown_teammate("test-team", "worker-1")
+        .await
+        .unwrap();
     assert!(!orch.is_alive("test-team", "worker-1").await);
 
     // Delete team
@@ -185,10 +185,7 @@ async fn task_creation_and_assignment() {
     assert_eq!(assigned.owner.as_deref(), Some("coder"));
 
     // Check coder's inbox for TaskAssignment
-    let inbox = orch
-        .list_teams()
-        .await
-        .unwrap(); // just verify no panic
+    let inbox = orch.list_teams().await.unwrap(); // just verify no panic
     assert!(!inbox.is_empty());
 
     // Get next available task (should be task 2 since task 1 is assigned)
@@ -567,9 +564,13 @@ async fn memory_context_injection() {
         .unwrap();
 
     // Enable memory
-    orch.enable_memory("mem-team", "mem-agent", agent_teams::MemoryConfig::default())
-        .await
-        .unwrap();
+    orch.enable_memory(
+        "mem-team",
+        "mem-agent",
+        agent_teams::MemoryConfig::default(),
+    )
+    .await
+    .unwrap();
 
     // Send input (records user turn in memory)
     orch.send_input("mem-team", "mem-agent", "What is 2+2?")
@@ -590,9 +591,13 @@ async fn memory_context_injection() {
     orch.disable_memory("mem-team", "mem-agent").await.unwrap();
 
     // Clear memory
-    orch.enable_memory("mem-team", "mem-agent", agent_teams::MemoryConfig::default())
-        .await
-        .unwrap();
+    orch.enable_memory(
+        "mem-team",
+        "mem-agent",
+        agent_teams::MemoryConfig::default(),
+    )
+    .await
+    .unwrap();
     orch.clear_memory("mem-team", "mem-agent").await.unwrap();
 
     // Cleanup

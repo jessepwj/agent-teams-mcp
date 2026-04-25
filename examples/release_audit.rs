@@ -66,22 +66,37 @@ async fn main() -> agent_teams::Result<()> {
     let t6 = mktask(&orch, "CC: Release readiness verdict").await?;
 
     // T4 needs T1 (API inventory) + T3 (doc gaps)
-    orch.update_task(TEAM, &t4.id, TaskUpdate {
-        add_blocked_by: Some(vec![t1.id.clone(), t3.id.clone()]),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t4.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t1.id.clone(), t3.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // T5 needs T1 (API changes) + T2 (dep health)
-    orch.update_task(TEAM, &t5.id, TaskUpdate {
-        add_blocked_by: Some(vec![t1.id.clone(), t2.id.clone()]),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t5.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t1.id.clone(), t2.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // T6 needs T4 + T5
-    orch.update_task(TEAM, &t6.id, TaskUpdate {
-        add_blocked_by: Some(vec![t4.id.clone(), t5.id.clone()]),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t6.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t4.id.clone(), t5.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     let dag = orch.export_task_graph_terminal(TEAM).await?;
     print!("{dag}");
@@ -105,10 +120,14 @@ async fn main() -> agent_teams::Result<()> {
     let memory = readn(project, "src/memory/mod.rs", 60);
 
     // T1: CC — API surface inventory
-    spawn_agent(&orch, "cc-api", BackendType::ClaudeCode, SpawnConfig {
-        name: "cc-api".into(),
-        prompt: format!(
-            "You are a Rust library maintainer preparing v0.2.0 release.\n\
+    spawn_agent(
+        &orch,
+        "cc-api",
+        BackendType::ClaudeCode,
+        SpawnConfig {
+            name: "cc-api".into(),
+            prompt: format!(
+                "You are a Rust library maintainer preparing v0.2.0 release.\n\
              List ALL public types, traits, functions, and methods exported by this crate.\n\
              Group by module. Mark items that are NEW since v0.1.0 with [NEW].\n\
              (Hint: consensus, memory, and terminal DAG rendering are new modules)\n\
@@ -116,62 +135,79 @@ async fn main() -> agent_teams::Result<()> {
              === src/lib.rs ===\n{lib_rs}\n\n\
              === src/backend/mod.rs (public types) ===\n{backend_mod}\n\n\
              === src/consensus/mod.rs (first 60 lines) ===\n{consensus}\n\n\
-             === src/memory/mod.rs (first 60 lines) ===\n{memory}"),
-        model: Some("sonnet".into()),
-        cwd: Some(project.to_path_buf()),
-        max_turns: Some(2),
-        allowed_tools: vec![],
-        permission_mode: None,
-        reasoning_effort: None,
-        env: Default::default(),
-        memory_config: None,
-        delegations: Vec::new(),
-    }).await;
+             === src/memory/mod.rs (first 60 lines) ===\n{memory}"
+            ),
+            model: Some("sonnet".into()),
+            cwd: Some(project.to_path_buf()),
+            max_turns: Some(2),
+            allowed_tools: vec![],
+            permission_mode: None,
+            reasoning_effort: None,
+            env: Default::default(),
+            memory_config: None,
+            delegations: Vec::new(),
+        },
+    )
+    .await;
 
     // T2: Codex — Dependency health check
-    spawn_agent(&orch, "codex-deps", BackendType::Codex, SpawnConfig {
-        name: "codex-deps".into(),
-        prompt: format!(
-            "You are a Rust dependency auditor. Analyze this Cargo.toml:\n\
+    spawn_agent(
+        &orch,
+        "codex-deps",
+        BackendType::Codex,
+        SpawnConfig {
+            name: "codex-deps".into(),
+            prompt: format!(
+                "You are a Rust dependency auditor. Analyze this Cargo.toml:\n\
              1. Check each dependency version — is it latest stable? List any outdated.\n\
              2. Flag any dependency with known security issues.\n\
              3. Check feature flags — any unnecessary features enabled?\n\
              4. Suggest any dependencies that could be removed or replaced.\n\
              Be concise, max 400 words.\n\n\
-             === Cargo.toml ===\n{cargo}"),
-        model: None,
-        cwd: Some(project.to_path_buf()),
-        max_turns: Some(1),
-        allowed_tools: vec![],
-        permission_mode: None,
-        reasoning_effort: Some("high".into()),
-        env: Default::default(),
-        memory_config: None,
-        delegations: Vec::new(),
-    }).await;
+             === Cargo.toml ===\n{cargo}"
+            ),
+            model: None,
+            cwd: Some(project.to_path_buf()),
+            max_turns: Some(1),
+            allowed_tools: vec![],
+            permission_mode: None,
+            reasoning_effort: Some("high".into()),
+            env: Default::default(),
+            memory_config: None,
+            delegations: Vec::new(),
+        },
+    )
+    .await;
 
     // T3: Gemini — Doc coverage audit
-    spawn_agent(&orch, "gemini-docs", BackendType::GeminiCli, SpawnConfig {
-        name: "gemini-docs".into(),
-        prompt: format!(
-            "You are a Rust documentation auditor. Analyze these files and list:\n\
+    spawn_agent(
+        &orch,
+        "gemini-docs",
+        BackendType::GeminiCli,
+        SpawnConfig {
+            name: "gemini-docs".into(),
+            prompt: format!(
+                "You are a Rust documentation auditor. Analyze these files and list:\n\
              1. Public items MISSING doc comments (///) — list each with its location\n\
              2. Public items with docs but MISSING examples (```rust blocks)\n\
              3. Module-level docs (//!) that are missing or incomplete\n\
              Rate overall doc coverage as A/B/C/D/F. Max 400 words.\n\n\
              === src/lib.rs ===\n{lib_rs}\n\n\
              === src/error.rs ===\n{error_rs}\n\n\
-             === src/orchestrator/mod.rs (first 80 lines) ===\n{orch_excerpt}"),
-        model: Some("gemini-2.5-flash".into()),
-        cwd: Some(project.to_path_buf()),
-        max_turns: Some(1),
-        allowed_tools: vec![],
-        permission_mode: None,
-        reasoning_effort: None,
-        env: Default::default(),
-        memory_config: None,
-        delegations: Vec::new(),
-    }).await;
+             === src/orchestrator/mod.rs (first 80 lines) ===\n{orch_excerpt}"
+            ),
+            model: Some("gemini-2.5-flash".into()),
+            cwd: Some(project.to_path_buf()),
+            max_turns: Some(1),
+            allowed_tools: vec![],
+            permission_mode: None,
+            reasoning_effort: None,
+            env: Default::default(),
+            memory_config: None,
+            delegations: Vec::new(),
+        },
+    )
+    .await;
 
     // Show live DAG
     let dag = orch.export_task_graph_terminal(TEAM).await?;
@@ -202,9 +238,15 @@ async fn main() -> agent_teams::Result<()> {
 
     // Complete Phase 1
     for id in [&t1.id, &t2.id, &t3.id] {
-        orch.update_task(TEAM, id, TaskUpdate {
-            status: Some(TaskStatus::Completed), ..Default::default()
-        }).await?;
+        orch.update_task(
+            TEAM,
+            id,
+            TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await?;
     }
     for n in ["cc-api", "codex-deps", "gemini-docs"] {
         let _ = orch.shutdown_teammate(TEAM, n).await;
@@ -227,49 +269,63 @@ async fn main() -> agent_teams::Result<()> {
     mark_started(&orch, &t5.id, "gemini-changelog").await?;
 
     // T4: Codex — Write missing doc examples
-    spawn_agent(&orch, "codex-examples", BackendType::Codex, SpawnConfig {
-        name: "codex-examples".into(),
-        prompt: format!(
-            "You are a Rust documentation writer.\n\
+    spawn_agent(
+        &orch,
+        "codex-examples",
+        BackendType::Codex,
+        SpawnConfig {
+            name: "codex-examples".into(),
+            prompt: format!(
+                "You are a Rust documentation writer.\n\
              Based on the API inventory and doc coverage audit below, write\n\
              concrete `/// # Examples` blocks for the TOP 5 most important\n\
              undocumented public items.\n\
              Use real types from the crate. Each example should compile.\n\
              Output as: `/// # Examples` blocks ready to paste. Max 600 words.\n\n\
              === API Surface (from CC) ===\n{api_inventory}\n\n\
-             === Doc Gaps (from Gemini) ===\n{doc_audit}"),
-        model: None,
-        cwd: Some(project.to_path_buf()),
-        max_turns: Some(1),
-        allowed_tools: vec![],
-        permission_mode: None,
-        reasoning_effort: Some("high".into()),
-        env: Default::default(),
-        memory_config: None,
-        delegations: Vec::new(),
-    }).await;
+             === Doc Gaps (from Gemini) ===\n{doc_audit}"
+            ),
+            model: None,
+            cwd: Some(project.to_path_buf()),
+            max_turns: Some(1),
+            allowed_tools: vec![],
+            permission_mode: None,
+            reasoning_effort: Some("high".into()),
+            env: Default::default(),
+            memory_config: None,
+            delegations: Vec::new(),
+        },
+    )
+    .await;
 
     // T5: Gemini — Draft CHANGELOG
-    spawn_agent(&orch, "gemini-changelog", BackendType::GeminiCli, SpawnConfig {
-        name: "gemini-changelog".into(),
-        prompt: format!(
-            "You are writing the CHANGELOG for agent-teams v0.2.0.\n\
+    spawn_agent(
+        &orch,
+        "gemini-changelog",
+        BackendType::GeminiCli,
+        SpawnConfig {
+            name: "gemini-changelog".into(),
+            prompt: format!(
+                "You are writing the CHANGELOG for agent-teams v0.2.0.\n\
              Based on the API inventory and dependency analysis below,\n\
              write a CHANGELOG.md entry in Keep a Changelog format.\n\
              Sections: Added, Changed, Fixed, Dependencies.\n\
              Mark breaking changes with [BREAKING]. Max 400 words.\n\n\
              === API Surface (new items marked [NEW]) ===\n{api_inventory}\n\n\
-             === Dependency Analysis ===\n{dep_health}"),
-        model: Some("gemini-2.5-flash".into()),
-        cwd: Some(project.to_path_buf()),
-        max_turns: Some(1),
-        allowed_tools: vec![],
-        permission_mode: None,
-        reasoning_effort: None,
-        env: Default::default(),
-        memory_config: None,
-        delegations: Vec::new(),
-    }).await;
+             === Dependency Analysis ===\n{dep_health}"
+            ),
+            model: Some("gemini-2.5-flash".into()),
+            cwd: Some(project.to_path_buf()),
+            max_turns: Some(1),
+            allowed_tools: vec![],
+            permission_mode: None,
+            reasoning_effort: None,
+            env: Default::default(),
+            memory_config: None,
+            delegations: Vec::new(),
+        },
+    )
+    .await;
 
     // Collect Phase 2
     println!("  Waiting for Phase 2 results...\n");
@@ -290,9 +346,15 @@ async fn main() -> agent_teams::Result<()> {
     print_result("P2", "Gemini", "gemini-changelog", &results);
 
     for id in [&t4.id, &t5.id] {
-        orch.update_task(TEAM, id, TaskUpdate {
-            status: Some(TaskStatus::Completed), ..Default::default()
-        }).await?;
+        orch.update_task(
+            TEAM,
+            id,
+            TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await?;
     }
     for n in ["codex-examples", "gemini-changelog"] {
         let _ = orch.shutdown_teammate(TEAM, n).await;
@@ -312,10 +374,14 @@ async fn main() -> agent_teams::Result<()> {
     let doc_examples = results.get("codex-examples").cloned().unwrap_or_default();
     let changelog = results.get("gemini-changelog").cloned().unwrap_or_default();
 
-    spawn_agent(&orch, "cc-verdict", BackendType::ClaudeCode, SpawnConfig {
-        name: "cc-verdict".into(),
-        prompt: format!(
-            "You are the release manager for `agent-teams` v0.2.0.\n\
+    spawn_agent(
+        &orch,
+        "cc-verdict",
+        BackendType::ClaudeCode,
+        SpawnConfig {
+            name: "cc-verdict".into(),
+            prompt: format!(
+                "You are the release manager for `agent-teams` v0.2.0.\n\
              Based on ALL audit findings below, give a release readiness verdict:\n\n\
              ## Verdict: READY / NEEDS WORK / BLOCKED\n\n\
              Include:\n\
@@ -328,24 +394,33 @@ async fn main() -> agent_teams::Result<()> {
              === Dependency Health ===\n{dep_health}\n\n\
              === Doc Coverage ===\n{doc_audit}\n\n\
              === Generated Examples ===\n{doc_examples}\n\n\
-             === CHANGELOG Draft ===\n{changelog}"),
-        model: Some("sonnet".into()),
-        cwd: Some(project.to_path_buf()),
-        max_turns: Some(2),
-        allowed_tools: vec![],
-        permission_mode: None,
-        reasoning_effort: None,
-        env: Default::default(),
-        memory_config: None,
-        delegations: Vec::new(),
-    }).await;
+             === CHANGELOG Draft ===\n{changelog}"
+            ),
+            model: Some("sonnet".into()),
+            cwd: Some(project.to_path_buf()),
+            max_turns: Some(2),
+            allowed_tools: vec![],
+            permission_mode: None,
+            reasoning_effort: None,
+            env: Default::default(),
+            memory_config: None,
+            delegations: Vec::new(),
+        },
+    )
+    .await;
 
     let r6 = orch.take_output_receiver(TEAM, "cc-verdict").await?;
     let verdict = collect(r6, TIMEOUT).await;
 
-    orch.update_task(TEAM, &t6.id, TaskUpdate {
-        status: Some(TaskStatus::Completed), ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t6.id,
+        TaskUpdate {
+            status: Some(TaskStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // =====================================================================
     // FINAL OUTPUT
@@ -369,7 +444,10 @@ async fn main() -> agent_teams::Result<()> {
     orch.delete_team(TEAM).await?;
 
     let total = start.elapsed();
-    println!("\n  Total: {:.0}s · 6 tasks · 3 phases · 3 backends", total.as_secs_f64());
+    println!(
+        "\n  Total: {:.0}s · 6 tasks · 3 phases · 3 backends",
+        total.as_secs_f64()
+    );
 
     Ok(())
 }
@@ -382,24 +460,29 @@ async fn mktask(
     orch: &TeamOrchestrator,
     subject: &str,
 ) -> agent_teams::Result<agent_teams::models::TaskFile> {
-    orch.create_task(TEAM, CreateTaskRequest {
-        subject: subject.into(),
-        description: None,
-        active_form: None,
-        metadata: None,
-    }).await
+    orch.create_task(
+        TEAM,
+        CreateTaskRequest {
+            subject: subject.into(),
+            description: None,
+            active_form: None,
+            metadata: None,
+        },
+    )
+    .await
 }
 
-async fn mark_started(
-    orch: &TeamOrchestrator,
-    tid: &str,
-    owner: &str,
-) -> agent_teams::Result<()> {
-    orch.update_task(TEAM, tid, TaskUpdate {
-        status: Some(TaskStatus::InProgress),
-        owner: Some(owner.into()),
-        ..Default::default()
-    }).await?;
+async fn mark_started(orch: &TeamOrchestrator, tid: &str, owner: &str) -> agent_teams::Result<()> {
+    orch.update_task(
+        TEAM,
+        tid,
+        TaskUpdate {
+            status: Some(TaskStatus::InProgress),
+            owner: Some(owner.into()),
+            ..Default::default()
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -420,7 +503,11 @@ fn readf(base: &std::path::Path, path: &str) -> String {
 }
 
 fn readn(base: &std::path::Path, path: &str, lines: usize) -> String {
-    readf(base, path).lines().take(lines).collect::<Vec<_>>().join("\n")
+    readf(base, path)
+        .lines()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn print_result(phase: &str, backend: &str, key: &str, results: &HashMap<String, String>) {
@@ -444,17 +531,32 @@ async fn collect(
     rx: Option<tokio::sync::mpsc::Receiver<AgentOutput>>,
     timeout_secs: u64,
 ) -> String {
-    let Some(mut rx) = rx else { return String::new() };
+    let Some(mut rx) = rx else {
+        return String::new();
+    };
     let mut text = String::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(AgentOutput::Delta(d))) => { text.push_str(&d); text.push('\n'); }
-            Ok(Some(AgentOutput::Message(m))) => { if !text.contains(&m) { text.push_str(&m); } }
+            Ok(Some(AgentOutput::Delta(d))) => {
+                text.push_str(&d);
+                text.push('\n');
+            }
+            Ok(Some(AgentOutput::Message(m))) => {
+                if !text.contains(&m) {
+                    text.push_str(&m);
+                }
+            }
             Ok(Some(AgentOutput::TurnComplete | AgentOutput::Idle)) => break,
-            Ok(Some(AgentOutput::Error(e))) => { text.push_str(&format!("\n[error] {e}")); break; }
+            Ok(Some(AgentOutput::Error(e))) => {
+                text.push_str(&format!("\n[error] {e}"));
+                break;
+            }
             Ok(None) => break,
-            Err(_) => { text.push_str(&format!("\n[timeout {timeout_secs}s]")); break; }
+            Err(_) => {
+                text.push_str(&format!("\n[timeout {timeout_secs}s]"));
+                break;
+            }
         }
     }
     text

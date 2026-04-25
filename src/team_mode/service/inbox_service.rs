@@ -80,11 +80,21 @@ impl InboxService {
         Ok(count)
     }
 
-    pub fn read(&self, team_id: &str, recipient: impl AsRef<str>, message_ids: &[String]) -> Result<usize> {
+    pub fn read(
+        &self,
+        team_id: &str,
+        recipient: impl AsRef<str>,
+        message_ids: &[String],
+    ) -> Result<usize> {
         self.apply_receipt(team_id, recipient, message_ids, false)
     }
 
-    pub fn ack(&self, team_id: &str, recipient: impl AsRef<str>, message_ids: &[String]) -> Result<usize> {
+    pub fn ack(
+        &self,
+        team_id: &str,
+        recipient: impl AsRef<str>,
+        message_ids: &[String],
+    ) -> Result<usize> {
         self.apply_receipt(team_id, recipient, message_ids, true)
     }
 
@@ -189,10 +199,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = MessageStore::new(dir.path());
         store.save(&sample_message("demo", "m1", "alice")).unwrap();
-        let service = InboxService::new(
-            ProjectionStore::with_message_store(store.clone()),
-            store,
-        );
+        let service = InboxService::new(ProjectionStore::with_message_store(store.clone()), store);
 
         let inbox = service.peek("demo", "alice", None).unwrap();
         assert_eq!(inbox.recipient, "alice");
@@ -218,9 +225,7 @@ mod tests {
             1
         );
         assert_eq!(
-            service
-                .ack("demo", "alice", &[String::from("m1")])
-                .unwrap(),
+            service.ack("demo", "alice", &[String::from("m1")]).unwrap(),
             1
         );
 

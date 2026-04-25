@@ -312,6 +312,18 @@ pub trait AgentSession: Send + Sync {
 
     /// Forcefully kill the agent process.
     async fn force_kill(&mut self) -> Result<()>;
+
+    /// The backend-assigned session identifier, if any. For Claude Code this
+    /// is the UUID that names the `~/.claude/projects/<cwd>/<id>.jsonl` file
+    /// the CLI writes for this session. Used by the web UI to display the
+    /// worker's exact conversation rather than guessing by mtime when many
+    /// sessions share the same project directory.
+    ///
+    /// Default `None` covers backends that don't expose a session id (codex
+    /// and gemini-cli). Implementations should return promptly with no I/O.
+    fn session_id(&self) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

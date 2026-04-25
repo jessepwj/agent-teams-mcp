@@ -5,6 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::team_mode::mcp::executor::TeamModeToolExecutor;
 use crate::team_mode::mcp::resources::TeamModeResourceRegistry;
 use crate::team_mode::mcp::schemas::{
     EmptyResult, InitializeResult, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest,
@@ -18,9 +19,8 @@ const ERR_INVALID_REQUEST: i32 = -32600;
 const ERR_METHOD_NOT_FOUND: i32 = -32601;
 const ERR_RUNTIME: i32 = -32000;
 
-#[derive(Debug)]
 pub struct TeamModeMcpRuntime {
-    tools: TeamModeToolset,
+    tools: Box<dyn TeamModeToolExecutor>,
     resources: TeamModeResourceRegistry,
     initialized: bool,
 }
@@ -28,8 +28,17 @@ pub struct TeamModeMcpRuntime {
 impl TeamModeMcpRuntime {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         let base_dir = base_dir.into();
+        let tools = Box::new(TeamModeToolset::new(base_dir.clone()));
+        Self::with_tool_executor(base_dir, tools)
+    }
+
+    pub fn with_tool_executor(
+        base_dir: impl Into<PathBuf>,
+        tools: Box<dyn TeamModeToolExecutor>,
+    ) -> Self {
+        let base_dir = base_dir.into();
         Self {
-            tools: TeamModeToolset::new(base_dir.clone()),
+            tools,
             resources: TeamModeResourceRegistry::new(base_dir),
             initialized: false,
         }
@@ -97,7 +106,7 @@ impl TeamModeMcpRuntime {
             }
             "tools/list" => Self::wrap_runtime_result(response_id, || {
                 let result = ListToolsResult {
-                    tools: self.tools.list_tools(),
+                    tools: self.tools.list_tools()?,
                 };
                 Ok((
                     Some(serde_json::to_value(JsonRpcResponse::success(
@@ -252,8 +261,16 @@ impl TeamModeMcpRuntime {
         loop {
             let message = match read_json_rpc_message(&mut reader) {
                 Ok(Some(message)) => message,
-                Ok(None) => break,
+                Ok(None) => {
+                    // Stdin closed by CC. Log this so we can distinguish
+                    // "CC closed our pipe" (clean exit path, expected on
+                    // session end) from "process signal-killed us" (we'd
+                    // never reach here) when debugging disconnect issues.
+                    tracing::warn!("MCP: stdin EOF — parent closed the pipe, exiting run_stdio");
+                    break;
+                }
                 Err(err) => {
+                    tracing::error!(error = %err, "MCP: stdin read error, exiting run_stdio");
                     let response = serde_json::to_value(JsonRpcErrorResponse::new(
                         Value::Null,
                         ERR_INVALID_REQUEST,
@@ -476,7 +493,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            notifications.iter().any(|n| n["params"]["uri"] == json!("team://sub-team")),
+            notifications
+                .iter()
+                .any(|n| n["params"]["uri"] == json!("team://sub-team")),
             "expected team://sub-team in notifications, got {:?}",
             notifications
         );
@@ -525,7 +544,10 @@ mod tests {
 
         // written output must be JSON followed by a newline (NDJSON)
         assert!(output.ends_with(b"\n"), "output must end with newline");
-        assert!(!output.starts_with(b"Content-Length"), "must not use Content-Length framing");
+        assert!(
+            !output.starts_with(b"Content-Length"),
+            "must not use Content-Length framing"
+        );
 
         let mut reader = io::Cursor::new(output);
         let parsed = read_json_rpc_message(&mut reader).unwrap().unwrap();

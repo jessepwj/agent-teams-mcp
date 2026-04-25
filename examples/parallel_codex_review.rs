@@ -33,7 +33,10 @@ async fn main() -> agent_teams::Result<()> {
     let project_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
     println!("╔═══════════════════════════════════════════════════╗");
-    println!("║  Parallel Codex Review ({} agents)               ║", REVIEW_TARGETS.len());
+    println!(
+        "║  Parallel Codex Review ({} agents)               ║",
+        REVIEW_TARGETS.len()
+    );
     println!("╚═══════════════════════════════════════════════════╝\n");
 
     // Build orchestrator with Codex backend
@@ -44,11 +47,15 @@ async fn main() -> agent_teams::Result<()> {
         .with_codex(codex_backend)
         .build()?;
 
-    orch.create_team("par-review", Some("Parallel code review")).await?;
+    orch.create_team("par-review", Some("Parallel code review"))
+        .await?;
 
     // --- Spawn all reviewers in parallel ---
     let start = Instant::now();
-    println!("[1] Spawning {} Codex reviewers (effort: medium)...", REVIEW_TARGETS.len());
+    println!(
+        "[1] Spawning {} Codex reviewers (effort: medium)...",
+        REVIEW_TARGETS.len()
+    );
 
     for &(name, file) in REVIEW_TARGETS {
         let code = std::fs::read_to_string(project_dir.join(file))
@@ -63,8 +70,8 @@ async fn main() -> agent_teams::Result<()> {
         let config = SpawnConfig {
             name: name.into(),
             prompt,
-            model: None,                                // Use default (gpt-5.2-codex)
-            reasoning_effort: Some("medium".into()),    // Lower effort = faster (vs xhigh default)
+            model: None,                             // Use default (gpt-5.2-codex)
+            reasoning_effort: Some("medium".into()), // Lower effort = faster (vs xhigh default)
             cwd: Some(project_dir.to_path_buf()),
             max_turns: Some(1),
             allowed_tools: vec![],
@@ -74,12 +81,16 @@ async fn main() -> agent_teams::Result<()> {
             delegations: Vec::new(),
         };
 
-        orch.spawn_teammate("par-review", config, BackendType::Codex).await?;
+        orch.spawn_teammate("par-review", config, BackendType::Codex)
+            .await?;
         println!("  ✓ {name} spawned → {file}");
     }
 
     let spawn_time = start.elapsed();
-    println!("\n  All agents spawned in {:.1}s\n", spawn_time.as_secs_f64());
+    println!(
+        "\n  All agents spawned in {:.1}s\n",
+        spawn_time.as_secs_f64()
+    );
 
     // --- Collect all outputs concurrently ---
     println!("[2] Collecting reviews...\n");

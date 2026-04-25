@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use crate::error::Result;
 use crate::team_mode::data_dir::{self, TEAM_FILE};
 use crate::team_mode::domain::Team;
-use crate::team_mode::storage::{acquire_lock_path, ensure_dir, read_json_opt, validate_storage_name};
+use crate::team_mode::storage::{
+    acquire_lock_path, ensure_dir, read_json_opt, validate_storage_name,
+};
 use crate::util::atomic_write::atomic_write_json;
 
 #[derive(Debug, Clone)]
@@ -99,6 +101,7 @@ mod tests {
             cwd: None,
             status: TeamStatus::Active,
             lead_member_id: Some("lead".into()),
+            owner_cc_pid: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

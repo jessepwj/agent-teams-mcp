@@ -64,7 +64,10 @@ async fn demo_prestage() -> agent_teams::Result<()> {
     let team_name = "rust-refactor";
 
     // Create team (or skip if exists)
-    match orch.create_team(team_name, Some("Rust codebase refactoring project")).await {
+    match orch
+        .create_team(team_name, Some("Rust codebase refactoring project"))
+        .await
+    {
         Ok(config) => println!("[Created] Team: {}", config.team_name),
         Err(agent_teams::Error::TeamAlreadyExists { .. }) => {
             println!("[Exists] Team already exists, skipping creation");
@@ -154,7 +157,10 @@ async fn demo_prestage() -> agent_teams::Result<()> {
     )
     .await?;
 
-    println!("\n[Deps] #{} -> #{} -> #{} -> #{}", t1.id, t2.id, t3.id, t4.id);
+    println!(
+        "\n[Deps] #{} -> #{} -> #{} -> #{}",
+        t1.id, t2.id, t3.id, t4.id
+    );
 
     println!("\n--- Files created ---");
     println!("  Team config:  ~/.claude/teams/{team_name}/config.json");
@@ -204,7 +210,12 @@ async fn demo_monitor() -> agent_teams::Result<()> {
                     } else {
                         "lead"
                     };
-                    println!("    - {} ({}, {})", member.name(), role, member.agent_type());
+                    println!(
+                        "    - {} ({}, {})",
+                        member.name(),
+                        role,
+                        member.agent_type()
+                    );
                 }
             }
             Err(e) => println!("  Error reading config: {e}"),
@@ -237,11 +248,7 @@ async fn demo_monitor() -> agent_teams::Result<()> {
             if let Ok(entries) = std::fs::read_dir(&inbox_dir) {
                 let agents: Vec<_> = entries
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .is_some_and(|ext| ext == "json")
-                    })
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
                     .collect();
 
                 if !agents.is_empty() {
@@ -349,7 +356,10 @@ async fn demo_spawn_real_agent() -> agent_teams::Result<()> {
         .await
     {
         Ok(()) => {
-            println!("[Spawned] researcher is alive: {}", orch.is_alive(team_name, "researcher").await);
+            println!(
+                "[Spawned] researcher is alive: {}",
+                orch.is_alive(team_name, "researcher").await
+            );
 
             // Assign a task
             let task = orch

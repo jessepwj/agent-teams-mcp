@@ -70,7 +70,11 @@ impl MemberService {
         Ok(record)
     }
 
-    pub fn get(&self, team_id: impl AsRef<str>, name: impl AsRef<str>) -> Result<Option<MemberRecord>> {
+    pub fn get(
+        &self,
+        team_id: impl AsRef<str>,
+        name: impl AsRef<str>,
+    ) -> Result<Option<MemberRecord>> {
         self.member_store.get(team_id, name)
     }
 
@@ -89,25 +93,26 @@ impl MemberService {
     pub fn update(&self, request: UpdateMemberRequest) -> Result<MemberRecord> {
         validate_name(&request.team_id)?;
         validate_name(&request.name)?;
-        let _existing =
-            self.member_store
-                .get(&request.team_id, &request.name)?
-                .ok_or_else(|| Error::MemberNotFound {
-                    team: request.team_id.clone(),
-                    member: request.name.clone(),
-                })?;
+        let _existing = self
+            .member_store
+            .get(&request.team_id, &request.name)?
+            .ok_or_else(|| Error::MemberNotFound {
+                team: request.team_id.clone(),
+                member: request.name.clone(),
+            })?;
 
-        self.member_store.update(&request.team_id, &request.name, |m| {
-            if let Some(role_label) = request.role_label.clone() {
-                m.role_label = role_label;
-            }
-            if let Some(role_description) = request.role_description.clone() {
-                m.role_description = Some(role_description);
-            }
-            if let Some(execution) = request.execution.clone() {
-                m.execution = Some(execution);
-            }
-        })?;
+        self.member_store
+            .update(&request.team_id, &request.name, |m| {
+                if let Some(role_label) = request.role_label.clone() {
+                    m.role_label = role_label;
+                }
+                if let Some(role_description) = request.role_description.clone() {
+                    m.role_description = Some(role_description);
+                }
+                if let Some(execution) = request.execution.clone() {
+                    m.execution = Some(execution);
+                }
+            })?;
 
         self.member_store
             .get(&request.team_id, &request.name)?
@@ -184,6 +189,7 @@ mod tests {
                 cwd: None,
                 status: TeamStatus::Active,
                 lead_member_id: None,
+                owner_cc_pid: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             })
@@ -213,6 +219,7 @@ mod tests {
                     system_prompt: None,
                     skills: vec![],
                     session_state: Some(ExecutionSessionState::Running),
+                    session_id: None,
                 }),
             })
             .unwrap();
@@ -274,6 +281,7 @@ mod tests {
                     system_prompt: None,
                     skills: vec![],
                     session_state: None,
+                    session_id: None,
                 }),
             })
             .unwrap();

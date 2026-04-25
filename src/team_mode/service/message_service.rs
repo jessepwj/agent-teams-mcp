@@ -127,11 +127,36 @@ impl MessageService {
             )));
         }
 
-        // Reply auto-recipient: the sender of the parent message.
-        if matches!(&kind, MessageKind::Reply) {
-            if let Some(reply_to_id) = &reply_to {
-                if let Ok(Some(parent)) = self.message_store.get(&team_id, reply_to_id) {
-                    push_unique(&mut effective_recipients, parent.sender.clone());
+        // NOTE: We deliberately do NOT auto-add parent.sender as a recipient
+        // for replies, despite that being a "natural" chat behavior. Doing so
+        // caused a production-breaking feedback loop: workers replying to
+        // each other kept auto-including the other as the next recipient,
+        // and LLMs tend to produce polite acknowledgments ("received",
+        // "waiting") indefinitely, so two workers would ping-pong forever
+        // once a cross-worker thread started.
+        //
+        // Instead, routing is driven by:
+        //   1. Explicit @mentions in the body (parsed above) — the worker
+        //      must spell out who they're addressing.
+        //   2. Lead observability (below) — the team's lead is always in
+        //      the recipient list for any worker-originated message, so
+        //      direct-to-lead replies keep working even without an @lead.
+        // A worker reply with no @mention and no lead-observability rule
+        // match would have no recipients at all — that's the desired
+        // "silent" case (lead sees it via observability; no one else does).
+
+        // Lead observability: the team's lead sees every message in the room,
+        // including side conversations between workers. Without this, workers
+        // could @-mention each other, reply back-and-forth, and the lead would
+        // be cut out after the first exchange (parent.sender auto-recipient
+        // only surfaces the immediate reply target). The lead is the team's
+        // orchestrator and must retain full visibility for coordination.
+        // The sender-is-lead check prevents lead's own dispatches from looping
+        // back into the lead's inbox.
+        if let Ok(Some(team)) = self.team_store.get(&team_id) {
+            if let Some(lead_id) = team.lead_member_id.as_ref() {
+                if sender != *lead_id {
+                    push_unique(&mut effective_recipients, lead_id.clone());
                 }
             }
         }
@@ -161,10 +186,7 @@ impl MessageService {
             });
         let delivery_status = derive_delivery_status(&effective_recipients, &dropped_for, &kind);
         let delivered_to = effective_recipients.clone();
-        let mentions = mention_candidates
-            .into_iter()
-            .map(|c| c.handle)
-            .collect();
+        let mentions = mention_candidates.into_iter().map(|c| c.handle).collect();
 
         let message = Message {
             id: Uuid::new_v4().to_string(),
@@ -207,7 +229,11 @@ impl MessageService {
         if let Some(writer) = &self.lead_pending_writer {
             if let Ok(Some(team)) = self.team_store.get(&team_id) {
                 if let Some(lead_name) = team.lead_member_id.as_deref() {
-                    if let Err(err) = writer.maybe_write(&message, lead_name, &sender) {
+                    // Route only to the CC process that owns this team
+                    // (set at team_create time via parent_id). None means
+                    // unbound — hook script will fall back to broadcasting.
+                    let owner_pid = team.owner_cc_pid;
+                    if let Err(err) = writer.maybe_write(&message, lead_name, &sender, owner_pid) {
                         tracing::warn!(
                             error = %err,
                             msg_id = %message.id,
@@ -244,13 +270,13 @@ impl MessageService {
     }
 
     fn ensure_sender_exists(&self, team_id: &str, sender: &str) -> Result<()> {
-        let record = self
-            .member_store
-            .get(team_id, sender)?
-            .ok_or_else(|| Error::MemberNotFound {
-                team: team_id.to_string(),
-                member: sender.to_string(),
-            })?;
+        let record =
+            self.member_store
+                .get(team_id, sender)?
+                .ok_or_else(|| Error::MemberNotFound {
+                    team: team_id.to_string(),
+                    member: sender.to_string(),
+                })?;
         if matches!(record.profile.status, MemberStatus::Removed) {
             return Err(Error::MemberNotFound {
                 team: team_id.to_string(),
@@ -409,7 +435,9 @@ mod tests {
     };
     use crate::team_mode::service::MemberService;
     use crate::team_mode::service::member_service::AddMemberRequest;
-    use crate::team_mode::storage::{MemberRecord, MemberStore, MessageStore, RoomStore, TeamStore};
+    use crate::team_mode::storage::{
+        MemberRecord, MemberStore, MessageStore, RoomStore, TeamStore,
+    };
 
     fn seed_team(base_dir: &std::path::Path, team_id: &str) {
         TeamStore::new(base_dir)
@@ -420,6 +448,7 @@ mod tests {
                 cwd: None,
                 status: TeamStatus::Active,
                 lead_member_id: Some("lead".into()),
+                owner_cc_pid: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             })
@@ -477,9 +506,27 @@ mod tests {
     fn dispatch_routes_mentions_to_recipients() {
         let dir = tempdir().unwrap();
         seed_team(dir.path(), "demo");
-        add_member(dir.path(), "demo", "lead", MemberKind::Lead, MemberStatus::Active);
-        add_member(dir.path(), "demo", "alice", MemberKind::Member, MemberStatus::Active);
-        add_member(dir.path(), "demo", "bob", MemberKind::Member, MemberStatus::Active);
+        add_member(
+            dir.path(),
+            "demo",
+            "lead",
+            MemberKind::Lead,
+            MemberStatus::Active,
+        );
+        add_member(
+            dir.path(),
+            "demo",
+            "alice",
+            MemberKind::Member,
+            MemberStatus::Active,
+        );
+        add_member(
+            dir.path(),
+            "demo",
+            "bob",
+            MemberKind::Member,
+            MemberStatus::Active,
+        );
 
         let service = new_service(dir.path());
         let msg = service
@@ -503,11 +550,23 @@ mod tests {
     }
 
     #[test]
-    fn reply_auto_adds_parent_sender_as_recipient() {
+    fn worker_reply_to_lead_dispatch_reaches_lead_via_observability() {
         let dir = tempdir().unwrap();
         seed_team(dir.path(), "demo");
-        add_member(dir.path(), "demo", "lead", MemberKind::Lead, MemberStatus::Active);
-        add_member(dir.path(), "demo", "alice", MemberKind::Member, MemberStatus::Active);
+        add_member(
+            dir.path(),
+            "demo",
+            "lead",
+            MemberKind::Lead,
+            MemberStatus::Active,
+        );
+        add_member(
+            dir.path(),
+            "demo",
+            "alice",
+            MemberKind::Member,
+            MemberStatus::Active,
+        );
 
         let service = new_service(dir.path());
         let first = service
@@ -547,11 +606,126 @@ mod tests {
         assert!(reply.effective_recipients.contains(&"lead".to_string()));
     }
 
+    /// Regression test for the "worker ping-pong" dead loop: without the
+    /// parent.sender auto-recipient rule, carol's reply to alice without
+    /// an explicit @alice in the body must NOT be routed back to alice.
+    /// Only lead should see it (via observability). This is what breaks
+    /// the infinite "ack → ack → ack" chain between two workers.
+    #[test]
+    fn worker_reply_without_explicit_mention_does_not_loop_back_to_peer() {
+        let dir = tempdir().unwrap();
+        seed_team(dir.path(), "demo");
+        add_member(
+            dir.path(),
+            "demo",
+            "lead",
+            MemberKind::Lead,
+            MemberStatus::Active,
+        );
+        add_member(
+            dir.path(),
+            "demo",
+            "alice",
+            MemberKind::Member,
+            MemberStatus::Active,
+        );
+        add_member(
+            dir.path(),
+            "demo",
+            "carol",
+            MemberKind::Member,
+            MemberStatus::Active,
+        );
+
+        let service = new_service(dir.path());
+        // Lead → alice (dispatch)
+        let dispatch = service
+            .send(SendMessageRequest {
+                team_id: "demo".into(),
+                room_id: "main".into(),
+                sender: "lead".into(),
+                kind: MessageKind::Dispatch,
+                subject: None,
+                body: "@alice @carol work together".into(),
+                mentions: vec![],
+                visibility: vec![],
+                audience_policy: None,
+                reply_to: None,
+                thread_id: None,
+                expires_at: None,
+            })
+            .unwrap();
+
+        // alice replies with @carol → carol gets it (explicit mention).
+        let alice_to_carol = service
+            .send(SendMessageRequest {
+                team_id: "demo".into(),
+                room_id: "main".into(),
+                sender: "alice".into(),
+                kind: MessageKind::Reply,
+                subject: None,
+                body: "@carol let's go".into(),
+                mentions: vec![],
+                visibility: vec![],
+                audience_policy: None,
+                reply_to: Some(dispatch.id.clone()),
+                thread_id: None,
+                expires_at: None,
+            })
+            .unwrap();
+        assert!(
+            alice_to_carol
+                .effective_recipients
+                .contains(&"carol".to_string())
+        );
+        assert!(
+            alice_to_carol
+                .effective_recipients
+                .contains(&"lead".to_string())
+        );
+
+        // carol replies to alice's message WITHOUT explicit @alice in body.
+        // Critical: recipients must NOT include alice, else we ping-pong.
+        let carol_ack = service
+            .send(SendMessageRequest {
+                team_id: "demo".into(),
+                room_id: "main".into(),
+                sender: "carol".into(),
+                kind: MessageKind::Reply,
+                subject: None,
+                body: "ok, received".into(),
+                mentions: vec![],
+                visibility: vec![],
+                audience_policy: None,
+                reply_to: Some(alice_to_carol.id.clone()),
+                thread_id: None,
+                expires_at: None,
+            })
+            .unwrap();
+        assert!(
+            !carol_ack
+                .effective_recipients
+                .contains(&"alice".to_string()),
+            "carol's ack leaked to alice: {:?}",
+            carol_ack.effective_recipients
+        );
+        assert!(
+            carol_ack.effective_recipients.contains(&"lead".to_string()),
+            "lead must still see worker ack via observability"
+        );
+    }
+
     #[test]
     fn self_mention_rejected() {
         let dir = tempdir().unwrap();
         seed_team(dir.path(), "demo");
-        add_member(dir.path(), "demo", "alice", MemberKind::Member, MemberStatus::Active);
+        add_member(
+            dir.path(),
+            "demo",
+            "alice",
+            MemberKind::Member,
+            MemberStatus::Active,
+        );
         let service = new_service(dir.path());
         let err = service
             .send(SendMessageRequest {

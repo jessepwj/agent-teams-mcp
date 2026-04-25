@@ -9,7 +9,7 @@ use crate::backend::AgentOutput;
 use crate::runtime::orchestrator::RuntimeOrchestrator;
 use crate::team_mode::domain::{InboxStatus, MessageKind};
 use crate::team_mode::service::{InboxNotifier, InboxService, MessageService, SendMessageRequest};
-use crate::team_mode::storage::MessageStore;
+use crate::team_mode::storage::{MemberStore, MessageStore};
 
 /// Handle returned by `AgentLoop::start`. Drop or call `shutdown()` to stop the loop.
 pub struct AgentLoopHandle {
@@ -34,7 +34,13 @@ impl AgentLoopHandle {
 /// Drives a managed member's autonomous work loop:
 ///   poll inbox → feed to Claude Code → collect reply → post to room → ack
 pub struct AgentLoop {
+    /// The worker's handle within its team (e.g. "alice"). Used for inbox,
+    /// message sender, and ack operations — anything team-scoped.
     pub member_id: String,
+    /// The orchestrator's session key (e.g. "diag__alice"). Used when calling
+    /// orchestrator APIs like `send_input` that key sessions by spawn_key,
+    /// not by team-scoped member name.
+    pub session_key: String,
     pub team_id: String,
     pub room_id: String,
     pub orchestrator: Arc<Mutex<RuntimeOrchestrator>>,
@@ -43,6 +49,12 @@ pub struct AgentLoop {
     pub message_service: MessageService,
     pub poll_interval: Duration,
     pub inbox_notifier: Option<InboxNotifier>,
+    /// Used to persist the backend-assigned `session_id` once the worker
+    /// emits its first stream-json event (which only happens after the
+    /// worker processes its first message — so worker_add can't capture
+    /// it at spawn time). Optional to keep backwards-compat with tests
+    /// that didn't supply it.
+    pub member_store: Option<MemberStore>,
 }
 
 impl AgentLoop {
@@ -62,16 +74,18 @@ impl AgentLoop {
         }
     }
 
-    async fn run(self, mut output_rx: Receiver<AgentOutput>, mut shutdown_rx: oneshot::Receiver<()>) {
-        // Drain the initial Claude Code response to the system prompt before polling.
-        loop {
-            match output_rx.recv().await {
-                Some(AgentOutput::TurnComplete) => break,
-                Some(AgentOutput::Error(_)) | None => return,
-                Some(AgentOutput::Message(_))
-                | Some(AgentOutput::Delta(_))
-                | Some(AgentOutput::Idle) => {}
-            }
+    async fn run(
+        self,
+        mut output_rx: Receiver<AgentOutput>,
+        mut shutdown_rx: oneshot::Receiver<()>,
+    ) {
+        // Best-effort drain of any pending synthetic ready signal (TurnComplete/Idle
+        // emitted by the backend on spawn). The caller's ready-check may have already
+        // consumed it — in that case the 100ms timeout fires and we proceed normally.
+        let drain_deadline = Duration::from_millis(100);
+        match tokio::time::timeout(drain_deadline, output_rx.recv()).await {
+            Ok(Some(AgentOutput::Error(_))) | Ok(None) => return,
+            Ok(Some(_)) | Err(_) => {}
         }
         tracing::info!(member = %self.member_id, "agent loop ready, polling inbox");
 
@@ -109,19 +123,62 @@ impl AgentLoop {
                 tracing::info!(member = %self.member_id, msg_id = %message.id, sender = %message.sender, "processing inbox message");
 
                 // 3. Feed message to Claude Code with sender context.
-                let input = format!(
-                    "[Message from {}]: {}",
-                    message.sender, message.body
-                );
+                let input = format!("[Message from {}]: {}", message.sender, message.body);
                 {
-                    tracing::debug!(member = %self.member_id, "sending input to session");
+                    tracing::debug!(
+                        member = %self.member_id,
+                        session_key = %self.session_key,
+                        "sending input to session"
+                    );
                     let mut orch = self.orchestrator.lock().await;
-                    if orch
-                        .send_input(&self.member_id, &input)
-                        .await
-                        .is_err()
-                    {
-                        tracing::error!(member = %self.member_id, "send_input failed, shutting down agent loop");
+                    if let Err(err) = orch.send_input(&self.session_key, &input).await {
+                        tracing::error!(
+                            member = %self.member_id,
+                            session_key = %self.session_key,
+                            error = %err,
+                            "send_input failed, shutting down agent loop"
+                        );
+                        // Drop the orchestrator lock before doing anything
+                        // that reaches other services, to avoid deadlock.
+                        drop(orch);
+
+                        // Notify lead that this worker died mid-message so
+                        // the coordinator doesn't wait forever for a reply
+                        // that will never come. Without this the inbox
+                        // message stays unread and the lead has no signal
+                        // that anything went wrong.
+                        let notice = format!(
+                            "[SYSTEM] worker '{member}' died while processing message \
+                             from '{sender}' (msg_id={mid}). Error: {err}. \
+                             The message will not be answered. Use worker_add with \
+                             on_existing=reuse to restart this worker if you want to \
+                             retry.",
+                            member = self.member_id,
+                            sender = message.sender,
+                            mid = message.id,
+                        );
+                        let _ = self.message_service.send(SendMessageRequest {
+                            team_id: self.team_id.clone(),
+                            room_id: self.room_id.clone(),
+                            sender: self.member_id.clone(),
+                            kind: MessageKind::Status,
+                            subject: None,
+                            body: notice,
+                            mentions: Vec::new(),
+                            visibility: Vec::new(),
+                            audience_policy: None,
+                            reply_to: Some(message.id.clone()),
+                            thread_id: message.thread_id.clone(),
+                            expires_at: None,
+                        });
+                        // Ack the message so the dead worker's inbox doesn't
+                        // keep this entry as unread forever (UX noise in
+                        // inbox_read and zombie visibility in projections).
+                        let _ = self.inbox_service.ack(
+                            &self.team_id,
+                            &self.member_id,
+                            &[message.id.clone()],
+                        );
                         return;
                     }
                 }
@@ -167,6 +224,25 @@ impl AgentLoop {
                 let _ = self
                     .inbox_service
                     .ack(&self.team_id, &self.member_id, &[message.id]);
+
+                // 7. Backfill backend session_id into the member record once
+                // the worker has actually started its conversation. The
+                // session_id is only emitted after the first user message
+                // (claude CLI in stream-json mode stays silent at spawn),
+                // so worker_add couldn't persist it — we do it here, lazily,
+                // after each turn. Idempotent: only writes if value changed.
+                if let Some(store) = &self.member_store {
+                    let sid = self.orchestrator.lock().await.session_id_of(&self.session_key);
+                    if let Some(sid) = sid {
+                        let _ = store.update(&self.team_id, &self.member_id, |m| {
+                            if let Some(exec) = m.execution.as_mut() {
+                                if exec.session_id.as_deref() != Some(sid.as_str()) {
+                                    exec.session_id = Some(sid.clone());
+                                }
+                            }
+                        });
+                    }
+                }
             }
 
             // Wait for a push notification or the 30-second fallback timeout.
@@ -297,6 +373,7 @@ mod tests {
                 cwd: None,
                 status: TeamStatus::Active,
                 lead_member_id: Some("lead".into()),
+                owner_cc_pid: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             })
@@ -315,10 +392,7 @@ mod tests {
             .unwrap();
 
         let store = MemberStore::new(base);
-        for (name, kind) in [
-            ("lead", MemberKind::Lead),
-            ("worker", MemberKind::Member),
-        ] {
+        for (name, kind) in [("lead", MemberKind::Lead), ("worker", MemberKind::Member)] {
             store
                 .add(crate::team_mode::storage::MemberRecord {
                     profile: MemberProfile {
@@ -336,9 +410,7 @@ mod tests {
         }
     }
 
-    fn build_services(
-        base: &std::path::Path,
-    ) -> (MessageService, InboxService, MessageStore) {
+    fn build_services(base: &std::path::Path) -> (MessageService, InboxService, MessageStore) {
         let ms = MessageStore::new(base);
         let member = MemberStore::new(base);
         let room = RoomStore::new(base);
@@ -382,9 +454,7 @@ mod tests {
         assert_eq!(dispatch.effective_recipients, vec!["worker"]);
 
         // Verify worker has 1 unread inbox item.
-        let before = inbox_service
-            .peek("team-1", "worker", None)
-            .unwrap();
+        let before = inbox_service.peek("team-1", "worker", None).unwrap();
         assert_eq!(before.items.len(), 1);
         assert!(matches!(before.items[0].status, InboxStatus::Unread));
 
@@ -427,6 +497,7 @@ mod tests {
         // Start the agent loop with our scripted output_rx.
         let agent_loop = AgentLoop {
             member_id: "worker".into(),
+            session_key: "worker".into(),
             team_id: "team-1".into(),
             room_id: "main".into(),
             orchestrator: Arc::clone(&orch),
@@ -435,6 +506,7 @@ mod tests {
             message_service: message_service.clone(),
             poll_interval: Duration::from_millis(50),
             inbox_notifier: None,
+            member_store: None,
         };
 
         // Script: emit TurnComplete (initial prompt drain), then after send_input
@@ -445,9 +517,7 @@ mod tests {
             output_tx
                 .blocking_send(AgentOutput::Message("Done!".into()))
                 .unwrap();
-            output_tx
-                .blocking_send(AgentOutput::TurnComplete)
-                .unwrap();
+            output_tx.blocking_send(AgentOutput::TurnComplete).unwrap();
             // output_tx dropped here; further recv() in loop returns None
         });
 
@@ -461,16 +531,12 @@ mod tests {
         loop_handle.shutdown();
 
         // Worker inbox should now be acked.
-        let after = inbox_service
-            .peek("team-1", "worker", None)
-            .unwrap();
+        let after = inbox_service.peek("team-1", "worker", None).unwrap();
         assert_eq!(after.items.len(), 1);
         assert!(matches!(after.items[0].status, InboxStatus::Acked));
 
         // A reply message from worker should exist in the room.
-        let messages = message_store
-            .list_by_room("team-1", "main")
-            .unwrap();
+        let messages = message_store.list_by_room("team-1", "main").unwrap();
         let reply = messages
             .iter()
             .find(|m| m.sender == "worker" && matches!(m.kind, MessageKind::Reply));

@@ -114,9 +114,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::team_mode::domain::{MemberKind, MemberStatus, Room, RoomKind, RoomStatus, Team, TeamStatus};
-    use crate::team_mode::service::member_service::AddMemberRequest;
+    use crate::team_mode::domain::{
+        MemberKind, MemberStatus, Room, RoomKind, RoomStatus, Team, TeamStatus,
+    };
     use crate::team_mode::service::MemberService;
+    use crate::team_mode::service::member_service::AddMemberRequest;
     use crate::team_mode::storage::{MemberStore, RoomStore, TeamStore};
 
     fn seed(base_dir: &std::path::Path) {
@@ -128,6 +130,7 @@ mod tests {
                 cwd: None,
                 status: TeamStatus::Active,
                 lead_member_id: Some("lead".into()),
+                owner_cc_pid: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             })

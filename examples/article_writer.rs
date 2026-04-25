@@ -44,7 +44,8 @@ async fn main() -> agent_teams::Result<()> {
         .with_gemini_cli(GeminiCliBackend::with_path("/opt/homebrew/bin/gemini"))
         .build()?;
 
-    orch.create_team(TEAM, Some("Article writing pipeline")).await?;
+    orch.create_team(TEAM, Some("Article writing pipeline"))
+        .await?;
     let start = Instant::now();
 
     // =====================================================================
@@ -55,18 +56,33 @@ async fn main() -> agent_teams::Result<()> {
     let t3 = mktask(&orch, "Gemini: Writing quality review").await?;
     let t4 = mktask(&orch, "CC: Finalize article").await?;
 
-    orch.update_task(TEAM, &t2.id, TaskUpdate {
-        add_blocked_by: Some(vec![t1.id.clone()]),
-        ..Default::default()
-    }).await?;
-    orch.update_task(TEAM, &t3.id, TaskUpdate {
-        add_blocked_by: Some(vec![t1.id.clone()]),
-        ..Default::default()
-    }).await?;
-    orch.update_task(TEAM, &t4.id, TaskUpdate {
-        add_blocked_by: Some(vec![t2.id.clone(), t3.id.clone()]),
-        ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t2.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t1.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
+    orch.update_task(
+        TEAM,
+        &t3.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t1.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
+    orch.update_task(
+        TEAM,
+        &t4.id,
+        TaskUpdate {
+            add_blocked_by: Some(vec![t2.id.clone(), t3.id.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     let dag = orch.export_task_graph_terminal(TEAM).await?;
     print!("{dag}");
@@ -149,14 +165,26 @@ r#"你是一位技术博客作者。根据下面提供的 agent-teams Rust 库�
     let r1 = orch.take_output_receiver(TEAM, "cc-writer").await?;
     let draft = collect(r1, TIMEOUT).await;
 
-    orch.update_task(TEAM, &t1.id, TaskUpdate {
-        status: Some(TaskStatus::Completed), ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t1.id,
+        TaskUpdate {
+            status: Some(TaskStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
     let _ = orch.shutdown_teammate(TEAM, "cc-writer").await;
 
-    println!("─────────── [Phase 1] CC Draft ({} chars) ───────────", draft.len());
+    println!(
+        "─────────── [Phase 1] CC Draft ({} chars) ───────────",
+        draft.len()
+    );
     print_truncated(&draft, 40);
-    println!("\n  Phase 1 done in {:.0}s\n", start.elapsed().as_secs_f64());
+    println!(
+        "\n  Phase 1 done in {:.0}s\n",
+        start.elapsed().as_secs_f64()
+    );
 
     let dag = orch.export_task_graph_terminal(TEAM).await?;
     print!("{dag}");
@@ -169,10 +197,14 @@ r#"你是一位技术博客作者。根据下面提供的 agent-teams Rust 库�
     mark_started(&orch, &t3.id, "gemini-reviewer").await?;
 
     // T2: Codex technical review
-    spawn_agent(&orch, "codex-reviewer", BackendType::Codex, SpawnConfig {
-        name: "codex-reviewer".into(),
-        prompt: format!(
-r#"You are a Rust expert reviewing a technical article about the agent-teams crate.
+    spawn_agent(
+        &orch,
+        "codex-reviewer",
+        BackendType::Codex,
+        SpawnConfig {
+            name: "codex-reviewer".into(),
+            prompt: format!(
+                r#"You are a Rust expert reviewing a technical article about the agent-teams crate.
 
 Review the article below for TECHNICAL ACCURACY ONLY:
 1. Are API names correct? (struct/trait/method names matching actual code)
@@ -192,23 +224,30 @@ Be concise. Max 500 words.
 {draft}
 
 === ACTUAL src/lib.rs (for verification) ===
-{lib_rs}"#),
-        model: None,
-        cwd: Some(project.to_path_buf()),
-        max_turns: Some(1),
-        allowed_tools: vec![],
-        permission_mode: None,
-        reasoning_effort: Some("high".into()),
-        env: Default::default(),
-        memory_config: None,
-        delegations: Vec::new(),
-    }).await;
+{lib_rs}"#
+            ),
+            model: None,
+            cwd: Some(project.to_path_buf()),
+            max_turns: Some(1),
+            allowed_tools: vec![],
+            permission_mode: None,
+            reasoning_effort: Some("high".into()),
+            env: Default::default(),
+            memory_config: None,
+            delegations: Vec::new(),
+        },
+    )
+    .await;
 
     // T3: Gemini writing quality review
-    spawn_agent(&orch, "gemini-reviewer", BackendType::GeminiCli, SpawnConfig {
-        name: "gemini-reviewer".into(),
-        prompt: format!(
-r#"你是一位技术写作编辑。审查以下关于 agent-teams Rust 库的中文技术文章。
+    spawn_agent(
+        &orch,
+        "gemini-reviewer",
+        BackendType::GeminiCli,
+        SpawnConfig {
+            name: "gemini-reviewer".into(),
+            prompt: format!(
+                r#"你是一位技术写作编辑。审查以下关于 agent-teams Rust 库的中文技术文章。
 
 仅关注写作质量：
 1. 结构是否清晰？段落过渡是否自然？
@@ -225,17 +264,20 @@ r#"你是一位技术写作编辑。审查以下关于 agent-teams Rust 库的�
 简洁输出，最多 400 字。
 
 === 文章初稿 ===
-{draft}"#),
-        model: Some("gemini-2.5-flash".into()),
-        cwd: Some(project.to_path_buf()),
-        max_turns: Some(1),
-        allowed_tools: vec![],
-        permission_mode: None,
-        reasoning_effort: None,
-        env: Default::default(),
-        memory_config: None,
-        delegations: Vec::new(),
-    }).await;
+{draft}"#
+            ),
+            model: Some("gemini-2.5-flash".into()),
+            cwd: Some(project.to_path_buf()),
+            max_turns: Some(1),
+            allowed_tools: vec![],
+            permission_mode: None,
+            reasoning_effort: None,
+            env: Default::default(),
+            memory_config: None,
+            delegations: Vec::new(),
+        },
+    )
+    .await;
 
     let r2 = orch.take_output_receiver(TEAM, "codex-reviewer").await?;
     let r3 = orch.take_output_receiver(TEAM, "gemini-reviewer").await?;
@@ -257,15 +299,24 @@ r#"你是一位技术写作编辑。审查以下关于 agent-teams Rust 库的�
     print_truncated(&gemini_review, 30);
 
     for id in [&t2.id, &t3.id] {
-        orch.update_task(TEAM, id, TaskUpdate {
-            status: Some(TaskStatus::Completed), ..Default::default()
-        }).await?;
+        orch.update_task(
+            TEAM,
+            id,
+            TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await?;
     }
     for n in ["codex-reviewer", "gemini-reviewer"] {
         let _ = orch.shutdown_teammate(TEAM, n).await;
     }
 
-    println!("\n  Phase 2 done in {:.0}s\n", start.elapsed().as_secs_f64());
+    println!(
+        "\n  Phase 2 done in {:.0}s\n",
+        start.elapsed().as_secs_f64()
+    );
     let dag = orch.export_task_graph_terminal(TEAM).await?;
     print!("{dag}");
 
@@ -275,10 +326,14 @@ r#"你是一位技术写作编辑。审查以下关于 agent-teams Rust 库的�
     println!("\n[Phase 3] CC 整合反馈，输出终稿...\n");
     mark_started(&orch, &t4.id, "cc-editor").await?;
 
-    spawn_agent(&orch, "cc-editor", BackendType::ClaudeCode, SpawnConfig {
-        name: "cc-editor".into(),
-        prompt: format!(
-r#"你是技术文章的终审编辑。根据初稿和两位审查者的反馈，输出最终定稿。
+    spawn_agent(
+        &orch,
+        "cc-editor",
+        BackendType::ClaudeCode,
+        SpawnConfig {
+            name: "cc-editor".into(),
+            prompt: format!(
+                r#"你是技术文章的终审编辑。根据初稿和两位审查者的反馈，输出最终定稿。
 
 ## 任务
 1. 修正 Codex 指出的所有技术错误
@@ -296,24 +351,33 @@ r#"你是技术文章的终审编辑。根据初稿和两位审查者的反馈�
 {codex_review}
 
 === Gemini 写作审查 ===
-{gemini_review}"#),
-        model: Some("sonnet".into()),
-        cwd: Some(project.to_path_buf()),
-        max_turns: Some(3),
-        allowed_tools: vec![],
-        permission_mode: None,
-        reasoning_effort: None,
-        env: Default::default(),
-        memory_config: None,
-        delegations: Vec::new(),
-    }).await;
+{gemini_review}"#
+            ),
+            model: Some("sonnet".into()),
+            cwd: Some(project.to_path_buf()),
+            max_turns: Some(3),
+            allowed_tools: vec![],
+            permission_mode: None,
+            reasoning_effort: None,
+            env: Default::default(),
+            memory_config: None,
+            delegations: Vec::new(),
+        },
+    )
+    .await;
 
     let r4 = orch.take_output_receiver(TEAM, "cc-editor").await?;
     let final_article = collect(r4, TIMEOUT).await;
 
-    orch.update_task(TEAM, &t4.id, TaskUpdate {
-        status: Some(TaskStatus::Completed), ..Default::default()
-    }).await?;
+    orch.update_task(
+        TEAM,
+        &t4.id,
+        TaskUpdate {
+            status: Some(TaskStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     // =====================================================================
     // OUTPUT
@@ -337,7 +401,11 @@ r#"你是技术文章的终审编辑。根据初稿和两位审查者的反馈�
     if let Some(parent) = out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let content = if final_article.is_empty() { &draft } else { &final_article };
+    let content = if final_article.is_empty() {
+        &draft
+    } else {
+        &final_article
+    };
     std::fs::write(&out_path, content).unwrap_or_else(|e| eprintln!("Failed to save: {e}"));
     println!("  Article saved to: {}", out_path.display());
 
@@ -349,8 +417,10 @@ r#"你是技术文章的终审编辑。根据初稿和两位审查者的反馈�
     let _ = orch.shutdown_teammate(TEAM, "cc-editor").await;
     orch.delete_team(TEAM).await?;
 
-    println!("\n  Total: {:.0}s · 4 tasks · 3 phases · 3 backends",
-        start.elapsed().as_secs_f64());
+    println!(
+        "\n  Total: {:.0}s · 4 tasks · 3 phases · 3 backends",
+        start.elapsed().as_secs_f64()
+    );
 
     Ok(())
 }
@@ -363,24 +433,29 @@ async fn mktask(
     orch: &TeamOrchestrator,
     subject: &str,
 ) -> agent_teams::Result<agent_teams::models::TaskFile> {
-    orch.create_task(TEAM, CreateTaskRequest {
-        subject: subject.into(),
-        description: None,
-        active_form: None,
-        metadata: None,
-    }).await
+    orch.create_task(
+        TEAM,
+        CreateTaskRequest {
+            subject: subject.into(),
+            description: None,
+            active_form: None,
+            metadata: None,
+        },
+    )
+    .await
 }
 
-async fn mark_started(
-    orch: &TeamOrchestrator,
-    tid: &str,
-    owner: &str,
-) -> agent_teams::Result<()> {
-    orch.update_task(TEAM, tid, TaskUpdate {
-        status: Some(TaskStatus::InProgress),
-        owner: Some(owner.into()),
-        ..Default::default()
-    }).await?;
+async fn mark_started(orch: &TeamOrchestrator, tid: &str, owner: &str) -> agent_teams::Result<()> {
+    orch.update_task(
+        TEAM,
+        tid,
+        TaskUpdate {
+            status: Some(TaskStatus::InProgress),
+            owner: Some(owner.into()),
+            ..Default::default()
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -401,7 +476,11 @@ fn readf(base: &std::path::Path, path: &str) -> String {
 }
 
 fn readn(base: &std::path::Path, path: &str, lines: usize) -> String {
-    readf(base, path).lines().take(lines).collect::<Vec<_>>().join("\n")
+    readf(base, path)
+        .lines()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn print_truncated(text: &str, max_lines: usize) {
@@ -423,17 +502,32 @@ async fn collect(
     rx: Option<tokio::sync::mpsc::Receiver<AgentOutput>>,
     timeout_secs: u64,
 ) -> String {
-    let Some(mut rx) = rx else { return String::new() };
+    let Some(mut rx) = rx else {
+        return String::new();
+    };
     let mut text = String::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(AgentOutput::Delta(d))) => { text.push_str(&d); text.push('\n'); }
-            Ok(Some(AgentOutput::Message(m))) => { if !text.contains(&m) { text.push_str(&m); } }
+            Ok(Some(AgentOutput::Delta(d))) => {
+                text.push_str(&d);
+                text.push('\n');
+            }
+            Ok(Some(AgentOutput::Message(m))) => {
+                if !text.contains(&m) {
+                    text.push_str(&m);
+                }
+            }
             Ok(Some(AgentOutput::TurnComplete | AgentOutput::Idle)) => break,
-            Ok(Some(AgentOutput::Error(e))) => { text.push_str(&format!("\n[error] {e}")); break; }
+            Ok(Some(AgentOutput::Error(e))) => {
+                text.push_str(&format!("\n[error] {e}"));
+                break;
+            }
             Ok(None) => break,
-            Err(_) => { text.push_str(&format!("\n[timeout {timeout_secs}s]")); break; }
+            Err(_) => {
+                text.push_str(&format!("\n[timeout {timeout_secs}s]"));
+                break;
+            }
         }
     }
     text

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use serde_json::json;
 
 use crate::error::{Error, Result};
-use crate::team_mode::mcp::schemas::{ReadResourceResult, ResourceDescriptor, TextResourceContents};
+use crate::team_mode::mcp::schemas::{
+    ReadResourceResult, ResourceDescriptor, TextResourceContents,
+};
 use crate::team_mode::service::{
     InboxService, MemberService, MessageService, RoomService, TeamService, ThreadService,
 };
@@ -151,12 +153,9 @@ impl TeamModeResourceRegistry {
                 json!(team)
             }
             ResourceTarget::Room { team_id, room_id } => {
-                let room = self
-                    .room_service
-                    .get(&team_id)?
-                    .ok_or_else(|| {
-                        Error::Other(format!("room '{room_id}' not found in team '{team_id}'"))
-                    })?;
+                let room = self.room_service.get(&team_id)?.ok_or_else(|| {
+                    Error::Other(format!("room '{room_id}' not found in team '{team_id}'"))
+                })?;
                 let messages = self.message_service.list_by_room(&team_id, &room_id)?;
                 json!({
                     "room": room,
@@ -246,21 +245,32 @@ impl TeamModeResourceRegistry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResourceTarget {
-    Team { team_id: String },
-    Room { team_id: String, room_id: String },
-    Thread { team_id: String, thread_id: String },
-    Inbox { team_id: String, member_name: String },
-    Session { team_id: String, member_name: String },
+    Team {
+        team_id: String,
+    },
+    Room {
+        team_id: String,
+        room_id: String,
+    },
+    Thread {
+        team_id: String,
+        thread_id: String,
+    },
+    Inbox {
+        team_id: String,
+        member_name: String,
+    },
+    Session {
+        team_id: String,
+        member_name: String,
+    },
 }
 
 fn parse_uri(uri: &str) -> Result<ResourceTarget> {
     let Some(rest) = uri.strip_prefix("team://") else {
         return Err(Error::Other(format!("unsupported resource uri '{uri}'")));
     };
-    let segments: Vec<&str> = rest
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
         return Err(Error::Other(format!("invalid resource uri '{uri}'")));
     }
@@ -322,12 +332,8 @@ mod tests {
         let team_service = TeamService::new(team_store.clone());
         let member_service = MemberService::new(member_store.clone(), team_store.clone());
         let room_service = RoomService::new(room_store.clone());
-        let message_service = MessageService::new(
-            message_store,
-            member_store,
-            room_store,
-            team_store,
-        );
+        let message_service =
+            MessageService::new(message_store, member_store, room_store, team_store);
 
         let team = team_service
             .create(CreateTeamRequest {
@@ -336,6 +342,7 @@ mod tests {
                 description: None,
                 cwd: None,
                 lead_member_id: Some("lead".into()),
+                owner_cc_pid: None,
             })
             .unwrap();
         member_service
@@ -405,8 +412,14 @@ mod tests {
 
         assert!(uris.iter().any(|uri| uri == "team://demo"));
         assert!(uris.iter().any(|uri| uri == "team://demo/rooms/main"));
-        assert!(uris.iter().any(|uri| uri == "team://demo/members/lead/inbox"));
-        assert!(uris.iter().any(|uri| uri.starts_with("team://demo/threads/")));
+        assert!(
+            uris.iter()
+                .any(|uri| uri == "team://demo/members/lead/inbox")
+        );
+        assert!(
+            uris.iter()
+                .any(|uri| uri.starts_with("team://demo/threads/"))
+        );
     }
 
     #[test]

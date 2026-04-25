@@ -123,7 +123,10 @@ async fn main() -> agent_teams::Result<()> {
     }
 
     let spawn_time = start.elapsed();
-    println!("\n  All {total_agents} agents spawned in {:.1}s\n", spawn_time.as_secs_f64());
+    println!(
+        "\n  All {total_agents} agents spawned in {:.1}s\n",
+        spawn_time.as_secs_f64()
+    );
 
     // --- Phase 2: Collect all outputs concurrently ---
     println!("[2] Collecting reviews (all agents working in parallel)...\n");
@@ -143,9 +146,7 @@ async fn main() -> agent_teams::Result<()> {
 
     // Collect all Codex outputs
     for &(name, file) in CODEX_TARGETS {
-        let rx = orch
-            .take_output_receiver("mixed-review", name)
-            .await?;
+        let rx = orch.take_output_receiver("mixed-review", name).await?;
         let file = file.to_string();
         let name = name.to_string();
         handles.push(tokio::spawn(async move {
@@ -174,7 +175,10 @@ async fn main() -> agent_teams::Result<()> {
     let total_time = start.elapsed();
     println!("═══════════════════════════════════════════════════════");
     println!("  Total wall-clock time: {:.1}s", total_time.as_secs_f64());
-    println!("  (1 Claude Code + {} Codex agents in parallel)", codex_count);
+    println!(
+        "  (1 Claude Code + {} Codex agents in parallel)",
+        codex_count
+    );
     println!("═══════════════════════════════════════════════════════\n");
 
     // --- Phase 3: Cleanup ---
@@ -196,7 +200,8 @@ async fn main() -> agent_teams::Result<()> {
 fn build_architecture_prompt(project_dir: &std::path::Path) -> String {
     // Read key files for context
     let lib_rs = std::fs::read_to_string(project_dir.join("src/lib.rs")).unwrap_or_default();
-    let backend_mod = std::fs::read_to_string(project_dir.join("src/backend/mod.rs")).unwrap_or_default();
+    let backend_mod =
+        std::fs::read_to_string(project_dir.join("src/backend/mod.rs")).unwrap_or_default();
     let error_rs = std::fs::read_to_string(project_dir.join("src/error.rs")).unwrap_or_default();
 
     format!(
