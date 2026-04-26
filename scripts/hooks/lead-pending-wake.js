@@ -67,6 +67,11 @@ const PENDING_FILENAME = 'lead_pending.jsonl';
 const LOG_FILENAME = '.lead-pending-wake.log';
 const COOLDOWN_FILENAME = '.stop-hook-cooldown';
 const ANCESTOR_CACHE_FILENAME = '.ancestor-cache.json';
+const LEAD_SESSIONS_FILENAME = '.lead-sessions.json';   // {pid: {session_id, updated_at}} written by Stop hook on each fire
+const LEAD_SESSIONS_TTL_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days; entries older than this are GC'd on write
+const PENDING_LOCK_FILENAME = '.lead-pending.lock';     // exclusive-create lock around pending classify→drain critical section
+const PENDING_LOCK_RETRY_MS = 50;                       // initial backoff between lock acquisition retries
+const PENDING_LOCK_MAX_WAIT_MS = 3000;                  // give up acquiring after this long (return false; caller handles gracefully)
 const ANCESTOR_CACHE_TTL_MS = 5_000;        // enough to span the Stop hook poll loop
 const ANCESTOR_CHAIN_MAX_DEPTH = 40;         // deep enough for any real dispatcher, bounds runaway
 const PROC_QUERY_TIMEOUT_MS = 5_000;
@@ -239,6 +244,130 @@ function writeCooldown(dir, sessionId) {
         );
     } catch (_) {
         // best-effort
+    }
+}
+
+// Bug 27 fix — lead session id binding for multi-CC-same-cwd setups.
+//
+// The web read_model picks the lead's Claude Code JSONL file by
+// "newest mtime in cwd" when it has no exact session_id to match.
+// This breaks when two CC instances run in the same project: both
+// write JSONL into the same `~/.claude/projects/<encoded>/` dir, and
+// the wrong CC's transcript ends up rendered as the lead's session.
+//
+// We can't introspect Claude session_id from inside the daemon (the
+// daemon never sees CC's hook payload). But the Stop hook DOES see
+// `event.session_id` on every fire. So the hook becomes the source
+// of truth: on each Stop, write {pid: session_id} for every PID in
+// our ancestor chain. The web layer reads this map keyed by
+// `team.owner_cc_pid` to pick the canonical session.
+//
+// Writes for ALL ancestors (not just process.ppid) because on Windows
+// the immediate parent can be a cmd.exe / node wrapper, not the CC
+// node process itself. team.owner_cc_pid is captured by the MCP relay
+// as `parent CC PID` — which is one of our ancestors.
+function writeLeadSessionMapping(dir, sessionId, ancestorPidSet) {
+    if (!sessionId || !ancestorPidSet || ancestorPidSet.size === 0) {
+        return;
+    }
+    const mapPath = path.join(dir, LEAD_SESSIONS_FILENAME);
+
+    let existing = {};
+    try {
+        const raw = fs.readFileSync(mapPath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+            existing = parsed;
+        }
+    } catch (_) {
+        // file missing or corrupt — start fresh
+    }
+
+    // GC: drop entries older than the TTL so the file doesn't grow
+    // forever as the user opens/closes CC sessions over months.
+    const cutoffMs = Date.now() - LEAD_SESSIONS_TTL_MS;
+    for (const [pid, entry] of Object.entries(existing)) {
+        const ts = entry && entry.updated_at ? Date.parse(entry.updated_at) : NaN;
+        if (!Number.isFinite(ts) || ts < cutoffMs) {
+            delete existing[pid];
+        }
+    }
+
+    const nowIso = new Date().toISOString();
+    for (const pid of ancestorPidSet) {
+        existing[String(pid)] = { session_id: sessionId, updated_at: nowIso };
+    }
+
+    // Atomic write (tmp + rename) so a partial write can't corrupt the
+    // file for a concurrent reader (web read_model polls it).
+    try {
+        const tmp = mapPath + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(existing, null, 2), 'utf8');
+        fs.renameSync(tmp, mapPath);
+    } catch (_) {
+        // best-effort; web layer falls back to mtime if file is missing
+    }
+}
+
+// Bug 28 fix — exclusive lock around the classify→drain critical
+// section in tryBlock. Without it, if CC fires two Stop hooks in rapid
+// succession (concurrent worker replies right at turn boundary), both
+// hook instances can read the same `mine` set, both call
+// `writePeersBack`, and both inject — duplicating the same batch to CC.
+//
+// We use `O_CREAT | O_EXCL` semantics via `fs.openSync(path, 'wx')`.
+// If another hook holds the lock we back off briefly and retry until
+// PENDING_LOCK_MAX_WAIT_MS. Returning null from acquire signals "skip
+// this round" to the caller — that's safe because the lock-holder will
+// drain whatever was pending and the next poll iteration will pick up
+// anything new.
+async function acquirePendingLock(dir) {
+    const lockPath = path.join(dir, PENDING_LOCK_FILENAME);
+    const startedAt = Date.now();
+    let backoff = PENDING_LOCK_RETRY_MS;
+    while (Date.now() - startedAt < PENDING_LOCK_MAX_WAIT_MS) {
+        try {
+            const fd = fs.openSync(lockPath, 'wx');
+            try {
+                fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+            } catch (_) {
+                // ignore — lock content is forensic only
+            }
+            fs.closeSync(fd);
+            return lockPath;
+        } catch (err) {
+            if (err && err.code === 'EEXIST') {
+                // Another hook holds it. Check if it's stale (process died
+                // before releasing). A lock older than 30s is almost
+                // certainly stale — Stop hook critical sections are <100ms.
+                try {
+                    const stat = fs.statSync(lockPath);
+                    if (Date.now() - stat.mtimeMs > 30_000) {
+                        try { fs.unlinkSync(lockPath); } catch (_) {}
+                        continue; // immediately retry the open
+                    }
+                } catch (_) {
+                    // stat failed — race with the holder releasing; loop
+                }
+                // Fresh lock — sleep with mild exponential backoff and retry.
+                // Real timer sleep (not busy-wait) so we don't burn CPU.
+                await sleep(backoff);
+                backoff = Math.min(backoff * 2, 200);
+                continue;
+            }
+            // Some other I/O error — give up; caller falls back unlocked.
+            return null;
+        }
+    }
+    return null;
+}
+
+function releasePendingLock(lockPath) {
+    if (!lockPath) return;
+    try {
+        fs.unlinkSync(lockPath);
+    } catch (_) {
+        // already gone or never existed — fine
     }
 }
 
@@ -506,6 +635,13 @@ async function handleStop(event, baseDir, pendingPath) {
         ? 'NO-ROUTING'
         : `ancestors=${[...ancestorSet].slice(0, 5).join(',')}${ancestorSet.size > 5 ? '...' : ''}`;
 
+    // Bug 27 fix: record the {ancestor_pid → claude_session_id} mapping so the
+    // web layer can pick the lead's actual JSONL even when multiple CC
+    // instances share the same project cwd. Cheap (single small file write
+    // per hook fire) and idempotent (repeated writes for the same pid just
+    // bump the timestamp).
+    writeLeadSessionMapping(baseDir, sessionId, ancestorSet);
+
     // Try-and-block helper shared by initial check + poll loop.
     //
     // Block via `exit 0 + JSON stdout {decision:"block", reason:"..."}`
@@ -535,22 +671,39 @@ async function handleStop(event, baseDir, pendingPath) {
     );
 
     const tryBlock = async () => {
-        let c = classifyPending(pendingPath, ancestorSet);
-        if (c.mine.length === 0) return false;
-        if (BATCH_GRACE_MS > 0) {
-            await sleep(BATCH_GRACE_MS);
-            // Re-classify; new entries from concurrent worker replies are
-            // additive — `c.mine` cannot shrink because nobody else drains
-            // pending while this hook holds it.
-            c = classifyPending(pendingPath, ancestorSet);
+        // Bug 28 fix: serialize the classify→drain critical section so two
+        // concurrent Stop hook instances can't both drain the same `mine`
+        // set and double-inject. A null return means we couldn't acquire
+        // the lock within the budget; the caller (poll loop) will retry
+        // on the next iteration when the lock-holder has finished.
+        const lockPath = await acquirePendingLock(baseDir);
+        if (!lockPath) {
+            log(baseDir, 'stop: lock contention, skipping this round (other hook draining)');
+            return false;
         }
-        writePeersBack(pendingPath, c.othersRaw, baseDir);
-        writeCooldown(baseDir, sessionId);
-        process.stdout.write(
-            JSON.stringify({ decision: 'block', reason: renderReminder(c.mine) })
-        );
-        log(baseDir, `stop: injected ${c.mine.length} (batch grace ${BATCH_GRACE_MS}ms), kept ${c.othersRaw.length} for peers [${routingNote}], exit 0 (block via JSON)`);
-        process.exit(0);
+        try {
+            let c = classifyPending(pendingPath, ancestorSet);
+            if (c.mine.length === 0) {
+                return false;
+            }
+            if (BATCH_GRACE_MS > 0) {
+                // Hold the lock across the grace window so a concurrent
+                // hook can't slip in and steal newly-arrived entries.
+                await sleep(BATCH_GRACE_MS);
+                c = classifyPending(pendingPath, ancestorSet);
+            }
+            writePeersBack(pendingPath, c.othersRaw, baseDir);
+            writeCooldown(baseDir, sessionId);
+            process.stdout.write(
+                JSON.stringify({ decision: 'block', reason: renderReminder(c.mine) })
+            );
+            log(baseDir, `stop: injected ${c.mine.length} (batch grace ${BATCH_GRACE_MS}ms), kept ${c.othersRaw.length} for peers [${routingNote}], exit 0 (block via JSON)`);
+            // Release before exit — process.exit doesn't run finally.
+            releasePendingLock(lockPath);
+            process.exit(0);
+        } finally {
+            releasePendingLock(lockPath);
+        }
     };
 
     // ---- UNCONDITIONAL first check ----
