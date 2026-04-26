@@ -74,6 +74,32 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    /// Count messages this worker sent into the team room with a
+    /// `created_at` strictly after `since`. Used by step 5 to detect
+    /// whether the worker called `send_message` during the turn that
+    /// just ended (delta > 0 = explicit reply, delta == 0 = silent).
+    ///
+    /// Cheap: a single full read of `messages.jsonl` then a linear
+    /// filter. Per-turn cost is acceptable for any realistic project
+    /// size (a million-message team is hypothetical; in practice we're
+    /// in the hundreds-to-thousands range).
+    ///
+    /// Returns `None` on storage I/O error; callers should treat that
+    /// as "unknown" and pick a conservative default rather than
+    /// panicking.
+    fn count_self_messages_after(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Option<usize> {
+        let messages = self.message_store.list(&self.team_id).ok()?;
+        Some(
+            messages
+                .into_iter()
+                .filter(|m| m.sender == self.member_id && m.created_at > since)
+                .count(),
+        )
+    }
+
     /// Spawn the loop on a dedicated thread with its own Tokio runtime.
     pub fn start(self, output_rx: Receiver<AgentOutput>) -> AgentLoopHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -196,174 +222,127 @@ impl AgentLoop {
                     }
                 }
 
-                // 4. Collect Claude Code's response until the turn ends.
+                // 4. Drain worker output events for this turn. We DELIBERATELY
+                // do not accumulate stdout into a reply body — the worker's
+                // job is to call `mcp__team-mode__send_message` explicitly.
+                // Anything written to stdout (LLM narration, codex shell
+                // command output, intermediate token streams) is treated as
+                // private working notes — visible in the web UI's session
+                // transcript but never copied into messages.jsonl.
                 //
-                // We track the END-CAUSE so step 5 can synthesize a [SYSTEM]
-                // status whenever the worker produced no text. The whole point
-                // is the lead must always get exactly ONE terminal message
-                // back per inbox dispatch — Reply when there's content, Status
-                // otherwise. Without this guarantee, a worker that finishes a
-                // turn silently (LLM ignored the request, content was filtered,
-                // process died mid-turn) leaves the lead waiting forever.
-                // Codex emits BOTH `EVENT_AGENT_MESSAGE_DELTA` (token-by-
-                // token of the assistant reply) AND `EVENT_ITEM_COMPLETED`
-                // (the same reply as one final block). If we concatenated
-                // both, the body would contain the assistant text twice.
+                // We still drain events because we need:
+                //   * the terminal signal (TurnComplete / Error / pipe close)
+                //     to know the turn ended,
+                //   * tracing for debugging.
                 //
-                // Strategy: track the final `Message` separately from the
-                // streaming `Delta`s. If a `Message` arrived during this
-                // turn, it's the canonical complete reply — use it and
-                // discard the deltas. Otherwise (Claude Code, Gemini,
-                // codex turn that only streamed deltas), fall back to
-                // joining the deltas in order.
-                //
-                // `ToolOutput` (codex shell command stdout, etc.) is
-                // observability data only — we trace-log it but never
-                // include it in the body.
-                let mut deltas: Vec<String> = Vec::new();
-                let mut final_message: Option<String> = None;
+                // History: this loop used to JOIN every Message + Delta event
+                // into a body and post it as a Reply (the "auto-capture stdout
+                // as reply" path). That design caused Bug 26 (codex command
+                // output and double-writes bloating the reply to 50K+ tokens)
+                // and was removed in Bug 29. The contract is now strict:
+                // explicit MCP call = message; anything else = noise.
+                let baseline_sent = self
+                    .count_self_messages_after(message.created_at)
+                    .unwrap_or(0);
                 let mut error_text: Option<String> = None;
                 let end_cause: TurnEndCause = loop {
                     match output_rx.recv().await {
-                        Some(AgentOutput::Message(text)) => {
-                            // Last `Message` wins (some backends may emit
-                            // intermediate ones; the final one is the
-                            // committed reply).
-                            final_message = Some(text);
-                        }
-                        Some(AgentOutput::Delta(text)) => {
-                            deltas.push(text);
-                        }
-                        Some(AgentOutput::ToolOutput(text)) => {
-                            tracing::trace!(
-                                member = %self.member_id,
-                                "tool output ({} bytes) suppressed from reply body",
-                                text.len()
-                            );
+                        Some(AgentOutput::Message(_))
+                        | Some(AgentOutput::Delta(_))
+                        | Some(AgentOutput::ToolOutput(_)) => {
+                            // Discarded for body purposes. Web UI still shows
+                            // the worker's transcript via the session JSONL
+                            // file (Claude/codex write it independently).
                         }
                         Some(AgentOutput::TurnComplete) | Some(AgentOutput::Idle) => {
                             break TurnEndCause::TurnComplete;
                         }
                         Some(AgentOutput::Error(e)) => {
-                            error_text = Some(format!("[agent error: {e}]"));
+                            error_text = Some(e);
                             break TurnEndCause::AgentError;
                         }
                         None => {
-                            // stdout pipe closed mid-turn — the child process
-                            // is gone (crashed, killed, or stdin/stdout pair
-                            // dropped). We still must surface this to the
-                            // lead. Fall through to step 5; after sending the
-                            // [SYSTEM] notice we will exit the loop because
-                            // there's nothing left to listen on.
+                            // Pipe closed mid-turn — child process died.
+                            // The lead must hear about this; fall through
+                            // to step 5 then exit the loop (there's nothing
+                            // left to read).
                             break TurnEndCause::OutputClosed;
                         }
                     }
                 };
-                // Prefer the canonical complete `Message` over delta
-                // accumulation to avoid the codex double-write. If only
-                // an error arrived (no Message, no Delta), surface the
-                // error text.
-                let mut parts: Vec<String> = match (final_message, deltas.is_empty()) {
-                    (Some(msg), _) => vec![msg],
-                    (None, false) => deltas,
-                    (None, true) => Vec::new(),
-                };
-                if let Some(err) = error_text {
-                    parts.push(err);
-                }
 
-                // 5. Always post EXACTLY ONE terminal message back to the room.
-                //
-                // Branching:
-                //   - body has visible content (after trim) → `Reply`
-                //   - empty body + TurnComplete             → `[SYSTEM]` Status: silent turn
-                //   - empty body + AgentError               → `[SYSTEM]` Status: agent error
-                //                                              (parts already includes
-                //                                              the error string above,
-                //                                              so this branch usually
-                //                                              has content; included for
-                //                                              completeness)
-                //   - any cause + OutputClosed              → `[SYSTEM]` Status: pipe closed
-                //
-                // Rationale: lead coordination relies on every dispatch
-                // producing a single observable terminal event. Two events
-                // (a Reply AND a "completed" status) would be redundant noise;
-                // zero events strands the lead. So we pick exactly one.
-                let raw_body = parts.join("");
-                let trimmed = raw_body.trim();
-                let has_content = !trimmed.is_empty();
+                // 5. Post a terminal `[SYSTEM]` notice ONLY for failure
+                // modes the worker can't surface itself. A clean
+                // TurnComplete where the worker explicitly called
+                // send_message at least once → no noise from us; the
+                // worker has spoken for itself. A clean TurnComplete
+                // where the worker said nothing → one Status notice so
+                // the lead doesn't wait forever for a silent worker.
+                let final_sent = self
+                    .count_self_messages_after(message.created_at)
+                    .unwrap_or(baseline_sent);
+                let worker_spoke_explicitly = final_sent > baseline_sent;
                 let pipe_closed = matches!(end_cause, TurnEndCause::OutputClosed);
 
-                let (kind, body) = if has_content && !pipe_closed {
-                    (MessageKind::Reply, raw_body)
-                } else {
-                    let notice = match (has_content, end_cause) {
-                        (false, TurnEndCause::TurnComplete) => format!(
-                            "[SYSTEM] worker '{member}' completed its turn without \
-                             producing any reply text for msg {mid}. The worker may \
-                             have silently ignored the request or finished without \
-                             output. Check the worker's prompt or send a follow-up.",
-                            member = self.member_id,
-                            mid = message.id
-                        ),
-                        (true, TurnEndCause::OutputClosed) => format!(
-                            "[SYSTEM] worker '{member}' output channel closed \
-                             mid-turn while answering msg {mid} (partial output: {n} \
-                             chars). The child process likely died. Use \
-                             `worker_add name={member} on_existing=reuse` to revive.\n\n\
-                             --- partial output ---\n{partial}",
-                            member = self.member_id,
-                            mid = message.id,
-                            n = trimmed.len(),
-                            partial = trimmed
-                        ),
-                        (false, TurnEndCause::OutputClosed) => format!(
-                            "[SYSTEM] worker '{member}' output channel closed \
-                             before producing any reply for msg {mid}. The child \
-                             process died at the start of its turn. Use \
-                             `worker_add name={member} on_existing=reuse` to revive.",
-                            member = self.member_id,
-                            mid = message.id
-                        ),
-                        (false, TurnEndCause::AgentError) => format!(
-                            "[SYSTEM] worker '{member}' raised an agent error while \
-                             processing msg {mid} but emitted no message body. See \
-                             the worker's stderr / daemon log for details.",
-                            member = self.member_id,
-                            mid = message.id
-                        ),
-                        // (true, TurnComplete) or (true, AgentError) hit the
-                        // Reply branch above; this match is exhaustive.
-                        _ => unreachable!(
-                            "terminal-message branch: has_content={has_content} cause={cause:?}",
-                            cause = end_cause
-                        ),
-                    };
-                    (MessageKind::Status, notice)
+                let notice: Option<String> = match end_cause {
+                    TurnEndCause::OutputClosed => Some(format!(
+                        "[SYSTEM] worker '{member}' output channel closed \
+                         while answering msg {mid}. The child process \
+                         died. Use `worker_add name={member} on_existing=reuse` \
+                         to revive (worker loses prior conversation context).",
+                        member = self.member_id,
+                        mid = message.id
+                    )),
+                    TurnEndCause::AgentError => Some(format!(
+                        "[SYSTEM] worker '{member}' raised an agent error \
+                         while processing msg {mid}: {err}. See daemon log \
+                         for details.",
+                        member = self.member_id,
+                        mid = message.id,
+                        err = error_text.as_deref().unwrap_or("(no detail)")
+                    )),
+                    TurnEndCause::TurnComplete if !worker_spoke_explicitly => Some(format!(
+                        "[SYSTEM] worker '{member}' completed its turn for \
+                         msg {mid} without calling send_message. Either the \
+                         worker chose to stay silent or its onboarding \
+                         didn't teach the explicit-send protocol. Send a \
+                         follow-up to nudge, or check the worker's system \
+                         prompt.",
+                        member = self.member_id,
+                        mid = message.id
+                    )),
+                    TurnEndCause::TurnComplete => None, // worker spoke — silent success
                 };
 
-                tracing::info!(
-                    member = %self.member_id,
-                    msg_id = %message.id,
-                    kind = ?kind,
-                    body_len = body.len(),
-                    end_cause = ?end_cause,
-                    "posting terminal message for inbox turn"
-                );
-                let _ = self.message_service.send(SendMessageRequest {
-                    team_id: self.team_id.clone(),
-                    room_id: self.room_id.clone(),
-                    sender: self.member_id.clone(),
-                    kind,
-                    subject: None,
-                    body,
-                    mentions: Vec::new(),
-                    visibility: Vec::new(),
-                    audience_policy: None,
-                    reply_to: Some(message.id.clone()),
-                    thread_id: message.thread_id.clone(),
-                    expires_at: None,
-                });
+                if let Some(body) = notice {
+                    tracing::info!(
+                        member = %self.member_id,
+                        msg_id = %message.id,
+                        end_cause = ?end_cause,
+                        "posting [SYSTEM] terminal notice for inbox turn"
+                    );
+                    let _ = self.message_service.send(SendMessageRequest {
+                        team_id: self.team_id.clone(),
+                        room_id: self.room_id.clone(),
+                        sender: self.member_id.clone(),
+                        kind: MessageKind::Status,
+                        subject: None,
+                        body,
+                        mentions: Vec::new(),
+                        visibility: Vec::new(),
+                        audience_policy: None,
+                        reply_to: Some(message.id.clone()),
+                        thread_id: message.thread_id.clone(),
+                        expires_at: None,
+                    });
+                } else {
+                    tracing::info!(
+                        member = %self.member_id,
+                        msg_id = %message.id,
+                        sent = final_sent - baseline_sent,
+                        "turn complete; worker spoke explicitly via send_message"
+                    );
+                }
 
                 // 6. Ack the processed inbox item.
                 tracing::debug!(member = %self.member_id, msg_id = %message.id, "ack'd inbox item");
@@ -697,13 +676,34 @@ mod tests {
         assert_eq!(after.items.len(), 1);
         assert!(matches!(after.items[0].status, InboxStatus::Acked));
 
-        // A reply message from worker should exist in the room.
+        // Bug 29 contract: stdout `Message`/`Delta` events are NOT
+        // auto-published as a Reply. Workers must call send_message
+        // explicitly to communicate. The driver here only emits a
+        // TurnComplete with a Message event but never calls
+        // send_message → expect a [SYSTEM] silent-turn notice, not a
+        // Reply with the Message body.
         let messages = message_store.list_by_room("team-1", "main").unwrap();
-        let reply = messages
+        let auto_reply = messages
             .iter()
             .find(|m| m.sender == "worker" && matches!(m.kind, MessageKind::Reply));
-        assert!(reply.is_some(), "expected a reply from worker in the room");
-        assert_eq!(reply.unwrap().body, "Done!");
+        assert!(
+            auto_reply.is_none(),
+            "stdout `Message` should NOT be auto-captured as a Reply; \
+             worker must call send_message explicitly. Found: {:?}",
+            auto_reply
+        );
+        let silent_notice = messages
+            .iter()
+            .find(|m| m.sender == "worker" && matches!(m.kind, MessageKind::Status));
+        assert!(
+            silent_notice.is_some(),
+            "expected [SYSTEM] silent-turn notice when worker doesn't call send_message"
+        );
+        assert!(
+            silent_notice.unwrap().body.contains("without calling send_message"),
+            "silent-turn notice should mention send_message; got: {}",
+            silent_notice.unwrap().body
+        );
     }
 
     /// Helper to wire up an AgentLoop + scripted output channel.
@@ -826,7 +826,7 @@ mod tests {
             from_worker[0].body.contains("[SYSTEM]")
                 && from_worker[0]
                     .body
-                    .contains("completed its turn without producing any reply text"),
+                    .contains("without calling send_message"),
             "unexpected body: {}",
             from_worker[0].body
         );
@@ -865,9 +865,18 @@ mod tests {
             "unexpected body: {}",
             from_worker[0].body
         );
+        // Bug 29: partial stdout output is no longer included in pipe-close
+        // notices — the worker's "partial answer" via stdout is private
+        // working notes, not a message. The notice only states the death
+        // and points the lead at how to revive.
         assert!(
-            from_worker[0].body.contains("partial..."),
-            "should include the partial output: {}",
+            !from_worker[0].body.contains("partial..."),
+            "partial stdout should NOT leak into pipe-close notice: {}",
+            from_worker[0].body
+        );
+        assert!(
+            from_worker[0].body.contains("worker_add"),
+            "notice should suggest revive command: {}",
             from_worker[0].body
         );
     }

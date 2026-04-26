@@ -1,36 +1,29 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 
-use crate::ExecutionSessionState;
 use crate::RuntimeOrchestrator;
 use crate::backend::claude_code::ClaudeCodeBackend;
 use crate::backend::codex::CodexBackend;
 use crate::backend::gemini::GeminiCliBackend;
-use crate::backend::{AgentOutput, BackendType, SpawnConfig};
 use crate::error::{Error, Result};
-use crate::runtime::AgentLoop;
-use crate::team_mode::domain::{
-    ExecutionMode, ExecutionProfile, MemberKind, MemberStatus, MessageKind,
-};
-use crate::team_mode::mcp::resources::{inbox_uri, room_uri, team_uri, thread_uri};
+use crate::team_mode::domain::{MemberKind, MemberStatus, MessageKind};
+use crate::team_mode::mcp::resources::{inbox_uri, team_uri};
 use crate::team_mode::mcp::schemas::{ToolCallResult, ToolDescriptor, empty_object_schema};
-use crate::team_mode::runtime_workers::{
-    RuntimeWorkerStore, STATE_DEAD, STATE_FAILED, STATE_RUNNING, STATE_STARTING, STATE_STOPPED,
-};
+use crate::team_mode::runtime_workers::{RuntimeWorkerStore, STATE_STOPPED};
 use crate::team_mode::service::{
     AddMemberRequest, CreateTeamRequest, InboxNotifier, InboxService, LeadPendingWriter,
-    MemberService, MessageService, RoomService, SendMessageRequest, TeamService,
+    MemberService, MessageService, RoomService, TeamService,
 };
-use crate::team_mode::storage::{
-    MemberRecord, MemberStore, MessageStore, ProjectionStore, RoomStore, TeamStore,
-};
+use crate::team_mode::storage::{MemberStore, MessageStore, ProjectionStore, RoomStore, TeamStore};
 use crate::util::validate_name;
+
+mod message;
+mod worker;
 
 /// Per-team lead is always a virtual member with this name.
 const LEAD_NAME: &str = "lead";
@@ -165,11 +158,7 @@ impl TeamModeToolset {
                     &["name"],
                 ),
             ),
-            tool(
-                "team_list",
-                "List teams.",
-                empty_object_schema(),
-            ),
+            tool("team_list", "List teams.", empty_object_schema()),
             tool(
                 "team_delete",
                 "Delete a team and stop all its workers.",
@@ -547,870 +536,6 @@ impl TeamModeToolset {
         }
 
         Ok(success_with_updates(result, vec![team_uri(&team_name)]))
-    }
-
-    fn worker_add(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
-        let team_name = required_identifier(args, "team")?;
-        let worker_name = required_identifier(args, "name")?;
-        if worker_name == LEAD_NAME {
-            return Err(Error::Other(
-                "'lead' is a reserved name and cannot be used for a worker".into(),
-            ));
-        }
-        // Reserve the synthetic web-UI sender name. If a user named a real
-        // worker `user`, web messages from the browser would land in that
-        // worker's inbox (sender == self), tripping the self-mention guard
-        // and possibly other downstream confusion.
-        if worker_name == crate::team_mode_web::read_model::WEB_USER_SENDER {
-            return Err(Error::Other(format!(
-                "'{}' is reserved for the web-UI sender and cannot be used for a worker",
-                crate::team_mode_web::read_model::WEB_USER_SENDER
-            )));
-        }
-        // Same strict slug check as team_create. Without this, names with
-        // spaces / uppercase / unicode were accepted but unreachable via
-        // @mention — workers existed in members.json but no message could
-        // ever route to them.
-        crate::util::validate_slug_name(&worker_name)?;
-
-        let team = self
-            .team_service
-            .get(&team_name)?
-            .ok_or_else(|| Error::TeamNotFound {
-                name: team_name.clone(),
-            })?;
-
-        let existing = self.member_store.get(&team_name, &worker_name)?;
-        let existing_execution = existing.as_ref().and_then(|r| r.execution.clone());
-        let caller_adapter = optional_identifier(args, "adapter")?;
-        let on_existing = optional_identifier(args, "on_existing")?
-            .as_deref()
-            .map(parse_on_existing)
-            .transpose()?
-            .unwrap_or(OnExisting::Error);
-
-        // Decide the mode
-        let mode = match (&existing_execution, &caller_adapter, on_existing) {
-            (Some(_), _, OnExisting::Reuse) => WorkerAddMode::Reuse,
-            (Some(_), Some(_), OnExisting::Overwrite) => WorkerAddMode::Overwrite,
-            (Some(_), None, OnExisting::Overwrite) => {
-                return Err(Error::Other(
-                    "on_existing=overwrite requires `adapter`".into(),
-                ));
-            }
-            (Some(_), _, OnExisting::Error) => {
-                let members_path = self.member_store_members_file_hint(&team_name);
-                return Err(Error::Other(format!(
-                    "worker '{worker_name}' already exists with an execution profile ({members_path}). \
-                     Pass on_existing=reuse to fast-resume the saved config, \
-                     on_existing=overwrite to replace it (adapter required), \
-                     or choose a different worker name."
-                )));
-            }
-            (None, Some(_), _) => WorkerAddMode::Create,
-            (None, None, _) => {
-                return Err(Error::Other(
-                    "first-time worker_add requires `adapter`".into(),
-                ));
-            }
-        };
-
-        // Build / resolve execution profile
-        let execution = match mode {
-            WorkerAddMode::Reuse => existing_execution.clone().ok_or_else(|| {
-                Error::Other(format!(
-                    "worker '{worker_name}' has no saved profile to reuse"
-                ))
-            })?,
-            WorkerAddMode::Overwrite | WorkerAddMode::Create => {
-                let adapter = caller_adapter.clone().ok_or_else(|| {
-                    Error::Other("adapter is required when overwriting or creating".into())
-                })?;
-                let cwd_for_worker = optional_text(args, "cwd")?.or_else(|| team.cwd.clone());
-                ExecutionProfile {
-                    execution_mode: ExecutionMode::Managed,
-                    adapter: Some(adapter),
-                    agent_name: Some(worker_name.clone()),
-                    model: optional_identifier(args, "model")?,
-                    cwd: cwd_for_worker,
-                    env: parse_env_map(args.get("env"))?,
-                    system_prompt: optional_text(args, "system_prompt")?,
-                    skills: Vec::new(),
-                    session_state: None,
-                    session_id: None,
-                    // Optional. None = let the backend's own config file
-                    // (e.g. `~/.codex/config.toml`) decide. Don't default
-                    // to `"medium"` — that would silently override the
-                    // user's global preference.
-                    reasoning_effort: optional_identifier(args, "effort")?,
-                }
-            }
-        };
-
-        // Validate adapter up-front — BEFORE any state changes. Otherwise a
-        // bad adapter leaves behind a phantom member record that later shows
-        // up in worker_list and @mention resolution.
-        let backend_type: BackendType = execution
-            .adapter
-            .clone()
-            .ok_or_else(|| Error::Other("execution profile missing adapter".into()))?
-            .parse()
-            .map_err(|e: String| Error::Other(e))?;
-
-        // Idempotent reuse: if the orchestrator already has a live session
-        // for this spawn_key, don't try to re-spawn (which would error
-        // "already registered"). Just report the current state.
-        //
-        // If the worker was registered but has died (process gone), we drop
-        // the stale session entry now so the spawn path below can recreate
-        // a fresh one. Without this cleanup `spawn_managed_member` rejects
-        // any spawn_key already in its HashMap, so a `worker_add reuse` on
-        // a dead worker would fail with "already registered" — exactly the
-        // workflow the `[SYSTEM] worker died ... use on_existing=reuse to
-        // restart` notice tells the lead to perform.
-        let spawn_key_pre = spawn_key(&team_name, &worker_name);
-        let (already_live, revived_from_dead) = self.async_runtime.block_on({
-            let orch = Arc::clone(&self.runtime_orchestrator);
-            let key = spawn_key_pre.clone();
-            async move {
-                let mut guard = orch.lock().await;
-                let alive = guard.is_alive(&key).await.unwrap_or(false);
-                let revived = if !alive && guard.has_session(&key) {
-                    guard.remove_dead_session_if_any(&key).await
-                } else {
-                    false
-                };
-                (alive, revived)
-            }
-        });
-        if matches!(mode, WorkerAddMode::Reuse) && already_live {
-            // Make sure the on-disk session_state reflects reality and return.
-            let _ = self.member_store.update(&team_name, &worker_name, |m| {
-                if let Some(exec) = m.execution.as_mut() {
-                    exec.session_state = Some(ExecutionSessionState::Running);
-                }
-            });
-            let _ = self.runtime_workers.upsert_state(
-                &team_name,
-                &worker_name,
-                &spawn_key_pre,
-                execution.adapter.clone(),
-                STATE_RUNNING,
-                None,
-            );
-            return Ok(success_with_updates(
-                json!({
-                    "team": team_name.clone(),
-                    "name": worker_name.clone(),
-                    "sessionState": "running",
-                    "mode": "reuse",
-                }),
-                vec![team_uri(&team_name), inbox_uri(&team_name, &worker_name)],
-            ));
-        }
-
-        // Upsert identity + execution (only after validation and liveness check)
-        let record = MemberRecord {
-            profile: crate::team_mode::domain::MemberProfile {
-                team_id: team_name.clone(),
-                name: worker_name.clone(),
-                kind: MemberKind::Member,
-                role_label: "worker".into(),
-                role_description: None,
-                status: MemberStatus::Active,
-                joined_at: existing
-                    .as_ref()
-                    .map(|e| e.profile.joined_at)
-                    .unwrap_or_else(chrono::Utc::now),
-            },
-            execution: Some(execution.clone()),
-        };
-        self.member_store.upsert(record.clone())?;
-        let prompt = execution
-            .system_prompt
-            .clone()
-            .unwrap_or_else(|| format!("You are {}", worker_name));
-        let mut config = SpawnConfig::new(
-            execution
-                .agent_name
-                .clone()
-                .unwrap_or_else(|| worker_name.clone()),
-            prompt,
-        );
-        config.model = execution.model.clone();
-        config.cwd = execution.cwd.as_ref().map(PathBuf::from);
-        config.env = execution.env.clone();
-        // Pass through whatever the caller stored — `None` means the
-        // backend CLI consults its own config (e.g. `~/.codex/config.toml`).
-        // No project-level hardcoding: a user who set `model_reasoning_effort
-        // = "high"` globally must see that take effect.
-        config.reasoning_effort = execution.reasoning_effort.clone();
-
-        let key = spawn_key(&team_name, &worker_name);
-        self.runtime_workers.upsert_state(
-            &team_name,
-            &worker_name,
-            &key,
-            execution.adapter.clone(),
-            STATE_STARTING,
-            None,
-        )?;
-        let orch = Arc::clone(&self.runtime_orchestrator);
-        let key_clone = key.clone();
-        let wname = worker_name.clone();
-        let handle = match self.async_runtime.block_on(async move {
-            orch.lock()
-                .await
-                .spawn_managed_member(key_clone, wname, config, backend_type)
-                .await
-        }) {
-            Ok(handle) => handle,
-            Err(err) => {
-                let _ = self.runtime_workers.upsert_state(
-                    &team_name,
-                    &worker_name,
-                    &key,
-                    execution.adapter.clone(),
-                    STATE_FAILED,
-                    Some(err.to_string()),
-                );
-                return Err(err);
-            }
-        };
-
-        let orch2 = Arc::clone(&self.runtime_orchestrator);
-        let key_for_rx = key.clone();
-        let output_rx = self
-            .async_runtime
-            .block_on(async move { orch2.lock().await.take_output_receiver(&key_for_rx) })
-            .ok()
-            .flatten();
-
-        // Ready-check: drain until first TurnComplete / Idle / Error / process exit.
-        //
-        // No timeout: different adapters have very different cold-start costs
-        // (codex on Windows can take 10-15s, claude-code ~2s). Capping with
-        // a fixed timeout caused the caller to receive `state="starting"` for
-        // slow starters, which then never got updated to "running" because
-        // nothing downstream transitions that state. Instead we wait for an
-        // unambiguous terminal signal — success or explicit failure. If a
-        // worker truly hangs forever, the caller can interrupt the MCP call.
-        let (rx_for_loop, ready_state) = if let Some(mut rx) = output_rx {
-            let (reported_state, remaining_rx) = self.async_runtime.block_on(async move {
-                let result = async {
-                    loop {
-                        match rx.recv().await {
-                            Some(AgentOutput::TurnComplete) | Some(AgentOutput::Idle) => {
-                                return Ok::<(), String>(());
-                            }
-                            Some(AgentOutput::Error(e)) => {
-                                return Err(format!("agent error during startup: {e}"));
-                            }
-                            Some(_) => continue,
-                            None => return Err("agent process exited during startup".into()),
-                        }
-                    }
-                }
-                .await;
-                let state = match result {
-                    Ok(()) => "running",
-                    Err(_) => "failed",
-                };
-                (state, rx)
-            });
-
-            if reported_state == "failed" {
-                // Clean up: remove the profile we just wrote, reset status
-                let _ = self.member_store.mark_removed(&team_name, &worker_name);
-                let _ = self.runtime_workers.upsert_state(
-                    &team_name,
-                    &worker_name,
-                    &key,
-                    execution.adapter.clone(),
-                    STATE_FAILED,
-                    Some("agent process exited during startup".into()),
-                );
-                return Err(Error::Other(format!(
-                    "worker '{worker_name}' failed to start"
-                )));
-            }
-
-            (Some(remaining_rx), reported_state.to_string())
-        } else {
-            (None, handle.session_state.as_str().to_string())
-        };
-
-        // Persist runtime session_state to disk so worker_list reflects the live
-        // status (otherwise it always reads back "not-spawned" from the initial
-        // upsert done before spawn_managed_member).
-        let persisted_state = match ready_state.as_str() {
-            "running" => Some(ExecutionSessionState::Running),
-            "starting" => Some(ExecutionSessionState::Starting),
-            _ => None,
-        };
-        let session_id = self.async_runtime.block_on({
-            let orch = Arc::clone(&self.runtime_orchestrator);
-            let key = key.clone();
-            async move { orch.lock().await.session_id_of(&key) }
-        });
-        if let Some(state) = persisted_state {
-            let _ = self.member_store.update(&team_name, &worker_name, |m| {
-                if let Some(exec) = m.execution.as_mut() {
-                    exec.session_state = Some(state);
-                    if session_id.is_some() {
-                        exec.session_id = session_id.clone();
-                    }
-                }
-            });
-        }
-        let _ = self.runtime_workers.upsert_state(
-            &team_name,
-            &worker_name,
-            &key,
-            execution.adapter.clone(),
-            ready_state.as_str(),
-            None,
-        );
-
-        if let Some(rx) = rx_for_loop {
-            let agent_loop = AgentLoop {
-                member_id: worker_name.clone(),
-                session_key: key.clone(),
-                team_id: team_name.clone(),
-                room_id: "main".into(),
-                orchestrator: Arc::clone(&self.runtime_orchestrator),
-                inbox_service: self.inbox_service.clone(),
-                message_store: self.message_store.clone(),
-                message_service: self.message_service.clone(),
-                poll_interval: Duration::from_secs(5),
-                inbox_notifier: Some(self.inbox_notifier.clone()),
-                member_store: Some(self.member_store.clone()),
-            };
-            let loop_handle = agent_loop.start(rx);
-            self.loop_handles
-                .lock()
-                .unwrap()
-                .insert(key.clone(), loop_handle);
-        }
-
-        let mode_str = match mode {
-            WorkerAddMode::Reuse => "reuse",
-            WorkerAddMode::Overwrite => "overwrite",
-            WorkerAddMode::Create => "create",
-        };
-
-        let mut payload = json!({
-            "team": team_name.clone(),
-            "name": worker_name.clone(),
-            "sessionState": ready_state,
-            "mode": mode_str,
-        });
-        if let Value::Object(map) = &mut payload {
-            if revived_from_dead {
-                map.insert("revived_from_dead".into(), Value::Bool(true));
-                map.insert(
-                    "note".into(),
-                    Value::String(
-                        "Previous worker process was dead — its stale session was \
-                         dropped and a fresh process spawned. The worker has a new \
-                         conversation context (no memory of prior turns)."
-                            .into(),
-                    ),
-                );
-            }
-            // Reach out only on the create path: reuse already returns
-            // because the worker has been observed before, so the lead
-            // already knows the session_id timing trick.
-            if matches!(mode, WorkerAddMode::Create) {
-                map.insert(
-                    "hint".into(),
-                    Value::String(
-                        "Worker process started. Its backend session_id is captured \
-                         after the FIRST `type:result` event — i.e. once you send the \
-                         first @mention message and the worker replies. Until then, \
-                         the web UI 'process session' pane shows a placeholder for \
-                         this worker."
-                            .into(),
-                    ),
-                );
-            }
-        }
-
-        Ok(success_with_updates(
-            payload,
-            vec![team_uri(&team_name), inbox_uri(&team_name, &worker_name)],
-        ))
-    }
-
-    fn worker_remove(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
-        let team_name = required_identifier(args, "team")?;
-        let worker_name = required_identifier(args, "name")?;
-        if worker_name == LEAD_NAME {
-            return Err(Error::Other(
-                "the team lead cannot be removed via worker_remove".into(),
-            ));
-        }
-        let key = spawn_key(&team_name, &worker_name);
-
-        // Shut down process (best-effort)
-        let orch = Arc::clone(&self.runtime_orchestrator);
-        let key_clone = key.clone();
-        let _ = self
-            .async_runtime
-            .block_on(async move { orch.lock().await.shutdown_managed_member(&key_clone).await });
-        if let Some(h) = self.loop_handles.lock().unwrap().remove(&key) {
-            let _ = h.shutdown_tx.send(());
-        }
-        let _ = self.runtime_workers.upsert_state(
-            &team_name,
-            &worker_name,
-            &key,
-            None,
-            STATE_STOPPED,
-            None,
-        );
-
-        // Soft-remove: status=Removed but keep execution for fast-resume.
-        let changed = self.member_store.mark_removed(&team_name, &worker_name)?;
-        if !changed {
-            return Err(Error::MemberNotFound {
-                team: team_name,
-                member: worker_name,
-            });
-        }
-
-        Ok(success_with_updates(
-            json!({ "ok": true, "team": team_name.clone(), "name": worker_name.clone() }),
-            vec![team_uri(&team_name), inbox_uri(&team_name, &worker_name)],
-        ))
-    }
-
-    fn worker_list(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
-        let team_name = required_identifier(args, "team")?;
-        let members = self.member_service.list_active(&team_name)?;
-
-        // Cross-reference stored session_state with actual process liveness
-        // from the orchestrator. The stored state lags reality: if a worker
-        // process crashes or is killed externally, the agent_loop detects
-        // it and exits, but nothing updates member_store — so a subsequent
-        // `worker_list` would still say "running". For the lead's benefit
-        // (especially in long-running task coordination), expose the live
-        // view: stored="running" but orchestrator says "not alive" -> "dead".
-        let orch = Arc::clone(&self.runtime_orchestrator);
-        let workers: Vec<Value> = members
-            .into_iter()
-            .filter(|r| !matches!(r.profile.kind, MemberKind::Lead))
-            // Exclude the synthetic `user` member auto-created when the web
-            // UI sends its first message. It has no execution profile, so
-            // the liveness probe below would falsely flag it as "dead" and
-            // suggest revival via `worker_add reuse` — confusing UX. The
-            // web user is a sender identity, not a worker.
-            .filter(|r| {
-                let label = r.profile.role_label.as_str();
-                let name = r.profile.name.as_str();
-                label != crate::team_mode_web::read_model::WEB_USER_ROLE_LABEL
-                    && name != crate::team_mode_web::read_model::WEB_USER_SENDER
-            })
-            .map(|record| {
-                let adapter = record
-                    .execution
-                    .as_ref()
-                    .and_then(|e| e.adapter.clone())
-                    .unwrap_or_default();
-                let stored_state = record
-                    .execution
-                    .as_ref()
-                    .and_then(|e| e.session_state.as_ref())
-                    .map(|s| s.as_str())
-                    .unwrap_or("not-spawned")
-                    .to_string();
-
-                // Only run the liveness query when the stored state CLAIMS
-                // running — otherwise `not-spawned` / `failed` / `removed`
-                // are already accurate and we save the orchestrator lock.
-                let sidecar_state = self
-                    .runtime_workers
-                    .state_for(&team_name, &record.profile.name)
-                    .ok()
-                    .flatten();
-                let session_state = if sidecar_state.as_deref() == Some(STATE_DEAD) {
-                    STATE_DEAD.to_string()
-                } else if stored_state == "running" {
-                    let key = spawn_key(&team_name, &record.profile.name);
-                    let orch = Arc::clone(&orch);
-                    let alive = self.async_runtime.block_on(async move {
-                        orch.lock().await.is_alive(&key).await.unwrap_or(false)
-                    });
-                    if alive {
-                        STATE_RUNNING.to_string()
-                    } else {
-                        STATE_DEAD.to_string()
-                    }
-                } else {
-                    sidecar_state.unwrap_or(stored_state)
-                };
-
-                json!({
-                    "name": record.profile.name,
-                    "adapter": adapter,
-                    "sessionState": session_state,
-                })
-            })
-            .collect();
-        let dead_names: Vec<String> = workers
-            .iter()
-            .filter_map(|w| {
-                let state = w.get("sessionState")?.as_str()?;
-                if state == "dead" {
-                    w.get("name")?.as_str().map(String::from)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mut payload = json!({ "workers": workers });
-        if !dead_names.is_empty() {
-            if let Value::Object(map) = &mut payload {
-                map.insert(
-                    "hint".into(),
-                    Value::String(format!(
-                        "Dead workers found: [{}]. Revive each with \
-                         `worker_add name=<x> on_existing=reuse`. The worker \
-                         will lose its prior conversation context but its \
-                         saved profile (adapter / model / system_prompt) \
-                         is reused automatically.",
-                        dead_names.join(", ")
-                    )),
-                );
-            }
-        }
-        Ok(success(payload))
-    }
-
-    fn send_message(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
-        let team_name = required_identifier(args, "team")?;
-        let text = required_text(args, "text")?;
-
-        let _team = self
-            .team_service
-            .get(&team_name)?
-            .ok_or_else(|| Error::TeamNotFound {
-                name: team_name.clone(),
-            })?;
-
-        // Mandatory: text must contain at least one @handle.
-        let body_handles = extract_handles(&text);
-        if body_handles.is_empty() {
-            return Err(Error::Other(
-                "send_message requires at least one @handle in `text` naming an active worker"
-                    .into(),
-            ));
-        }
-
-        // Build active worker set (excluding lead). Also build a lowercase
-        // index so the mention parser can be case-insensitive while still
-        // routing to the canonically-cased name on disk.
-        let members = self.member_service.list_active(&team_name)?;
-        let active_workers: Vec<String> = members
-            .iter()
-            .filter(|r| !matches!(r.profile.kind, MemberKind::Lead))
-            .map(|r| r.profile.name.clone())
-            .collect();
-        let lc_index: HashMap<String, String> = active_workers
-            .iter()
-            .map(|n| (n.to_lowercase(), n.clone()))
-            .collect();
-
-        // Resolve @handles case-insensitively. Each user-visible handle in
-        // `body_handles` becomes the on-disk worker name when matched, or
-        // stays as the raw handle if unmatched (for the error message).
-        let mut resolved: Vec<String> = Vec::new();
-        let mut unmatched: Vec<String> = Vec::new();
-        for h in &body_handles {
-            match lc_index.get(&h.to_lowercase()) {
-                Some(canonical) => {
-                    if !resolved.iter().any(|r| r == canonical) {
-                        resolved.push(canonical.clone());
-                    }
-                }
-                None => {
-                    if !unmatched.iter().any(|u| u == h) {
-                        unmatched.push(h.clone());
-                    }
-                }
-            }
-        }
-        if !unmatched.is_empty() {
-            let mut active_sorted: Vec<_> = active_workers.iter().cloned().collect();
-            active_sorted.sort();
-            return Err(Error::Other(format!(
-                "send_message: unmatched @mentions {:?}. Active workers in team '{}': {:?}. \
-                 (Mention matching is case-insensitive; check spelling.)",
-                unmatched, team_name, active_sorted
-            )));
-        }
-
-        // Liveness pre-check: any recipient whose process is dead would
-        // otherwise sit in their inbox forever (the agent_loop that would
-        // post a [SYSTEM] death notice only exists while the worker is
-        // alive, so a daemon-restart scenario silently strands the lead).
-        // For each dead recipient we synthesize a [SYSTEM] Status reply
-        // immediately, route it via lead-observability, and drop the
-        // recipient from the dispatch.
-        let room_id = "main".to_string();
-        self.room_service.ensure_main_room(&team_name)?;
-
-        let mut live_recipients: Vec<String> = Vec::new();
-        let mut dead_recipients: Vec<String> = Vec::new();
-        for recipient in &resolved {
-            let key = spawn_key(&team_name, recipient);
-            let alive = self.async_runtime.block_on({
-                let orch = Arc::clone(&self.runtime_orchestrator);
-                let key = key.clone();
-                async move { orch.lock().await.is_alive(&key).await.unwrap_or(false) }
-            });
-            if alive {
-                live_recipients.push(recipient.clone());
-            } else {
-                dead_recipients.push(recipient.clone());
-            }
-        }
-
-        // Emit [SYSTEM] notice for each dead recipient up-front so the lead
-        // does not wait on the Stop hook shepherd for a reply that will
-        // never arrive.
-        let mut system_notices: Vec<Value> = Vec::new();
-        for dead in &dead_recipients {
-            let notice = format!(
-                "[SYSTEM] worker '{dead}' is not alive — message not delivered. \
-                 Use `worker_add name={dead} on_existing=reuse` to spawn a fresh \
-                 process (the worker will lose prior conversation context)."
-            );
-            let sys_msg = self.message_service.send(SendMessageRequest {
-                team_id: team_name.clone(),
-                room_id: room_id.clone(),
-                sender: dead.clone(),
-                kind: MessageKind::Status,
-                subject: None,
-                body: notice.clone(),
-                mentions: Vec::new(),
-                visibility: Vec::new(),
-                audience_policy: None,
-                reply_to: None,
-                thread_id: None,
-                expires_at: None,
-            });
-            match sys_msg {
-                Ok(m) => system_notices.push(json!({
-                    "worker": dead,
-                    "message_id": m.id,
-                    "text": notice,
-                })),
-                Err(err) => {
-                    tracing::warn!(
-                        worker = %dead,
-                        error = %err,
-                        "failed to write [SYSTEM] dead-worker notice"
-                    );
-                }
-            }
-        }
-
-        if live_recipients.is_empty() {
-            // All targeted workers were dead. Don't write a no-op dispatch
-            // — return a structured error listing the dead names so the
-            // tool caller sees the failure without scrolling through the
-            // [SYSTEM] reply chain.
-            return Err(Error::Other(format!(
-                "send_message: all targeted workers are dead {:?} in team '{}'. \
-                 [SYSTEM] notices have been posted to the lead inbox. \
-                 Restart with `worker_add on_existing=reuse` before retrying.",
-                dead_recipients, team_name
-            )));
-        }
-
-        // Rewrite the body so the dispatch only carries live mentions. The
-        // worker text routing already filters, but pruning here keeps the
-        // visible body clean. We replace each dead @handle with [worker
-        // unavailable: name] inline.
-        let mut filtered_body = text.clone();
-        for dead in &dead_recipients {
-            // Try canonical case first, then the raw handle as it appeared.
-            let pat = format!("@{dead}");
-            filtered_body = filtered_body
-                .replace(&pat, &format!("[worker unavailable: {dead}]"));
-        }
-        // Mentions for live recipients are already in `filtered_body`. The
-        // message_service will re-parse and route to live ones only.
-
-        let message = self.message_service.send(SendMessageRequest {
-            team_id: team_name.clone(),
-            room_id: room_id.clone(),
-            sender: LEAD_NAME.into(),
-            kind: MessageKind::Dispatch,
-            subject: None,
-            body: filtered_body,
-            mentions: live_recipients.clone(),
-            visibility: Vec::new(),
-            audience_policy: None,
-            reply_to: None,
-            thread_id: None,
-            expires_at: None,
-        })?;
-
-        let mut updated = vec![
-            team_uri(&team_name),
-            room_uri(&team_name, &room_id),
-            thread_uri(&team_name, message.thread_id.as_deref().unwrap_or("")),
-        ];
-        updated.extend(
-            message
-                .effective_recipients
-                .iter()
-                .map(|recipient| inbox_uri(&team_name, recipient)),
-        );
-
-        let matched_recipients: Vec<Value> = message
-            .effective_recipients
-            .iter()
-            .cloned()
-            .map(Value::String)
-            .collect();
-
-        let mut payload = json!({
-            "message": message,
-            "matched_recipients": matched_recipients,
-        });
-        if let Value::Object(map) = &mut payload {
-            // Always reinforce the "no polling" rule on every successful
-            // send. The whole reason for putting it here (vs the static
-            // tool description) is that this is the moment the model is
-            // most tempted to follow up with a sleep / inbox_read loop.
-            map.insert(
-                "hint".into(),
-                Value::String(
-                    "Replies will arrive automatically as a <system-reminder> \
-                     when your next turn starts. Do NOT call inbox_read or \
-                     sleep — just end your turn and continue when reminded. \
-                     If reminders never arrive (worker IS replying — check \
-                     `.lead-pending-wake.log` for new entries), the Stop hook \
-                     in `.claude/settings.json` is not loaded. Fully restart \
-                     Claude Code (NOT just `/mcp reconnect` — hooks only load \
-                     at CC startup). After any change to `.mcp.json` or \
-                     `.claude/settings.json`, a full CC restart is required."
-                        .into(),
-                ),
-            );
-            if !dead_recipients.is_empty() {
-                map.insert(
-                    "dead_recipients".into(),
-                    Value::Array(
-                        dead_recipients
-                            .iter()
-                            .cloned()
-                            .map(Value::String)
-                            .collect::<Vec<_>>(),
-                    ),
-                );
-                map.insert("system_notices".into(), Value::Array(system_notices));
-                let dead_names = dead_recipients.join(", ");
-                map.insert(
-                    "dead_recipients_hint".into(),
-                    Value::String(format!(
-                        "Workers [{dead_names}] were skipped because their process is gone. \
-                         Revive each with `worker_add name=<x> on_existing=reuse` (the worker \
-                         loses prior conversation context) before retrying."
-                    )),
-                );
-            }
-        }
-
-        Ok(success_with_updates(payload, updated))
-    }
-
-    fn inbox_read(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
-        let team_name = required_identifier(args, "team")?;
-        let limit = optional_usize(args, "limit")?.unwrap_or(20).clamp(1, 100);
-        let unread_only = optional_bool(args, "unread_only")?.unwrap_or(true);
-        let auto_ack = optional_bool(args, "auto_ack")?.unwrap_or(false);
-
-        self.team_service
-            .get(&team_name)?
-            .ok_or_else(|| Error::TeamNotFound {
-                name: team_name.clone(),
-            })?;
-
-        let inbox = self.inbox_service.peek(&team_name, LEAD_NAME, None)?;
-
-        let mut items: Vec<_> = inbox
-            .items
-            .into_iter()
-            .filter(|item| {
-                if !unread_only {
-                    return true;
-                }
-                !matches!(item.status, crate::team_mode::domain::InboxStatus::Acked)
-            })
-            .collect();
-        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        items.truncate(limit);
-
-        let mut messages_out: Vec<Value> = Vec::with_capacity(items.len());
-        let mut ack_ids: Vec<String> = Vec::with_capacity(items.len());
-        for item in items {
-            let message = match self.message_store.get(&team_name, &item.message_id) {
-                Ok(Some(m)) => m,
-                _ => continue,
-            };
-            messages_out.push(json!({
-                "id": message.id,
-                "from": message.sender,
-                "kind": kind_to_str(&message.kind),
-                "text": message.body,
-                "reply_to": message.reply_to,
-                "thread_id": message.thread_id,
-                "status": status_to_str(&item.status),
-                "created_at": message.created_at,
-            }));
-            ack_ids.push(message.id);
-        }
-
-        if auto_ack && !ack_ids.is_empty() {
-            let _ = self.inbox_service.read(&team_name, LEAD_NAME, &ack_ids);
-            let _ = self.inbox_service.ack(&team_name, LEAD_NAME, &ack_ids);
-        }
-
-        let unread_count = self
-            .inbox_service
-            .count(&team_name, LEAD_NAME, None)
-            .map(|c| c.unread)
-            .unwrap_or(0);
-
-        let mut payload = json!({
-            "team": team_name,
-            "lead": LEAD_NAME,
-            "unread_count": unread_count,
-            "total_returned": messages_out.len(),
-            "messages": messages_out,
-        });
-        // Inbox is a fallback channel — when it returns nothing, surface a
-        // hint so the model doesn't fall into a poll loop. The Stop hook
-        // delivers replies as `<system-reminder>` automatically; calling
-        // this tool without backlog-checking intent is wasted work.
-        if messages_out.is_empty() {
-            if let Value::Object(map) = &mut payload {
-                map.insert(
-                    "hint".into(),
-                    Value::String(
-                        "No messages in inbox. Worker replies arrive automatically \
-                         via the Stop hook on your next turn — calling inbox_read \
-                         is rarely needed; only useful for explicit backlog audits."
-                            .into(),
-                    ),
-                );
-            }
-        }
-        Ok(success(payload))
     }
 
     fn member_store_members_file_hint(&self, team_name: &str) -> String {
@@ -1926,6 +1051,57 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("unmatched"), "got: {msg}");
         assert!(msg.contains("typo"), "got: {msg}");
+    }
+
+    #[test]
+    fn send_message_unmatched_lists_available_handles_with_lead() {
+        let dir = tempdir().unwrap();
+        let tools = TeamModeToolset::new(dir.path());
+        tools
+            .call_tool("team_create", Some(json!({"name": "demo"})))
+            .unwrap();
+
+        // Bug 29: error must point the model at @lead so a confused
+        // caller can fall back to addressing the lead instead of guessing.
+        let err = tools
+            .call_tool(
+                "send_message",
+                Some(json!({
+                    "team": "demo",
+                    "text": "@nope please",
+                })),
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("@lead"),
+            "error should suggest @lead as a valid handle, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn send_message_lead_no_mention_lists_available_handles() {
+        let dir = tempdir().unwrap();
+        let tools = TeamModeToolset::new(dir.path());
+        tools
+            .call_tool("team_create", Some(json!({"name": "demo"})))
+            .unwrap();
+
+        // Lead with no @mention: error must include the available handles
+        // (so the LLM can self-correct without scrolling for `worker_list`).
+        let err = tools
+            .call_tool(
+                "send_message",
+                Some(json!({
+                    "team": "demo",
+                    "text": "no mention here",
+                    "_caller_member": "lead",
+                })),
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("@handle"), "got: {msg}");
+        assert!(msg.contains("Active recipients"), "got: {msg}");
     }
 
     #[test]

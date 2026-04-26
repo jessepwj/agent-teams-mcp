@@ -23,16 +23,33 @@ pub struct DaemonToolClient {
     base_dir: PathBuf,
     project_root: PathBuf,
     owner_cc_pid: Option<u32>,
+    /// Caller identity for daemon RPCs — populated from the relay process's
+    /// own env. When this relay was spawned by a worker subprocess (via the
+    /// worker's auto-loaded .mcp.json or injected codex config), the daemon
+    /// passes `TEAM_MODE_TEAM` and `TEAM_MODE_MEMBER` env vars; we read them
+    /// here and attach them to every tool call so the daemon knows the
+    /// real sender. When unset (the lead's own MCP relay started by Claude
+    /// Code from the project's .mcp.json), we default to lead — that's the
+    /// historical behavior and matches the implicit assumption everywhere.
+    caller_team: Option<String>,
+    caller_member: String,
     cached_info: Mutex<Option<DaemonInfo>>,
     next_id: AtomicU64,
 }
 
 impl DaemonToolClient {
     pub fn new(base_dir: impl Into<PathBuf>, project_root: impl Into<PathBuf>) -> Self {
+        let caller_team = std::env::var("TEAM_MODE_TEAM").ok().filter(|s| !s.is_empty());
+        let caller_member = std::env::var("TEAM_MODE_MEMBER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "lead".to_string());
         Self {
             base_dir: base_dir.into(),
             project_root: project_root.into(),
             owner_cc_pid: current_parent_pid(),
+            caller_team,
+            caller_member,
             cached_info: Mutex::new(None),
             next_id: AtomicU64::new(1),
         }
@@ -84,6 +101,7 @@ impl DaemonToolClient {
         let lock_path = data_dir::lock_path(&self.base_dir, "daemon-start");
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
@@ -185,7 +203,7 @@ impl DaemonToolClient {
             Err(Error::Timeout { seconds: 5 })
         })();
 
-        let _ = lock.unlock();
+        let _ = fs2::FileExt::unlock(&lock);
         result
     }
 
@@ -244,6 +262,14 @@ impl TeamModeToolExecutor for DaemonToolClient {
                 "context": {
                     "owner_cc_pid": self.owner_cc_pid,
                     "project_root": self.project_root,
+                    // Bug 29: caller identity for sender attribution. The
+                    // daemon's `inject_call_context` lifts these into
+                    // `_caller_team` / `_caller_member` arguments so
+                    // identity-aware tools (send_message, etc.) can
+                    // attribute the action to the correct member instead
+                    // of forging "lead".
+                    "caller_team": self.caller_team,
+                    "caller_member": self.caller_member,
                 }
             })),
         )?;

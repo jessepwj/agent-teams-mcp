@@ -77,9 +77,7 @@ pub fn serve_daemon(base_dir: PathBuf, project_root: PathBuf, token: String) -> 
         std::thread::Builder::new()
             .name("lead-watchdog".into())
             .spawn(move || run_lead_watchdog(team_store, toolset))
-            .map_err(|err| {
-                Error::Other(format!("failed to spawn lead-watchdog thread: {err}"))
-            })?;
+            .map_err(|err| Error::Other(format!("failed to spawn lead-watchdog thread: {err}")))?;
     }
 
     for incoming in listener.incoming() {
@@ -262,15 +260,40 @@ fn run_lead_watchdog(team_store: TeamStore, toolset: Arc<TeamModeToolset>) {
 }
 
 fn inject_call_context(arguments: &mut Option<Value>, params: &Value) {
-    let Some(owner_cc_pid) = params
-        .get("context")
-        .and_then(|context| context.get("owner_cc_pid"))
-        .and_then(Value::as_u64)
-    else {
-        return;
-    };
+    let context = params.get("context");
+
+    // Materialize an empty object if the caller didn't pass one but we
+    // have context fields to inject — otherwise tools that depend on
+    // _caller_member would silently miss it just because the caller
+    // omitted other arguments.
+    if context.is_some() && arguments.is_none() {
+        *arguments = Some(json!({}));
+    }
     let Some(Value::Object(args)) = arguments else {
         return;
     };
-    args.insert("_owner_cc_pid".into(), json!(owner_cc_pid));
+
+    if let Some(owner_cc_pid) = context
+        .and_then(|c| c.get("owner_cc_pid"))
+        .and_then(Value::as_u64)
+    {
+        args.insert("_owner_cc_pid".into(), json!(owner_cc_pid));
+    }
+    // Bug 29: identity passthrough. We always inject `_caller_member`
+    // (defaults to "lead" when absent — preserves historical behavior
+    // for any client that doesn't set the env). `_caller_team` is only
+    // injected when present so tools can distinguish "this caller has
+    // no team affiliation" from "this caller is in team X".
+    let caller_member = context
+        .and_then(|c| c.get("caller_member"))
+        .and_then(Value::as_str)
+        .unwrap_or("lead")
+        .to_string();
+    args.insert("_caller_member".into(), json!(caller_member));
+    if let Some(caller_team) = context
+        .and_then(|c| c.get("caller_team"))
+        .and_then(Value::as_str)
+    {
+        args.insert("_caller_team".into(), json!(caller_team));
+    }
 }
