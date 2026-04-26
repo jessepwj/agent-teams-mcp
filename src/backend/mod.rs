@@ -252,10 +252,21 @@ impl SpawnConfigBuilder {
 /// Events emitted by a running agent session, delivered via an mpsc channel.
 #[derive(Debug, Clone)]
 pub enum AgentOutput {
-    /// A complete text message from the agent.
+    /// A complete text message from the agent (typically the final
+    /// assistant reply for the turn). When both `Message` and `Delta`
+    /// events arrive in the same turn, callers SHOULD prefer the last
+    /// `Message` text and discard the streaming deltas to avoid
+    /// duplicating the body.
     Message(String),
-    /// A streaming text delta (partial token).
+    /// A streaming text delta (partial token of the assistant reply).
     Delta(String),
+    /// Side-band output from a tool / shell command invoked by the
+    /// agent (e.g. codex's `EVENT_COMMAND_OUTPUT_DELTA` from `bash` or
+    /// `local_shell`). This is *observability data*, not part of the
+    /// final assistant reply — callers MUST NOT include it in the
+    /// message body that gets posted to the room. Surface it via logs
+    /// or a dedicated tool-call transcript instead.
+    ToolOutput(String),
     /// The agent finished a turn (ready for next input).
     TurnComplete,
     /// The agent is idle / waiting for work.

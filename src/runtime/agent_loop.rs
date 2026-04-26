@@ -105,19 +105,16 @@ impl AgentLoop {
         }
         tracing::info!(member = %self.member_id, "agent loop ready, polling inbox");
 
-        loop {
+        while let Ok(inbox) = self
+            .inbox_service
+            .peek(&self.team_id, &self.member_id, None)
+        {
             // 1. Poll inbox for unread messages directed at this member.
-            let unread = match self
-                .inbox_service
-                .peek(&self.team_id, &self.member_id, None)
-            {
-                Ok(inbox) => inbox
-                    .items
-                    .into_iter()
-                    .filter(|item| matches!(item.status, InboxStatus::Unread))
-                    .collect::<Vec<_>>(),
-                Err(_) => break,
-            };
+            let unread = inbox
+                .items
+                .into_iter()
+                .filter(|item| matches!(item.status, InboxStatus::Unread))
+                .collect::<Vec<_>>();
             tracing::debug!(member = %self.member_id, count = unread.len(), "inbox polled");
 
             for item in unread {
@@ -193,7 +190,7 @@ impl AgentLoop {
                         let _ = self.inbox_service.ack(
                             &self.team_id,
                             &self.member_id,
-                            &[message.id.clone()],
+                            std::slice::from_ref(&message.id),
                         );
                         return;
                     }
@@ -208,17 +205,47 @@ impl AgentLoop {
                 // otherwise. Without this guarantee, a worker that finishes a
                 // turn silently (LLM ignored the request, content was filtered,
                 // process died mid-turn) leaves the lead waiting forever.
-                let mut parts: Vec<String> = Vec::new();
+                // Codex emits BOTH `EVENT_AGENT_MESSAGE_DELTA` (token-by-
+                // token of the assistant reply) AND `EVENT_ITEM_COMPLETED`
+                // (the same reply as one final block). If we concatenated
+                // both, the body would contain the assistant text twice.
+                //
+                // Strategy: track the final `Message` separately from the
+                // streaming `Delta`s. If a `Message` arrived during this
+                // turn, it's the canonical complete reply — use it and
+                // discard the deltas. Otherwise (Claude Code, Gemini,
+                // codex turn that only streamed deltas), fall back to
+                // joining the deltas in order.
+                //
+                // `ToolOutput` (codex shell command stdout, etc.) is
+                // observability data only — we trace-log it but never
+                // include it in the body.
+                let mut deltas: Vec<String> = Vec::new();
+                let mut final_message: Option<String> = None;
+                let mut error_text: Option<String> = None;
                 let end_cause: TurnEndCause = loop {
                     match output_rx.recv().await {
-                        Some(AgentOutput::Message(text)) | Some(AgentOutput::Delta(text)) => {
-                            parts.push(text);
+                        Some(AgentOutput::Message(text)) => {
+                            // Last `Message` wins (some backends may emit
+                            // intermediate ones; the final one is the
+                            // committed reply).
+                            final_message = Some(text);
+                        }
+                        Some(AgentOutput::Delta(text)) => {
+                            deltas.push(text);
+                        }
+                        Some(AgentOutput::ToolOutput(text)) => {
+                            tracing::trace!(
+                                member = %self.member_id,
+                                "tool output ({} bytes) suppressed from reply body",
+                                text.len()
+                            );
                         }
                         Some(AgentOutput::TurnComplete) | Some(AgentOutput::Idle) => {
                             break TurnEndCause::TurnComplete;
                         }
                         Some(AgentOutput::Error(e)) => {
-                            parts.push(format!("[agent error: {e}]"));
+                            error_text = Some(format!("[agent error: {e}]"));
                             break TurnEndCause::AgentError;
                         }
                         None => {
@@ -232,6 +259,18 @@ impl AgentLoop {
                         }
                     }
                 };
+                // Prefer the canonical complete `Message` over delta
+                // accumulation to avoid the codex double-write. If only
+                // an error arrived (no Message, no Delta), surface the
+                // error text.
+                let mut parts: Vec<String> = match (final_message, deltas.is_empty()) {
+                    (Some(msg), _) => vec![msg],
+                    (None, false) => deltas,
+                    (None, true) => Vec::new(),
+                };
+                if let Some(err) = error_text {
+                    parts.push(err);
+                }
 
                 // 5. Always post EXACTLY ONE terminal message back to the room.
                 //
@@ -351,7 +390,11 @@ impl AgentLoop {
                 // so worker_add couldn't persist it — we do it here, lazily,
                 // after each turn. Idempotent: only writes if value changed.
                 if let Some(store) = &self.member_store {
-                    let sid = self.orchestrator.lock().await.session_id_of(&self.session_key);
+                    let sid = self
+                        .orchestrator
+                        .lock()
+                        .await
+                        .session_id_of(&self.session_key);
                     if let Some(sid) = sid {
                         let _ = store.update(&self.team_id, &self.member_id, |m| {
                             if let Some(exec) = m.execution.as_mut() {
@@ -666,9 +709,7 @@ mod tests {
     /// Helper to wire up an AgentLoop + scripted output channel.
     /// Returns the message_store and inbox_service so the test can assert
     /// what the agent_loop posted.
-    fn run_loop_with_script<F>(
-        script: F,
-    ) -> (MessageStore, InboxService)
+    fn run_loop_with_script<F>(script: F) -> (MessageStore, InboxService)
     where
         F: FnOnce(mpsc::Sender<AgentOutput>, mpsc::Receiver<String>) + Send + 'static,
     {

@@ -630,7 +630,16 @@ fn map_notification_to_output(notif: &JsonRpcNotification) -> Option<AgentOutput
             }
         }
         EVENT_COMMAND_OUTPUT_DELTA => {
-            // Command execution output delta from `params.delta`
+            // Shell/command execution output (e.g. `cat`, `grep`, `ls`,
+            // PowerShell terminal output with ANSI escapes). This is
+            // *tool transcript data*, NOT the assistant's reply. The
+            // previous mapping to `AgentOutput::Delta` caused the entire
+            // command stdout (file dumps, grep results, ANSI codes) to
+            // be concatenated into the worker's reply body, inflating a
+            // 200-word summary into a 50,000+ token payload.
+            //
+            // Map to `ToolOutput` so the agent loop can drop it from the
+            // body but still surface it via tracing for observability.
             let text = notif
                 .params
                 .as_ref()
@@ -641,7 +650,7 @@ fn map_notification_to_output(notif: &JsonRpcNotification) -> Option<AgentOutput
             if text.is_empty() {
                 None
             } else {
-                Some(AgentOutput::Delta(text.to_string()))
+                Some(AgentOutput::ToolOutput(text.to_string()))
             }
         }
         EVENT_ITEM_COMPLETED => {
