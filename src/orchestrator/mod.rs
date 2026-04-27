@@ -882,6 +882,7 @@ impl TeamOrchestrator {
 ///     .build()
 ///     .unwrap();
 /// ```
+#[derive(Default)]
 pub struct TeamOrchestratorBuilder {
     teams_base: Option<PathBuf>,
     tasks_base: Option<PathBuf>,
@@ -889,19 +890,6 @@ pub struct TeamOrchestratorBuilder {
     default_router: Option<Arc<dyn crate::backend::router::BackendRouter>>,
     #[cfg(feature = "checkpoint")]
     auto_checkpoint_repo: Option<PathBuf>,
-}
-
-impl Default for TeamOrchestratorBuilder {
-    fn default() -> Self {
-        Self {
-            teams_base: None,
-            tasks_base: None,
-            backends: HashMap::new(),
-            default_router: None,
-            #[cfg(feature = "checkpoint")]
-            auto_checkpoint_repo: None,
-        }
-    }
 }
 
 impl TeamOrchestratorBuilder {

@@ -299,7 +299,8 @@ mod tests {
                 skills: vec![],
                 session_state: Some(ExecutionSessionState::Running),
                 session_id: None,
-                    reasoning_effort: None,}),
+                reasoning_effort: None,
+            }),
         }
     }
 

@@ -23,7 +23,7 @@ pub struct MessageStore {
 #[serde(tag = "entryType", rename_all = "snake_case")]
 enum TranscriptEntry {
     Message {
-        message: Message,
+        message: Box<Message>,
     },
     Deleted {
         message_id: String,
@@ -87,6 +87,7 @@ impl MessageStore {
         for (index, line) in lines.iter().enumerate() {
             match serde_json::from_str::<TranscriptEntry>(line) {
                 Ok(TranscriptEntry::Message { message }) => {
+                    let message = *message;
                     if !snapshot.order_index.contains_key(&message.id) {
                         snapshot
                             .order_index
@@ -132,7 +133,7 @@ impl MessageStore {
         self.append_entry(
             team_id,
             &TranscriptEntry::Message {
-                message: message.clone(),
+                message: Box::new(message.clone()),
             },
         )
     }
@@ -219,7 +220,7 @@ impl MessageStore {
             self.append_entry(
                 team_id,
                 &TranscriptEntry::Message {
-                    message: message.clone(),
+                    message: Box::new(message.clone()),
                 },
             )?;
         }

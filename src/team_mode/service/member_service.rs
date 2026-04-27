@@ -116,7 +116,7 @@ impl MemberService {
 
         self.member_store
             .get(&request.team_id, &request.name)?
-            .ok_or_else(|| Error::MemberNotFound {
+            .ok_or(Error::MemberNotFound {
                 team: request.team_id,
                 member: request.name,
             })
@@ -220,7 +220,8 @@ mod tests {
                     skills: vec![],
                     session_state: Some(ExecutionSessionState::Running),
                     session_id: None,
-                    reasoning_effort: None,}),
+                    reasoning_effort: None,
+                }),
             })
             .unwrap();
 
@@ -282,7 +283,8 @@ mod tests {
                     skills: vec![],
                     session_state: None,
                     session_id: None,
-                    reasoning_effort: None,}),
+                    reasoning_effort: None,
+                }),
             })
             .unwrap();
 

@@ -102,7 +102,7 @@ impl FileLock {
 impl Drop for FileLock {
     fn drop(&mut self) {
         // Explicitly unlock before the fd/handle is closed.
-        let _ = self.file.unlock();
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 

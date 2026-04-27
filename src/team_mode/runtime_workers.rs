@@ -126,6 +126,15 @@ impl RuntimeWorkerStore {
             .map(|worker| worker.state))
     }
 
+    /// Snapshot every worker record currently in the sidecar. Used by the
+    /// background liveness watchdog to scan for processes that died
+    /// externally (kill, OOM, host crash) so the sidecar's `state` field
+    /// stays in sync with reality.
+    pub fn list_all(&self) -> Result<Vec<RuntimeWorkerRecord>> {
+        let file = self.read_file()?;
+        Ok(file.workers)
+    }
+
     fn update_file<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut RuntimeWorkersFile) -> Result<T>,
@@ -135,6 +144,7 @@ impl RuntimeWorkerStore {
         let lock_path = data_dir::lock_path(&self.base_dir, "runtime-workers");
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
@@ -150,7 +160,7 @@ impl RuntimeWorkerStore {
             Ok(value)
         })();
 
-        let _ = lock.unlock();
+        let _ = fs2::FileExt::unlock(&lock);
         result
     }
 

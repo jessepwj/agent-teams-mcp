@@ -303,7 +303,24 @@ impl AgentSession for GeminiCliSession {
     }
 
     async fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
+        // Fast path: explicit shutdown sets `alive=false`.
+        if !self.alive.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Slow path: gemini-cli spawns per-turn, so `child` is `None`
+        // between turns. Treat that as "alive" (the session itself is
+        // still valid; we just don't have a child process at this
+        // instant). When a child IS present and the OS doesn't see it,
+        // the worker was killed externally — flip to dead.
+        let Some(pid) = self.child.as_ref().and_then(|c| c.id()) else {
+            return true;
+        };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+            true,
+        );
+        sys.process(sysinfo::Pid::from_u32(pid)).is_some()
     }
 
     async fn shutdown(&mut self) -> Result<()> {

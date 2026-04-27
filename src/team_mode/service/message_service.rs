@@ -132,8 +132,12 @@ impl MessageService {
         }
 
         if effective_recipients.contains(&sender) {
+            // Match the user-facing wording the tool layer (`tools::message`)
+            // produces so workers and lead see consistent guidance regardless
+            // of which defensive check fires first.
             return Err(Error::Other(format!(
-                "member '{sender}' cannot send a message that mentions themselves"
+                "send_message: cannot send to yourself ('@{sender}'). \
+                 Did you mean @lead or another member?"
             )));
         }
 
@@ -178,7 +182,7 @@ impl MessageService {
         }
 
         let thread_id = self.resolve_thread_id(&team_id, &room_id, thread_id, reply_to.clone())?;
-        let audience_policy = audience_policy.or_else(|| {
+        let audience_policy = audience_policy.or({
             if effective_recipients.is_empty() {
                 None
             } else {
@@ -753,7 +757,7 @@ mod tests {
                 expires_at: None,
             })
             .unwrap_err();
-        assert!(err.to_string().contains("mentions themselves"));
+        assert!(err.to_string().contains("cannot send to yourself"));
     }
 
     // Silence "unused" lint for imports.

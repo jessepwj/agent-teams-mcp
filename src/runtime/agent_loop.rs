@@ -245,31 +245,89 @@ impl AgentLoop {
                     .count_self_messages_after(message.created_at)
                     .unwrap_or(0);
                 let mut error_text: Option<String> = None;
+                // Active liveness probe — independent background task.
+                //
+                // Why a separate task and not a recv-coupled timeout:
+                // codex on Windows keeps streaming buffered stdout events
+                // for up to ~20s after a hard kill. While that buffer is
+                // draining, every `recv()` returns Some(...) within
+                // milliseconds, so any timeout-on-recv approach never
+                // fires. We need a probe that runs in parallel with
+                // recv, on its own clock.
+                //
+                // Implementation: spawn a tokio task that polls
+                // `is_alive` every 3s. The first time it sees the
+                // process gone, it signals the recv loop via a oneshot
+                // channel. The recv loop selects between recv and the
+                // probe-dead signal — whichever fires first wins. The
+                // task is aborted at end of the turn whether by clean
+                // termination or probe.
+                let (probe_dead_tx, probe_dead_rx) = tokio::sync::oneshot::channel::<()>();
+                let probe_orch = Arc::clone(&self.orchestrator);
+                let probe_session_key = self.session_key.clone();
+                let probe_member = self.member_id.clone();
+                let probe_handle = tokio::spawn(async move {
+                    let mut tx = Some(probe_dead_tx);
+                    let mut interval = tokio::time::interval(Duration::from_secs(3));
+                    interval.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Delay,
+                    );
+                    // Skip the immediate first tick at t=0; give the
+                    // worker at least one probe interval to bring up.
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        let alive = {
+                            let orch = probe_orch.lock().await;
+                            orch.is_alive(&probe_session_key).await.unwrap_or(true)
+                        };
+                        if !alive {
+                            tracing::warn!(
+                                member = %probe_member,
+                                session_key = %probe_session_key,
+                                "liveness probe: worker process gone, signaling OutputClosed"
+                            );
+                            if let Some(tx) = tx.take() {
+                                let _ = tx.send(());
+                            }
+                            return;
+                        }
+                    }
+                });
+
+                tokio::pin!(probe_dead_rx);
                 let end_cause: TurnEndCause = loop {
-                    match output_rx.recv().await {
-                        Some(AgentOutput::Message(_))
-                        | Some(AgentOutput::Delta(_))
-                        | Some(AgentOutput::ToolOutput(_)) => {
-                            // Discarded for body purposes. Web UI still shows
-                            // the worker's transcript via the session JSONL
-                            // file (Claude/codex write it independently).
-                        }
-                        Some(AgentOutput::TurnComplete) | Some(AgentOutput::Idle) => {
-                            break TurnEndCause::TurnComplete;
-                        }
-                        Some(AgentOutput::Error(e)) => {
-                            error_text = Some(e);
-                            break TurnEndCause::AgentError;
-                        }
-                        None => {
-                            // Pipe closed mid-turn — child process died.
-                            // The lead must hear about this; fall through
-                            // to step 5 then exit the loop (there's nothing
-                            // left to read).
+                    tokio::select! {
+                        result = output_rx.recv() => match result {
+                            Some(AgentOutput::Message(_))
+                            | Some(AgentOutput::Delta(_))
+                            | Some(AgentOutput::ToolOutput(_)) => {
+                                // Discarded for body purposes. Web UI
+                                // still shows the worker's transcript via
+                                // the session JSONL file.
+                            }
+                            Some(AgentOutput::TurnComplete) | Some(AgentOutput::Idle) => {
+                                break TurnEndCause::TurnComplete;
+                            }
+                            Some(AgentOutput::Error(e)) => {
+                                error_text = Some(e);
+                                break TurnEndCause::AgentError;
+                            }
+                            None => {
+                                // Pipe closed cleanly — child died and
+                                // stdout drained.
+                                break TurnEndCause::OutputClosed;
+                            }
+                        },
+                        _ = &mut probe_dead_rx => {
+                            // Probe task detected the process is gone.
+                            // Stop draining buffered events — they will
+                            // be EOF anyway.
                             break TurnEndCause::OutputClosed;
                         }
                     }
                 };
+                probe_handle.abort();
 
                 // 5. Post a terminal `[SYSTEM]` notice ONLY for failure
                 // modes the worker can't surface itself. A clean

@@ -194,9 +194,9 @@ select {
 
 .composer-mention {
   display: inline-flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 2px;
-  padding: 0 8px;
+  padding: 6px 8px 4px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel);
@@ -207,12 +207,23 @@ select {
   background: transparent;
   color: inherit;
   font: inherit;
-  padding: 6px 4px;
+  padding: 2px 4px;
   outline: none;
   cursor: pointer;
-  /* Cap at the longest worker name so ultra-long custom names don't push
-     the textarea off-screen. */
-  max-width: 160px;
+  /* Multi-select listbox: show several rows so users see they can pick more
+     than one. Cap width so ultra-long worker names don't push the textarea
+     off-screen; the listbox itself scrolls horizontally if needed. */
+  max-width: 180px;
+  min-width: 110px;
+  /* Native multi-select renders as a list box with scroll once `size` is
+     set on the element; keep visible rows compact so the composer doesn't
+     dominate vertical space on small screens. */
+  max-height: 96px;
+}
+
+.composer-select option:checked {
+  background: var(--accent, #4c8bf5);
+  color: var(--accent-fg, #fff);
 }
 
 .composer-input {
@@ -517,6 +528,117 @@ select {
 
 .badge.warn {
   color: var(--warn);
+}
+
+/* Member runtime status pill — colored dot + label.
+ * Tones map to ExecutionSessionState semantics; see memberStatusMeta() in
+ * app-utils.js. The dot animates only for live transitions (running pulse,
+ * starting spin) so the eye is drawn to changing state, not idle workers. */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding: 0 8px 0 6px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  white-space: nowrap;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.status-pill.status-good {
+  color: var(--good);
+  border-color: rgba(76, 195, 138, 0.45);
+  background: rgba(76, 195, 138, 0.08);
+}
+.status-pill.status-good .status-dot {
+  background: var(--good);
+  box-shadow: 0 0 0 0 rgba(76, 195, 138, 0.6);
+}
+
+.status-pill.status-warn {
+  color: var(--warn);
+  border-color: rgba(224, 179, 74, 0.45);
+  background: rgba(224, 179, 74, 0.08);
+}
+.status-pill.status-warn .status-dot {
+  background: var(--warn);
+}
+
+.status-pill.status-bad {
+  color: var(--bad);
+  border-color: rgba(239, 107, 115, 0.45);
+  background: rgba(239, 107, 115, 0.08);
+}
+.status-pill.status-bad .status-dot {
+  background: var(--bad);
+}
+
+.status-pill.status-lead {
+  color: var(--accent);
+  border-color: rgba(73, 180, 195, 0.45);
+  background: rgba(73, 180, 195, 0.08);
+}
+.status-pill.status-lead .status-dot {
+  background: var(--accent);
+}
+
+.status-pill.status-muted {
+  color: var(--muted);
+  border-style: dashed;
+}
+.status-pill.status-muted .status-dot {
+  background: var(--muted);
+  opacity: 0.7;
+}
+
+/* Pulsing halo — process is alive and reachable. */
+.status-dot-pulse {
+  animation: status-pulse 1.8s ease-in-out infinite;
+}
+@keyframes status-pulse {
+  0% {
+    box-shadow: 0 0 0 0 currentColor;
+    opacity: 1;
+  }
+  70% {
+    box-shadow: 0 0 0 6px transparent;
+    opacity: 0.85;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    opacity: 1;
+  }
+}
+
+/* Spinning ring — process is booting. Dot becomes a hollow ring with a
+ * single bright arc rotating around it. */
+.status-dot-spin {
+  background: transparent !important;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  animation: status-spin 0.9s linear infinite;
+}
+@keyframes status-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot-pulse,
+  .status-dot-spin {
+    animation: none;
+  }
 }
 
 /* Per-sender colored badge.

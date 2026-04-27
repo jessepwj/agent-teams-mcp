@@ -100,7 +100,7 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
         let boundary = s[..=target.min(s.len().saturating_sub(1))]
             .char_indices()
             .map(|(i, _)| i)
-            .last()
+            .next_back()
             .unwrap_or(0);
         let truncated = &s[..boundary];
         format!("{truncated}...")

@@ -72,7 +72,29 @@ mcp__team-mode__send_message(
 **完成 turn 但没调 send_message 会怎样**：
 - lead 会收到 `[SYSTEM] worker 'X' completed turn without calling send_message` 通知
 - 这表明你这一轮"白干了"——可能漏了汇报，或者工作没完成
-- 正确做法：每次接到 lead 的 dispatch 后，**至少调一次** `send_message` 汇报状态（即使是说"我开始了，下一步要做 X"）
+- 正确做法：**任何 sender**（lead / user / 其他 worker）派给你的消息处理完后，**至少调一次** `send_message` 汇报状态（即使是说"我开始了，下一步要做 X"）
+
+**⚠️ 易错点：来自 `user` 的消息也必须调 `send_message` 回复**
+
+team-mode web UI 的人类用户会用 `user` 身份给你发消息（dispatch sender = `user`）。
+**不要**像普通聊天那样把答案写在 stdout 自然回复——**没人能看到你的 stdout**。
+处理 user 消息和处理 lead/worker 消息完全一样：必须显式调 `mcp__team-mode__send_message`，
+text 里 `@lead` 或 `@user` 把回答发出去。
+
+```
+错（codex 经常踩这个坑）：
+  收到 [Message from user]: 帮我看一下 .gitignore 的内容
+  → 在 stdout 输出 ".gitignore 的内容是 ..."
+  → turn 结束 → lead 收到 [SYSTEM] silent notice，user 永远等不到回答
+
+对：
+  收到 [Message from user]: 帮我看一下 .gitignore 的内容
+  → 在 stdout 私下读文件、思考
+  → 调 mcp__team-mode__send_message(team="X", text="@user .gitignore 的关键条目是 ...")
+  → user 在 web UI 收到回复
+```
+
+记住：**stdout 是私有思考；只有 send_message 工具调用才算"说话"**。这条规则跟 sender 是谁无关。
 
 **例子**：
 - 接到 lead 派任务后立刻确认：

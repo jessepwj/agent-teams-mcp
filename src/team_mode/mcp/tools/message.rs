@@ -134,9 +134,27 @@ impl TeamModeToolset {
             )));
         }
         if self_mentioned && resolved.is_empty() {
+            // For workers, suggesting @lead is helpful (it's the most common
+            // recipient). For lead itself, suggesting @lead would be the
+            // same self-mention that just got rejected — instead suggest
+            // any active worker.
+            let suggestion = if caller_is_lead {
+                let mut workers: Vec<String> = active_workers
+                    .iter()
+                    .filter(|n| n.as_str() != LEAD_NAME)
+                    .map(|n| format!("@{n}"))
+                    .collect();
+                workers.sort();
+                if workers.is_empty() {
+                    "Add a worker via worker_add and @-mention them.".to_string()
+                } else {
+                    format!("Did you mean one of {workers:?}?")
+                }
+            } else {
+                "Did you mean @lead or another member?".to_string()
+            };
             return Err(Error::Other(format!(
-                "send_message: cannot send to yourself ('@{caller_member}'). \
-                 Did you mean @lead or another member?"
+                "send_message: cannot send to yourself ('@{caller_member}'). {suggestion}"
             )));
         }
 
@@ -153,6 +171,15 @@ impl TeamModeToolset {
         let mut live_recipients: Vec<String> = Vec::new();
         let mut dead_recipients: Vec<String> = Vec::new();
         for recipient in &resolved {
+            // Lead is a virtual member, not a managed worker — it has no
+            // spawned process to check. Always treat as alive (the lead's
+            // inbox is delivered via the Stop hook push path, no agent_loop
+            // required). Without this short-circuit, workers messaging
+            // @lead would always hit "all targeted workers are dead [lead]".
+            if recipient == LEAD_NAME {
+                live_recipients.push(recipient.clone());
+                continue;
+            }
             let key = spawn_key(&team_name, recipient);
             let alive = self.async_runtime.block_on({
                 let orch = Arc::clone(&self.runtime_orchestrator);

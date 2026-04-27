@@ -65,19 +65,36 @@ impl CodexBackend {
 
     /// Spawn the Codex child process.
     fn spawn_child(&self, config: &SpawnConfig) -> Result<Child> {
-        // Bug 29: codex doesn't auto-discover .mcp.json in the project cwd
-        // (unlike claude CLI), and we don't want to write to the user's
-        // global ~/.codex/config.toml because each worker needs its own
-        // TEAM_MODE_MEMBER env. Solution: prepare a per-worker CODEX_HOME
-        // pointing at <cwd>/.agent-teams/<team>/codex-homes/<member>/
-        // with a config.toml that registers our team_mode_mcp relay as
-        // an MCP server. The temp config is wiped on team_delete (lives
-        // inside the team's data dir).
+        // Bug 29 — codex MCP server registration via user's GLOBAL
+        // ~/.codex/config.toml.
         //
-        // Returns the CODEX_HOME path on success; None when we can't
-        // resolve the relay binary or the cwd, in which case the worker
-        // spawns without team-mode MCP access (degraded but functional).
-        let codex_home = self.prepare_codex_home(config).ok();
+        // Why not CODEX_HOME isolation: codex auth lives under CODEX_HOME
+        // and uses single-use refresh tokens (openai/codex#15410), so
+        // copying auth.json into per-worker homes breaks on first refresh.
+        //
+        // Why not project-level `<cwd>/.codex/config.toml`: MCP servers
+        // in project config are silently ignored by codex
+        // (openai/codex#13025).
+        //
+        // Why not `-c mcp_servers.X.*` inline flags: empirically, codex
+        // does NOT spawn the MCP relay even when these flags are present
+        // (verified on 2026-04-26). Possibly the parser rejects array
+        // values (`args=[]`, `env_vars=["a","b"]`) silently.
+        //
+        // What works: write a managed block into the user's global
+        // `~/.codex/config.toml` (idempotent — the block is bracketed
+        // by markers so it can be safely re-written or removed). codex
+        // reads this on startup. `env_vars` lets it pass through
+        // TEAM_MODE_TEAM / TEAM_MODE_MEMBER from the worker process env
+        // to the MCP relay, so identity binding works without per-worker
+        // config files.
+        if let Err(e) = ensure_global_codex_mcp_config() {
+            tracing::warn!(
+                agent = %config.name,
+                error = %e,
+                "ensure_global_codex_mcp_config failed — codex worker may not see team-mode MCP server"
+            );
+        }
 
         let mut cmd = Command::new(&self.codex_path);
         // `codex app-server` reads JSON from stdin, writes JSON to stdout.
@@ -128,15 +145,6 @@ impl CodexBackend {
             cmd.env(k, v);
         }
 
-        // Apply CODEX_HOME last so it can't be silently overridden by a
-        // stray `config.env` entry. If preparation failed (no relay
-        // binary, no cwd), we leave codex to use its default home (no
-        // team-mode MCP access for this worker — onboarding teaches
-        // workers to detect and report this).
-        if let Some(home) = codex_home {
-            cmd.env("CODEX_HOME", home);
-        }
-
         cmd.kill_on_drop(true);
         let child = cmd.spawn().map_err(|e| Error::SpawnFailed {
             name: config.name.clone(),
@@ -146,71 +154,128 @@ impl CodexBackend {
         Ok(child)
     }
 
-    /// Prepare a per-worker CODEX_HOME directory containing a
-    /// `config.toml` that wires up the team-mode MCP relay with this
-    /// worker's identity baked into env. See spawn_child for context.
-    fn prepare_codex_home(&self, config: &SpawnConfig) -> Result<PathBuf> {
-        let team = config
-            .env
-            .get("TEAM_MODE_TEAM")
-            .cloned()
-            .ok_or_else(|| Error::Other("TEAM_MODE_TEAM env not set on codex worker".into()))?;
-        let member = config
-            .env
-            .get("TEAM_MODE_MEMBER")
-            .cloned()
-            .ok_or_else(|| Error::Other("TEAM_MODE_MEMBER env not set on codex worker".into()))?;
-        let cwd = config
-            .cwd
-            .as_ref()
-            .ok_or_else(|| Error::Other("codex worker has no cwd; can't compute CODEX_HOME".into()))?;
-        let relay_path = resolve_relay_exe()?;
+}
 
-        let home = cwd
-            .join(".agent-teams")
-            .join(&team)
-            .join("codex-homes")
-            .join(&member);
-        std::fs::create_dir_all(&home).map_err(|e| {
-            Error::Other(format!(
-                "failed to create codex home {}: {e}",
-                home.display()
-            ))
-        })?;
+/// Idempotently inject a managed `[mcp_servers."team-mode"]` block into
+/// the user's global `~/.codex/config.toml`. The block is bracketed by
+/// markers so subsequent calls update or skip in place. We never edit
+/// content outside the markers; user's other entries are preserved.
+///
+/// Why global instead of project-local: see `spawn_child` rationale.
+fn ensure_global_codex_mcp_config() -> Result<()> {
+    let codex_home = match std::env::var_os("CODEX_HOME") {
+        Some(p) => PathBuf::from(p),
+        None => {
+            // Fall back to <user-home>/.codex. Use USERPROFILE on
+            // Windows, HOME elsewhere — this matches what codex itself
+            // does when CODEX_HOME is unset.
+            let home = std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    Error::Other(
+                        "neither CODEX_HOME nor USERPROFILE/HOME is set; cannot \
+                         locate codex config"
+                            .into(),
+                    )
+                })?;
+            home.join(".codex")
+        }
+    };
 
-        // TOML is whitespace-tolerant but we still escape backslashes
-        // and quotes inside paths to keep Windows paths valid.
-        let relay_str = relay_path.display().to_string();
-        let cfg = format!(
-            r#"# Auto-generated by agent-teams-mcp for codex worker `{member}` in team `{team}`.
-# Do not edit by hand — regenerated on every worker_add.
+    std::fs::create_dir_all(&codex_home).map_err(|e| {
+        Error::Other(format!(
+            "failed to create codex home {}: {e}",
+            codex_home.display()
+        ))
+    })?;
 
-[mcp_servers.team-mode]
-command = "{relay}"
-args = []
+    let config_path = codex_home.join("config.toml");
+    let relay = resolve_relay_exe()?;
+    let relay_str = relay.display().to_string();
 
-[mcp_servers.team-mode.env]
-TEAM_MODE_TEAM = "{team}"
-TEAM_MODE_MEMBER = "{member}"
-"#,
-            member = member,
-            team = team,
-            relay = toml_escape(&relay_str),
-        );
-        std::fs::write(home.join("config.toml"), cfg).map_err(|e| {
-            Error::Other(format!(
-                "failed to write {}/config.toml: {e}",
-                home.display()
-            ))
-        })?;
-        Ok(home)
+    const BEGIN: &str = "# === BEGIN agent-teams-mcp managed (team-mode) ===";
+    const END: &str = "# === END agent-teams-mcp managed (team-mode) ===";
+    let block = format!(
+        "{begin}\n\
+         # Auto-managed by agent-teams-mcp. Do not edit by hand — this entire\n\
+         # block is regenerated on every codex worker spawn. Remove the markers\n\
+         # to keep manual edits across spawns.\n\
+         [mcp_servers.\"team-mode\"]\n\
+         type = \"stdio\"\n\
+         command = \"{cmd}\"\n\
+         args = []\n\
+         env_vars = [\"TEAM_MODE_TEAM\", \"TEAM_MODE_MEMBER\"]\n\
+         {end}\n",
+        begin = BEGIN,
+        cmd = toml_escape(&relay_str),
+        end = END,
+    );
+
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    let new_contents = match (existing.find(BEGIN), existing.find(END)) {
+        (Some(s), Some(e)) if e > s => {
+            // Replace the managed block in place. `e + END.len()` plus a
+            // possible trailing newline.
+            let end_byte = e + END.len();
+            let after_end = if existing[end_byte..].starts_with('\n') {
+                end_byte + 1
+            } else {
+                end_byte
+            };
+            let mut out = String::with_capacity(existing.len() + block.len());
+            out.push_str(&existing[..s]);
+            out.push_str(&block);
+            out.push_str(&existing[after_end..]);
+            out
+        }
+        _ => {
+            // Append. Ensure exactly one blank line separator.
+            let mut out = existing.clone();
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                if out.ends_with('\n') {
+                    out.push('\n');
+                } else {
+                    out.push_str("\n\n");
+                }
+            }
+            out.push_str(&block);
+            out
+        }
+    };
+
+    if new_contents == existing {
+        return Ok(()); // already up to date
     }
+
+    // Atomic write: write to .tmp, rename. Avoids corrupting the user's
+    // config if we crash mid-write.
+    let tmp_path = config_path.with_extension("toml.agent-teams-tmp");
+    std::fs::write(&tmp_path, &new_contents).map_err(|e| {
+        Error::Other(format!(
+            "failed to write {}: {e}",
+            tmp_path.display()
+        ))
+    })?;
+    std::fs::rename(&tmp_path, &config_path).map_err(|e| {
+        Error::Other(format!(
+            "failed to rename {} -> {}: {e}",
+            tmp_path.display(),
+            config_path.display()
+        ))
+    })?;
+    tracing::info!(
+        path = %config_path.display(),
+        "wrote team-mode MCP block to global codex config"
+    );
+    Ok(())
 }
 
 /// Resolve the team_mode_mcp relay binary. Mirrors `daemon_exe_path`
 /// in the daemon client: prefer the env var override, fall back to a
 /// sibling of the current executable. Used by codex worker spawn to
-/// register the relay in the per-worker codex config.toml.
+/// register the relay in the user's global ~/.codex/config.toml.
 fn resolve_relay_exe() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("TEAM_MODE_MCP_EXE") {
         return Ok(PathBuf::from(p));
@@ -546,7 +611,26 @@ impl AgentSession for CodexSession {
     }
 
     async fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
+        // Fast path: if our internal flag is already false (shutdown was
+        // called explicitly), the session is definitely dead.
+        if !self.alive.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Slow path: the flag is stale when the child is killed
+        // externally (taskkill, kill -9, OOM, host crash). Verify
+        // against the OS via sysinfo. Without this check, the active
+        // liveness probe + worker-liveness watchdog both think a
+        // killed worker is still alive, and the lead never receives
+        // an OutputClosed [SYSTEM] notice.
+        let Some(pid) = self.child.as_ref().and_then(|c| c.id()) else {
+            return false;
+        };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+            true,
+        );
+        sys.process(sysinfo::Pid::from_u32(pid)).is_some()
     }
 
     fn session_id(&self) -> Option<String> {
@@ -813,6 +897,11 @@ fn map_notification_to_output(notif: &JsonRpcNotification) -> Option<AgentOutput
                 .and_then(|p| p.get("message"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown error");
+            tracing::warn!(
+                event = "codex_error",
+                params = ?notif.params,
+                "codex EVENT_ERROR"
+            );
             Some(AgentOutput::Error(message.to_string()))
         }
         // Informational events -- no output needed

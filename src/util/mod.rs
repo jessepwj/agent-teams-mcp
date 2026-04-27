@@ -133,7 +133,10 @@ mod tests {
     #[test]
     fn slug_rejects_unicode() {
         let err = validate_slug_name("中文名").unwrap_err().to_string();
-        assert!(err.contains("not allowed") || err.contains("lowercase"), "got: {err}");
+        assert!(
+            err.contains("not allowed") || err.contains("lowercase"),
+            "got: {err}"
+        );
     }
 
     #[test]

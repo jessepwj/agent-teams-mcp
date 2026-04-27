@@ -22,6 +22,13 @@ const LEAD_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 /// that a genuinely-closed CC session reclaims workers promptly.
 const LEAD_WATCH_GRACE_CHECKS: u32 = 3;
 
+/// How often the worker-liveness watchdog reconciles the sidecar
+/// (`runtime/workers.json`) against the orchestrator's live view.
+/// Picked at 5s as a compromise between web-UI freshness and the
+/// per-tick orchestrator-lock overhead (each tick blocks on
+/// `is_alive` for every claimed-running worker).
+const WORKER_LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+
 pub fn serve_daemon(base_dir: PathBuf, project_root: PathBuf, token: String) -> Result<()> {
     data_dir::ensure_scaffold(&base_dir)?;
     std::fs::create_dir_all(crate::team_mode_daemon::runtime_dir(&base_dir))?;
@@ -78,6 +85,21 @@ pub fn serve_daemon(base_dir: PathBuf, project_root: PathBuf, token: String) -> 
             .name("lead-watchdog".into())
             .spawn(move || run_lead_watchdog(team_store, toolset))
             .map_err(|err| Error::Other(format!("failed to spawn lead-watchdog thread: {err}")))?;
+    }
+
+    // Worker-liveness watchdog: every 5s reconcile sidecar workers marked
+    // RUNNING/STARTING against the orchestrator's `is_alive` view, flipping
+    // sidecar to DEAD for processes that died externally. The web UI
+    // depends on this — it reads only the sidecar (no orchestrator
+    // access), so without periodic reconciliation an externally-killed
+    // worker would keep showing as "running" until the user invoked the
+    // `worker_list` MCP tool.
+    {
+        let toolset = Arc::clone(&toolset);
+        std::thread::Builder::new()
+            .name("worker-liveness".into())
+            .spawn(move || run_worker_liveness_watchdog(toolset))
+            .map_err(|err| Error::Other(format!("failed to spawn worker-liveness thread: {err}")))?;
     }
 
     for incoming in listener.incoming() {
@@ -171,6 +193,32 @@ fn handle_request(
 ///   one strike. After 3 strikes in a row, exit.
 /// - Any team regains a live lead (rare, e.g. PID reuse within a check
 ///   window) → reset the strike counter.
+/// Background watcher: periodically reconcile the sidecar's claimed
+/// per-worker `state` against the orchestrator's actual `is_alive` view.
+///
+/// Why this exists: when a worker process dies externally (kill -9, OOM,
+/// host crash), only the orchestrator notices via its agent-loop. The
+/// sidecar (`runtime/workers.json`) is a static file written at spawn
+/// time — nothing automatically marks it DEAD when a process disappears.
+/// The web UI reads ONLY the sidecar (it has no orchestrator handle), so
+/// without reconciliation a killed worker keeps showing "running" in the
+/// browser until the user invokes the `worker_list` MCP tool.
+///
+/// This watcher closes that gap. Every `WORKER_LIVENESS_INTERVAL` it
+/// scans sidecar entries marked RUNNING/STARTING and asks the orchestrator
+/// — if the process is gone, flip the sidecar to DEAD with a note. The
+/// next web-UI poll then renders the worker as dead.
+///
+/// Failure handling: any error inside `worker_liveness_tick` is logged
+/// and swallowed; the watcher loop never crashes the daemon. The cost
+/// of skipping a tick is at most one extra interval of stale state.
+fn run_worker_liveness_watchdog(toolset: Arc<TeamModeToolset>) {
+    loop {
+        std::thread::sleep(WORKER_LIVENESS_INTERVAL);
+        let _ = toolset.worker_liveness_tick();
+    }
+}
+
 fn run_lead_watchdog(team_store: TeamStore, toolset: Arc<TeamModeToolset>) {
     use sysinfo::{Pid, ProcessesToUpdate, System};
 

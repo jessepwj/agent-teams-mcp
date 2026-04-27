@@ -221,10 +221,8 @@ fn full_scan() -> Vec<CodexSessionFile> {
     let root = codex_sessions_root();
     let mut paths = Vec::new();
     walk_date_tree(&root, &mut paths);
-    let mut sessions: Vec<CodexSessionFile> = paths
-        .into_iter()
-        .filter_map(build_session_file)
-        .collect();
+    let mut sessions: Vec<CodexSessionFile> =
+        paths.into_iter().filter_map(build_session_file).collect();
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     sessions
 }

@@ -24,7 +24,7 @@ impl ExecutionSessionState {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    fn parse_label(value: &str) -> Option<Self> {
         match value {
             "unknown" => Some(Self::Unknown),
             "starting" => Some(Self::Starting),
@@ -34,5 +34,13 @@ impl ExecutionSessionState {
             "failed" => Some(Self::Failed),
             _ => None,
         }
+    }
+}
+
+impl std::str::FromStr for ExecutionSessionState {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse_label(value).ok_or(())
     }
 }

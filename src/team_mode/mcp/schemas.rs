@@ -248,8 +248,8 @@ mod tests {
     fn initialize_result_has_expected_capabilities() {
         let result = InitializeResult::team_mode_default();
         assert_eq!(result.protocol_version, "2025-06-18");
-        assert_eq!(result.capabilities.tools.unwrap().list_changed, false);
-        assert_eq!(result.capabilities.resources.unwrap().subscribe, true);
+        assert!(!result.capabilities.tools.unwrap().list_changed);
+        assert!(result.capabilities.resources.unwrap().subscribe);
     }
 
     #[test]

@@ -5,7 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>团队模式 Web</title>
     <link rel="stylesheet" href="/styles.css" />
-    <script defer src="/app.js"></script>
+    <!-- Load order matters: dependencies first, then app.js wires it up.
+         Plain scripts (not module) so top-level function decls are shared
+         across files via the global scope. -->
+    <script src="/app-state.js"></script>
+    <script src="/app-utils.js"></script>
+    <script src="/app-api.js"></script>
+    <script src="/app-diagnostics.js"></script>
+    <script src="/app-render.js"></script>
+    <script src="/app-conversation.js"></script>
+    <script src="/app.js"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -74,7 +83,13 @@
             <div class="composer-row">
               <label class="composer-mention" for="composerMention" id="composerMentionLabel">
                 <span class="muted" id="composerMentionPrefix">@</span>
-                <select id="composerMention" class="composer-select"></select>
+                <select
+                  id="composerMention"
+                  class="composer-select"
+                  multiple
+                  size="4"
+                  title="按住 Ctrl/Cmd 多选；按住 Shift 选择范围"
+                ></select>
               </label>
               <textarea
                 id="composerInput"

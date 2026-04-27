@@ -8,10 +8,43 @@ const INDEX_HTML: &str = include_str!(concat!(
     "/web/team-mode/index.html"
 ));
 const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/web/team-mode/app.js"));
+const APP_STATE_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/web/team-mode/app-state.js"
+));
+const APP_API_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/web/team-mode/app-api.js"
+));
+const APP_UTILS_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/web/team-mode/app-utils.js"
+));
+const APP_DIAGNOSTICS_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/web/team-mode/app-diagnostics.js"
+));
+const APP_RENDER_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/web/team-mode/app-render.js"
+));
+const APP_CONVERSATION_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/web/team-mode/app-conversation.js"
+));
 const STYLES_CSS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/web/team-mode/styles.css"
 ));
+const JS_ASSETS: &[(&str, &str)] = &[
+    ("app.js", APP_JS),
+    ("app-state.js", APP_STATE_JS),
+    ("app-api.js", APP_API_JS),
+    ("app-utils.js", APP_UTILS_JS),
+    ("app-diagnostics.js", APP_DIAGNOSTICS_JS),
+    ("app-render.js", APP_RENDER_JS),
+    ("app-conversation.js", APP_CONVERSATION_JS),
+];
 
 use super::error::{ErrorBody, StatusCode, WebError};
 use super::read_model;
@@ -123,10 +156,13 @@ pub fn handle_request_with_body(
         );
     }
 
+    if let Some(asset) = javascript_asset(path) {
+        return WebResponse::javascript(StatusCode::Ok, asset);
+    }
+
     let result = match segments.as_slice() {
         [] => return WebResponse::html(StatusCode::Ok, INDEX_HTML),
         ["index.html"] => return WebResponse::html(StatusCode::Ok, INDEX_HTML),
-        ["app.js"] => return WebResponse::javascript(StatusCode::Ok, APP_JS),
         ["styles.css"] => return WebResponse::css(StatusCode::Ok, STYLES_CSS),
         ["healthz"] => return WebResponse::text(StatusCode::Ok, "ok"),
         ["api", "teams"] => {
@@ -171,6 +207,16 @@ pub fn handle_request_with_body(
         Ok(response) => response,
         Err(err) => error_response(err),
     }
+}
+
+fn javascript_asset(path: &str) -> Option<&'static str> {
+    let asset_name = path.trim_start_matches('/');
+    if asset_name.contains('/') || !asset_name.ends_with(".js") {
+        return None;
+    }
+    JS_ASSETS
+        .iter()
+        .find_map(|(name, body)| (*name == asset_name).then_some(*body))
 }
 
 fn error_response(err: WebError) -> WebResponse {

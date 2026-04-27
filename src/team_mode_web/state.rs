@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+use crate::team_mode::runtime_workers::RuntimeWorkerStore;
 use crate::team_mode::service::{
     InboxService, MemberService, MessageService, RoomService, TeamService,
 };
@@ -37,6 +38,7 @@ pub struct TeamModeWebState {
     pub(crate) room_service: RoomService,
     pub(crate) message_service: MessageService,
     pub(crate) inbox_service: InboxService,
+    pub(crate) runtime_workers: RuntimeWorkerStore,
 }
 
 impl TeamModeWebState {
@@ -65,6 +67,11 @@ impl TeamModeWebState {
             )
         });
         let inbox_service = InboxService::new(projection_store.clone(), message_store.clone());
+        // RuntimeWorkerStore reads `<base>/runtime/workers.json` — the daemon
+        // updates this sidecar whenever a worker dies or its state changes,
+        // so the web layer can show live "dead" status without holding the
+        // orchestrator lock.
+        let runtime_workers = RuntimeWorkerStore::new(base_dir.clone());
 
         Self {
             base_dir,
@@ -73,6 +80,7 @@ impl TeamModeWebState {
             room_service,
             message_service,
             inbox_service,
+            runtime_workers,
         }
     }
 

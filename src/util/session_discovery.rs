@@ -123,7 +123,7 @@ fn discover_sessions_in(dir: &Path) -> Vec<SessionFile> {
             let metadata = entry.metadata().ok();
             let modified = metadata
                 .as_ref()
-                .and_then(|m| m.modified().ok().map(|t| DateTime::<Utc>::from(t)));
+                .and_then(|m| m.modified().ok().map(DateTime::<Utc>::from));
             let size = metadata.map(|m| m.len()).unwrap_or(0);
 
             sessions.push(SessionFile {

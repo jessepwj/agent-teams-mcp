@@ -4,10 +4,22 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 
-const appJs = fs.readFileSync(
-  path.join(import.meta.dirname, "app.js"),
-  "utf8",
-);
+const APP_SCRIPT_ORDER = [
+  "app-state.js",
+  "app-api.js",
+  "app-utils.js",
+  "app-diagnostics.js",
+  "app-render.js",
+  "app-conversation.js",
+  "app.js",
+];
+
+function readAppScript(fileName) {
+  const source = fs.readFileSync(path.join(import.meta.dirname, fileName), "utf8");
+  return fileName === "app.js" ? source.replace(/^import\s+["'][^"']+["'];\n/gm, "") : source;
+}
+
+const appJs = APP_SCRIPT_ORDER.map(readAppScript).join("\n");
 
 const FIXED_ELEMENT_IDS = [
   "banner",
@@ -488,7 +500,7 @@ function createHarness({ hash = "", fetchImpl } = {}) {
   };
 }
 
-async function flushPromises(times = 4) {
+async function flushPromises(times = 8) {
   for (let index = 0; index < times; index += 1) {
     await Promise.resolve();
   }

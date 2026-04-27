@@ -152,6 +152,97 @@ Rust `std::process::parent_id()` 是 **nightly-only** API。`sysinfo` 跨平台�
 
 ---
 
+## 多层 worker 死亡检测（2026-04-27）
+
+worker 进程死亡（kill / OOM / 崩溃）的检测有 **3 层**，相互兜底：
+
+| 层 | 触发时机 | 反应时延 | 用途 |
+|---|---|---|---|
+| **agent_loop active probe** | 每 3s 一次 `is_alive` 检查（recv 等待间隙） | ≤6s | mid-turn worker 死了立即触发 OutputClosed [SYSTEM] notice 给 lead |
+| **worker-liveness watchdog** | daemon 后台 std::thread，每 5s 扫 sidecar | ≤10s | 把 sidecar workers.json 状态从 RUNNING 同步到 DEAD（web UI 读这个） |
+| **worker_list MCP 工具** | 每次调用都查 orchestrator.is_alive | 即时 | lead 主动看 worker 状态时返回真实 dead |
+
+**为什么需要三层**：
+
+- agent_loop active probe 修 mid-turn 终结消息分类——之前 `tokio::select! biased` 让 recv 抢占 tick，Windows codex stdout buffer 持有时永不超时；改成 `tokio::time::timeout(3s, recv)` 强制每 3s 探测一次。
+- watchdog 修 web UI 实时性——web read_model 不持有 orchestrator 引用，只读 sidecar；watchdog 周期把"已死但 sidecar 还说 running"同步过来。
+- worker_list 是用户主动确认的最强 source of truth（实时查不缓存）。
+
+3 层共同保证：worker 死了 lead 在 ≤10s 内通过任意一条路径得知。
+
+**是 backend 层的隐藏 bug**：早期的 `CodexBackend::is_alive` / `ClaudeCodeBackend::is_alive`
+只查内部 `Arc<AtomicBool>`，但这个 flag 仅在 `shutdown()` 显式调用时才被设 false。
+**外部 kill（taskkill / kill -9 / OOM / 崩溃）不会触发 alive=false**，所以前面三层
+liveness 都看到 alive=true 假信号。修复：每个 backend 的 `is_alive` 在 alive=true 快速
+路径之外加 sysinfo 实查 child PID 是否还在 OS process 列表里——alive=false 路径不变（保留
+显式 shutdown 语义）。代价：每次 is_alive 调用 ~1-3ms（sysinfo refresh 单 PID）。
+3 个 backend（codex / claude-code / gemini-cli）同时修。
+
+---
+
+---
+
+## 双轨投递（Stop hook + PostToolUse hook，2026-04-27）
+
+**问题**：单 Stop hook 路径下，worker reply 必须等 lead 当前 turn 完全结束才能投递。
+lead 跑长 turn（10+ 工具调用）时，最早收到 reply 的时刻是整个 turn 结束。
+
+**为什么只能这样**：CC 客户端的 `<system-reminder>` 注入只在 turn 边界发生。
+mid-turn 推送的官方 API 是 OAuth-only 的 Channels（API key 不支持）。
+
+**调研发现可用 mid-turn 注入路径**：CC 的 PostToolUse hook 可以返回
+`additionalContext`，CC 将其追加到下一次 LLM 调用的 context 里——
+**这是 mid-turn 唯一一个能在 API key 模式下塞内容给 lead LLM 的合法路径**。
+
+**双轨设计**：
+
+```
+Worker reply → daemon 写 lead_pending.jsonl
+                ↓
+   ┌────────────────────────┴────────────────────┐
+   │  PostToolUse 路径（mid-turn 快路径）         │
+   │  - lead-pending-mid-turn.js                  │
+   │  - 锁 + 抽 + 渲染 → additionalContext       │
+   │  - 适合 lead 在长 turn 跑工具时             │
+   │                                              │
+   │  Stop 路径（turn 结束兜底）                  │
+   │  - lead-pending-wake.js（已有）             │
+   │  - 锁 + 抽 + 渲染 → decision:"block"        │
+   │  - 适合 lead 没工具调用 / 纯思考完成        │
+   └─────────────────────────────────────────────┘
+```
+
+**为什么没有重复投递风险**：两个 hook 共享同一个 `lead_pending.jsonl`
++ 同一个 `.lead-pending.lock`。无论哪个先 fire，先抽就先得，pending 立即
+被改写（peers-only 留下）。另一个 hook 看到 `mine.length === 0` 直接退出。
+不需要单独的 delivered tracker。
+
+**LLM 语义防混淆**：
+
+mid-turn 注入的 reminder 跟 turn-end 的格式**不同**：
+- mid-turn: 视觉分隔块 `─── ─── ───`，明确标 "可稍后响应"
+- turn-end: 紧凑 header + body，标 "收到新消息"
+
+mid-turn 框架措辞强调"你可以继续手头任务，turn 结束会再次提醒"——
+让 LLM 不要立即放下当前工作切换上下文。如果 LLM 觉得新消息紧急，
+依然可以选择 mid-turn 响应；不紧急的就让 Stop hook 收尾。
+
+**性能开销**：每次 PostToolUse hook 启动 ~50ms（Node 冷启动 + 文件锁 + 抽取）。
+fast path（pending 文件不存在 / 文件为空）<10ms。
+
+**worker fast-path**：worker 自己的 claude CLI 也会触发 PostToolUse
+（项目级 .claude/settings.json 被任何 claude 进程读取）。新 hook 跟 Stop
+hook 一样在脚本头检测 `TEAM_MODE_WORKER=1` env 并立即 exit 0。
+否则 worker 会去抢 lead 的 pending 队列。
+
+**实现**：
+- `scripts/hooks/lead-pending-shared.js` — 抽取共用代码（process tree、锁、
+  pending 抽取、reminder 渲染）
+- `scripts/hooks/lead-pending-mid-turn.js` — 新 hook，PostToolUse 时跑
+- `scripts/hooks/lead-pending-wake.js` — 现有 Stop hook，未改
+
+---
+
 ## Bug 修复历史
 
 记录排查过程中发现并修复的非平凡 bug，按时间顺序。
@@ -713,6 +804,141 @@ fallback（因为 lead 就是当前 CC，最近的 JSONL 本来就是它）。
 做到 just-in-time。硬规则（必须含 @mention、name 必须 slug）继续在代码层
 强制 + fail-fast 错误信息说清原因；建议性指引（不要轮询、复活方式）放
 hint。
+
+---
+
+### Bug 26: codex worker reply body 膨胀（命令 stdout + delta/message 双写）
+
+**位置**：`src/backend/codex.rs::map_notification_to_output` + `src/runtime/agent_loop.rs` step 4
+
+**症状**：lead 自检报告——单次 Stop hook 通知 "2 new messages" 但 payload **50,000+ tokens**。
+真正的 200 词总结被埋在大量"看起来像工具调用 transcript"的内容里：完整文件源码 dump、
+PowerShell 终端输出 + ANSI 颜色码（`[31;1m`）、数百条 grep file:line:content 行。同一条
+backend-dev 的 message body 出现两次（顶部一次 + 嵌在 researcher reply 下半段）。
+
+**根因**（两条独立 bug 叠加）：
+
+26a — Shell stdout 污染：codex 协议的 `EVENT_COMMAND_OUTPUT_DELTA`（`bash`/`local_shell`
+工具的实时 stdout 流，含 `cat src/foo.rs`、`grep -rn`、ANSI 转义码）被映射成
+`AgentOutput::Delta`，与 LLM 文本回复同一类型，被 AgentLoop 的 `parts.push()` 路径无差别拼进 body。
+
+26b — `agentMessage` 双轨写入：codex 对同一条 LLM 回复**先**逐 token 发
+`EVENT_AGENT_MESSAGE_DELTA`，**再**在消息结束时发 `EVENT_ITEM_COMPLETED`（type=agentMessage,
+含完整文本）。两个事件都被处理为有效输出（`Delta` + `Message`），AgentLoop 等同对待
+→ 同一条 worker 回复被拼进 body 两次。
+
+**修复**：
+- 新增 `AgentOutput::ToolOutput(String)` 变体；`EVENT_COMMAND_OUTPUT_DELTA` 映射到它。
+  AgentLoop 收到 `ToolOutput` → trace-log 后丢弃，永不入 body。
+- 重构 step 4 累积逻辑：`final_message: Option<String>` 单独存 `Message` 事件，
+  `deltas: Vec<String>` 单独存 `Delta` 事件。组装 body 时**优先** `final_message`，
+  否则 fallback 到 `deltas.join("")`。codex 双写 → 只取 `Message`；纯 delta 流（claude_code、
+  gemini）→ join deltas。
+
+> **注**：Bug 26 的修复在 Bug 29 引入"workers 必须显式调 `send_message`"后被进一步
+> 简化——AgentLoop 不再 auto-capture stdout，body 拼接逻辑整段删除。但 `ToolOutput`
+> 变体保留作为防御性记录（trace 用），万一未来有 backend 漏洞重新泄漏 stdout。
+
+---
+
+### Bug 6 & 7: lead_pending text 未截断 + Stop hook 双 hook 竞态
+
+**位置**：`src/team_mode/service/lead_pending.rs::write_for_lead` + `scripts/hooks/lead-pending-wake.js::tryBlock`
+
+**Bug 6 症状**：Stop hook 把 `entry.text` 直接当 `{decision:"block", reason:...}` 推 lead。
+当 worker reply 体积大（Bug 26 中 50K+ tokens；未来 backend 类似漏洞），整段灌入 lead 的
+`<system-reminder>`，每次 worker 回复都烧 lead context。
+
+**Bug 6 修复**：`truncate_body_for_pending()` 在 `write_for_lead` 入口截断到 16 KB
+（≈ 4K tokens），UTF-8 安全（walk back 到 char boundary），追加清晰标记
+`[…body truncated. Call mcp__team-mode__inbox_read or read messages.jsonl for the full reply.]`。
+**原 body 在 messages.jsonl 完整保留**——截断只影响 Stop hook 推送的通知 payload。
+
+**Bug 7 症状**：CC 快速连续完工两轮 → 两个 Stop hook 实例并发跑 `tryBlock`。
+`classifyPending → writePeersBack` 之间无锁，两个实例都看到同一批 `mine`，都 drain，
+都 inject → 同批消息推 lead 两次。
+
+**Bug 7 修复**：`acquirePendingLock()` 用 `fs.openSync(path, 'wx')` 做独占创建文件锁
+（`.lead-pending.lock`），包住 `tryBlock` 的整个临界段。stale 锁（mtime > 30s）自动
+强解。指数退避（50→100→200ms）真定时器 sleep（不烧 CPU），总等待 3s 后放弃，
+caller 跳本轮，poll loop 下一周期重试。
+
+---
+
+### Bug 27: 多 CC 同 cwd 时 web UI 显示错的 lead session
+
+**位置**：`src/team_mode_web/read_model/conversation.rs::read_member_conversation`
+
+**症状**：用户在同一项目目录开两个 CC（PID A 和 PID B），其中 A 调 `team_create` →
+`team.owner_cc_pid = A`。Web UI 拉 lead session JSONL 时走 mtime-fallback
+（`sessions.first()` = newest）→ 拿到 PID B（更近活动）的 JSONL 而非 A 的。结果
+"lead session" 标签下显示**另一个 CC** 的工具调用历史。
+
+**根因**：Claude Code 的 JSONL 文件名是 session_id（无 PID 信息），daemon 没法靠
+`team.owner_cc_pid` 反查具体哪个 JSONL 是该 team 的 lead。fallback 用 mtime 是
+单 CC 场景的合理简化，多 CC 时崩。
+
+**修复**：Stop hook 是唯一同时知道 `process.ppid`（CC PID）和 `event.session_id`
+（Claude session id）的地方。让它每次 fire 时把 `{ancestor_pid: claude_session_id}`
+映射写到 `<base_dir>/.lead-sessions.json`（atomic write，7 天 TTL GC 防累积）。
+read_model 的 lead session 选择路径 lookup `team.owner_cc_pid` → 拿 session_id →
+精准匹配 JSONL，不再 mtime fallback。
+
+接管场景（lead 死、新 CC 接班）：team.owner_cc_pid 仍指旧死 PID → 映射查不到 →
+fallback 到 mtime（保留旧的"宽容"行为，至少能显示一些东西）。**真正的 takeover
+工具未做**——需要新 `team_takeover` MCP tool 把 owner_cc_pid 改到当前 CC PID，
+并清掉旧映射。
+
+---
+
+### Bug 29: workers 显式 MCP 消息 + caller identity（架构调整）
+
+**位置**：`src/team_mode_daemon/{client.rs,server.rs}` + `src/team_mode/mcp/tools/{worker.rs,message.rs}` + `src/runtime/agent_loop.rs` + `src/backend/codex.rs`
+
+**问题**：原架构 worker 子进程的整轮 stdout 被 AgentLoop 直接当 reply body 拼起来发 lead。
+这导致：
+1. Bug 26 类的体积膨胀（codex shell tool stdout 变成"消息"）
+2. worker 没有"私有 thinking" vs "对外 say" 的语义边界——所有输出都是公开的
+3. 防御性代码越加越多（`ToolOutput` 区分、delta/message 优先级、lead_pending 截断）
+   但都是治标
+4. claude-code worker 实际上**已经**自动加载了项目 `.mcp.json`（claude CLI 默认行为），
+   能调 `mcp__team-mode__send_message`——但 `send_message` 硬编码 `sender = LEAD_NAME`，
+   worker 调它会**冒充 lead 发消息**，daemon 完全无 caller identity 概念
+
+**架构调整**：
+
+1. **身份绑定**：`worker_add` spawn worker 时注入 `TEAM_MODE_TEAM` + `TEAM_MODE_MEMBER`
+   两个 env vars。env 透传给 worker 的子进程（包括 worker 自己拉起的 team-mode MCP
+   relay）。relay 启动时 read env 构造 `MemberIdentity`，每次 RPC 携带在 `context.caller_*`
+   字段。lead 的 relay（无 env）默认 `caller_member = "lead"`。
+
+2. **codex MCP 注入**（claude-code 自动 work；codex 不读 .mcp.json，需特殊处理）：
+   spawn codex 时 build `<cwd>/.agent-teams/<team>/codex-homes/<member>/config.toml`
+   含 `[mcp_servers.team-mode]` 节 + env passthrough，并设 `CODEX_HOME=<那个目录>`。
+   per-worker 隔离，不污染用户全局 `~/.codex/config.toml`。
+
+3. **`send_message` 改造**：sender 取自 `caller_member`（不再硬编码 lead）。
+   workers 只能发自己 bound 的 team。`@mention` 错误把 `@lead` + 所有活 worker 列出
+   供模型自纠。worker text 没 @ 任何人 → 默认 `@lead`。
+
+4. **AgentLoop 删 stdout-as-reply**：删 `parts/deltas/final_message/raw_body` 整套，
+   不再 auto-publish stdout。新方法 `count_self_messages_after()` 通过扫
+   messages.jsonl 检测 worker 这一轮调过几次 send_message，决定是否需要发 [SYSTEM]
+   "silent turn" 通知。pipe-close / agent-error 仍发 [SYSTEM] 终结通知（lead 必须知道
+   worker 死了）。
+
+5. **Onboarding 重写**：worker prompt 教"必须调 `mcp__team-mode__send_message` 才算
+   说话；stdout 是私有 thinking，不会被对方看到；不调 send_message → lead 收到
+   '白干'通知"。
+
+**结果**：worker 必须**显式**调工具发消息。stdout（思考、bash 输出、ANSI、文件 dump）
+永不进入 messages.jsonl。Bug 26 整类问题从根源消除——不是靠过滤，是靠不给路径。
+`ToolOutput` / Bug 6 截断保留作纵深防御。
+
+**未做**：
+- `team_takeover` 工具（Bug 27 的接管完整修复）——优先级低，单 CC 场景已 work
+- 运行时验证 codex 真的接受 `CODEX_HOME` + per-worker config.toml 这套（subagent
+  调研基于 codex 官方文档）
 
 ---
 

@@ -140,6 +140,75 @@ impl TeamModeToolset {
         }
     }
 
+    /// Sweep sidecar workers marked RUNNING/STARTING and reconcile against
+    /// the orchestrator's live process view. Workers whose backing process
+    /// is gone (killed externally, OOM, crashed) get their sidecar state
+    /// flipped to DEAD, with a note explaining the source of truth shift.
+    ///
+    /// Called periodically by the daemon's worker-liveness watchdog so the
+    /// web UI (which reads only sidecar) sees real-time dead status without
+    /// needing a worker_list MCP roundtrip.
+    ///
+    /// Returns the number of records flipped to DEAD on this tick.
+    pub fn worker_liveness_tick(&self) -> usize {
+        let workers = match self.runtime_workers.list_all() {
+            Ok(workers) => workers,
+            Err(err) => {
+                tracing::warn!(error = %err, "worker-liveness watchdog: list_all failed");
+                return 0;
+            }
+        };
+        let mut flipped = 0;
+        for worker in workers {
+            // Only check workers we expect to be alive — STARTING (mid-spawn)
+            // and RUNNING. STOPPED / DEAD / FAILED are already terminal
+            // states; FAILED in particular means the worker never reached
+            // running, no point probing.
+            let claims_alive = matches!(
+                worker.state.as_str(),
+                crate::team_mode::runtime_workers::STATE_RUNNING
+                    | crate::team_mode::runtime_workers::STATE_STARTING
+            );
+            if !claims_alive {
+                continue;
+            }
+            let key = worker.spawn_key.clone();
+            let orch = Arc::clone(&self.runtime_orchestrator);
+            let alive = self.async_runtime.block_on(async move {
+                orch.lock().await.is_alive(&key).await.unwrap_or(false)
+            });
+            if alive {
+                continue;
+            }
+            // Process is gone — flip the sidecar. We deliberately keep the
+            // member-store record (worker_remove handles full removal); this
+            // is purely the runtime liveness sidecar.
+            if let Err(err) = self.runtime_workers.upsert_state(
+                &worker.team,
+                &worker.name,
+                &worker.spawn_key,
+                worker.adapter.clone(),
+                crate::team_mode::runtime_workers::STATE_DEAD,
+                Some("liveness watchdog: orchestrator reported process gone".into()),
+            ) {
+                tracing::warn!(
+                    team = %worker.team,
+                    name = %worker.name,
+                    error = %err,
+                    "worker-liveness watchdog: failed to flip state to DEAD"
+                );
+                continue;
+            }
+            tracing::info!(
+                team = %worker.team,
+                name = %worker.name,
+                "worker-liveness watchdog: flipped sidecar to DEAD (process gone)"
+            );
+            flipped += 1;
+        }
+        flipped
+    }
+
     pub fn list_tools(&self) -> Vec<ToolDescriptor> {
         // Tool descriptions are deliberately terse. Detailed guidance and
         // failure-mode hints come back as `hint` / `note` fields in tool

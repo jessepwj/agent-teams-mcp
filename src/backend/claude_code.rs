@@ -443,7 +443,22 @@ impl AgentSession for ClaudeCodeSession {
     }
 
     async fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
+        // Fast path — internal flag set false on explicit shutdown.
+        if !self.alive.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Slow path — verify against the OS in case the child was
+        // killed externally (kill, OOM, host crash). Without this the
+        // active liveness probe + watchdog can't see a dead child.
+        let Some(pid) = self.child.as_ref().and_then(|c| c.id()) else {
+            return false;
+        };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+            true,
+        );
+        sys.process(sysinfo::Pid::from_u32(pid)).is_some()
     }
 
     async fn shutdown(&mut self) -> Result<()> {

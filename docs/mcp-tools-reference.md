@@ -151,6 +151,26 @@ held undelivered entries for this team that were dropped during cleanup.
 `running | starting | failed` based on the 5-second ready-check. On the
 revive path, `revived_from_dead: true` and a `note` field are also present.
 
+### Identity binding (Bug 29)
+
+Every `worker_add` injects two env vars onto the spawned worker process:
+
+| Env | Value | Purpose |
+|---|---|---|
+| `TEAM_MODE_TEAM` | the `team` argument | Worker's bound team for caller-identity checks |
+| `TEAM_MODE_MEMBER` | the `name` argument | Worker's identity for `send_message` sender attribution |
+
+These propagate to any MCP relay the worker spawns (claude-code via
+auto-discovered `.mcp.json`; codex via the auto-generated
+`<cwd>/.agent-teams/<team>/codex-homes/<member>/config.toml` + `CODEX_HOME`).
+The relay carries them in every daemon RPC's `context.caller_*` field so
+the daemon can attribute tool calls to the right worker instead of forging
+"lead". See `send_message` (Tool 7) for how these are consumed.
+
+`TEAM_MODE_WORKER=1` is also set as a marker so the worker's own claude
+CLI's project Stop hook short-circuits (workers are not leads — they
+must not block on the lead-pending queue).
+
 ---
 
 ## Tool 5 — `worker_list`
@@ -202,27 +222,43 @@ least one dead worker is in the list.
 
 ## Tool 7 — `send_message`
 
-**Purpose**: Send a message as the team's lead.
+**Purpose**: Send a message into the team room. Sender is determined by
+**caller identity** (Bug 29) — both lead and workers call this same tool;
+the daemon attributes the message to the correct sender automatically.
 
 **Parameters**:
 
 | Field | Required | Notes |
 |---|---|---|
-| `team` | ✅ | |
-| `text` | ✅ | Must contain at least one `@handle`. |
+| `team` | ✅ | Team name. Workers can only send into their bound team. |
+| `text` | ✅ | Body. SHOULD contain `@handle`s; if omitted, **workers default to `@lead`**, **lead must specify** at least one. |
 
-**Strict routing rules**:
-- `text` must have ≥1 `@handle`
-- **Every** `@handle` in `text` must resolve to an active worker (not the lead itself)
-- Unmatched handles cause the call to fail with the list of unmatched names + the list of active workers
-- `@handle` matching is case-insensitive (`@Alice` matches worker `alice`)
-- Recipients whose process is dead are detected before dispatch:
-  - **All dead** → call fails fast with names; a `[SYSTEM]` notice is
-    written to the lead inbox per dead recipient.
-  - **Mixed** → live recipients receive normally; dead `@handle`s are
-    rewritten in the body to `[worker unavailable: <name>]`; per-dead-worker
-    `[SYSTEM]` notices are posted; the response surfaces
-    `dead_recipients` + `system_notices` + `dead_recipients_hint`.
+**Caller identity** (Bug 29):
+- Lead's MCP relay (no `TEAM_MODE_MEMBER` env) → `caller_member = "lead"`,
+  message kind = `Dispatch`.
+- Worker's MCP relay (env set on spawn by `worker_add`) → `caller_member =
+  worker name`, message kind = `Reply`. Worker is locked to its bound team
+  (cross-team send is rejected with a clear error).
+
+**@mention semantics**:
+- `@handle` matching is case-insensitive (`@Alice` = `@alice`).
+- `@lead` is always a valid handle (the team always has a lead).
+- **Workers with no `@mention`** in `text` → tool auto-prepends `@lead `
+  (the natural "report up the chain" default). The body is rewritten so
+  the visible message reads `@lead <original text>`.
+- **Lead with no `@mention`** → call fails with the available handle list
+  (lead has no implicit recipient).
+- Unmatched `@handle` (typo / nonexistent worker) → call fails with the
+  unmatched names AND the available handle list (`@lead` + active workers).
+- Self-mention (`@yourself`) → rejected; tool suggests `@lead` instead.
+
+**Liveness handling** (recipient process dead before dispatch):
+- **All dead** → call fails fast with names; a `[SYSTEM]` notice is
+  written to the lead inbox per dead recipient.
+- **Mixed** → live recipients receive normally; dead `@handle`s are
+  rewritten in the body to `[worker unavailable: <name>]`; per-dead-worker
+  `[SYSTEM]` notices are posted; response surfaces `dead_recipients`,
+  `system_notices`, `dead_recipients_hint`.
 
 **Returns**:
 ```json
@@ -236,6 +272,14 @@ least one dead worker is in the list.
 The `hint` is present on EVERY successful send to remind the model that
 worker replies arrive via the Stop hook on the next turn — calling
 `inbox_read` afterwards is wrong.
+
+**Internal arguments** (injected by `inject_call_context`, not user-supplied):
+- `_caller_member` — caller identity (defaults to `"lead"` when unset)
+- `_caller_team` — caller's bound team (only when set)
+- `_owner_cc_pid` — owner CC PID (set by `team_create` to bind ownership)
+
+These are stripped from public schema and injected by the daemon before
+the tool runs.
 
 ---
 

@@ -146,7 +146,8 @@ mod tests {
             skills: vec!["review".into()],
             session_state: Some(ExecutionSessionState::Running),
             session_id: None,
-                    reasoning_effort: None,};
+            reasoning_effort: None,
+        };
 
         let json = serde_json::to_string(&execution).unwrap();
         let parsed: ExecutionProfile = serde_json::from_str(&json).unwrap();
@@ -187,7 +188,8 @@ mod tests {
                         skills: vec![],
                         session_state: Some(ExecutionSessionState::Running),
                         session_id: None,
-                    reasoning_effort: None,}),
+                        reasoning_effort: None,
+                    }),
                 },
             ],
         };

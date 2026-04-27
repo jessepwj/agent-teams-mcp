@@ -241,12 +241,11 @@ impl RuntimeOrchestrator {
 
     pub async fn is_alive(&self, member_id: impl AsRef<str>) -> Result<bool> {
         let member_id = member_id.as_ref();
-        let managed = self
-            .sessions
-            .get(member_id)
-            .ok_or_else(|| Error::Other(format!(
+        let managed = self.sessions.get(member_id).ok_or_else(|| {
+            Error::Other(format!(
                 "no managed session registered for spawn_key '{member_id}'"
-            )))?;
+            ))
+        })?;
         Ok(managed.session.is_alive().await)
     }
 
