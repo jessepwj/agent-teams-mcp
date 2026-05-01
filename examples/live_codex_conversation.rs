@@ -156,6 +156,9 @@ async fn collect_output(
                     full_text.push_str(&text);
                 }
             }
+            Ok(Some(AgentOutput::ToolOutput(text))) => {
+                eprint!("{text}");
+            }
             Ok(Some(AgentOutput::TurnComplete)) => {
                 if !full_text.ends_with('\n') {
                     println!();

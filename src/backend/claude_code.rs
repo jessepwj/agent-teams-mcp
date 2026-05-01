@@ -574,10 +574,24 @@ async fn background_reader(
                         // `~/.claude/projects/<cwd>/<id>.jsonl` file.
                         if let Some(ref sid) = event.session_id {
                             if !sid.is_empty() {
-                                let mut slot = session_id_slot.lock().unwrap();
-                                if slot.as_deref() != Some(sid.as_str()) {
-                                    debug!(agent = %agent_name, session_id = %sid, "captured Claude session_id");
-                                    *slot = Some(sid.clone());
+                                let session_id_lock_poisoned = match session_id_slot.lock() {
+                                    Ok(mut slot) => {
+                                        if slot.as_deref() != Some(sid.as_str()) {
+                                            debug!(agent = %agent_name, session_id = %sid, "captured Claude session_id");
+                                            *slot = Some(sid.clone());
+                                        }
+                                        false
+                                    }
+                                    Err(_) => true,
+                                };
+                                if session_id_lock_poisoned {
+                                    let message =
+                                        "poisoned mutex: claude session_id_slot".to_string();
+                                    alive.store(false, Ordering::Relaxed);
+                                    idle.store(true, Ordering::Release);
+                                    idle_notify.notify_waiters();
+                                    let _ = output_tx.send(AgentOutput::Error(message)).await;
+                                    break;
                                 }
                             }
                         }

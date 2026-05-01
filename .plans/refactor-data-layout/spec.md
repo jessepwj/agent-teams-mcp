@@ -391,7 +391,7 @@ pub fn ensure_scaffold(base_dir: &Path) -> Result<()> {
 }
 
 fn render_readme() -> String {
-    // 渲染完整 README，内容见 docs/push-notifications.md 的 README 模板
+    // 渲染完整 README，内容见 .plans/agent-teams-v2/docs/02-current-system/push-notifications.md 的 README 模板
     // 最后加 "_Generated at {now}_."
     ...
 }
@@ -454,7 +454,7 @@ as new messages arrive.
 
 ## Want push notifications for worker replies?
 
-See `docs/push-notifications.md` in the agent-teams-rs repo for how to
+See `.plans/agent-teams-v2/docs/02-current-system/push-notifications.md` in the agent-teams-rs repo for how to
 wire `~/.claude/settings.json` to read `lead_pending.jsonl` via
 `FileChanged` + `asyncRewake`.
 

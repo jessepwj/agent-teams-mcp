@@ -87,10 +87,7 @@ impl AgentLoop {
     /// Returns `None` on storage I/O error; callers should treat that
     /// as "unknown" and pick a conservative default rather than
     /// panicking.
-    fn count_self_messages_after(
-        &self,
-        since: chrono::DateTime<chrono::Utc>,
-    ) -> Option<usize> {
+    fn count_self_messages_after(&self, since: chrono::DateTime<chrono::Utc>) -> Option<usize> {
         let messages = self.message_store.list(&self.team_id).ok()?;
         Some(
             messages
@@ -269,9 +266,7 @@ impl AgentLoop {
                 let probe_handle = tokio::spawn(async move {
                     let mut tx = Some(probe_dead_tx);
                     let mut interval = tokio::time::interval(Duration::from_secs(3));
-                    interval.set_missed_tick_behavior(
-                        tokio::time::MissedTickBehavior::Delay,
-                    );
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     // Skip the immediate first tick at t=0; give the
                     // worker at least one probe interval to bring up.
                     interval.tick().await;
@@ -360,12 +355,8 @@ impl AgentLoop {
                         err = error_text.as_deref().unwrap_or("(no detail)")
                     )),
                     TurnEndCause::TurnComplete if !worker_spoke_explicitly => Some(format!(
-                        "[SYSTEM] worker '{member}' completed its turn for \
-                         msg {mid} without calling send_message. Either the \
-                         worker chose to stay silent or its onboarding \
-                         didn't teach the explicit-send protocol. Send a \
-                         follow-up to nudge, or check the worker's system \
-                         prompt.",
+                        "[INFO] worker '{member}' completed turn (msg {mid}) \
+                         without a routed team message.",
                         member = self.member_id,
                         mid = message.id
                     )),
@@ -738,7 +729,7 @@ mod tests {
         // auto-published as a Reply. Workers must call send_message
         // explicitly to communicate. The driver here only emits a
         // TurnComplete with a Message event but never calls
-        // send_message → expect a [SYSTEM] silent-turn notice, not a
+        // send_message → expect an [INFO] silent-turn notice, not a
         // Reply with the Message body.
         let messages = message_store.list_by_room("team-1", "main").unwrap();
         let auto_reply = messages
@@ -755,11 +746,14 @@ mod tests {
             .find(|m| m.sender == "worker" && matches!(m.kind, MessageKind::Status));
         assert!(
             silent_notice.is_some(),
-            "expected [SYSTEM] silent-turn notice when worker doesn't call send_message"
+            "expected [INFO] silent-turn notice when worker doesn't call send_message"
         );
         assert!(
-            silent_notice.unwrap().body.contains("without calling send_message"),
-            "silent-turn notice should mention send_message; got: {}",
+            silent_notice
+                .unwrap()
+                .body
+                .contains("without a routed team message"),
+            "silent-turn notice should mention silent turn; got: {}",
             silent_notice.unwrap().body
         );
     }
@@ -881,10 +875,10 @@ mod tests {
             from_worker[0].kind
         );
         assert!(
-            from_worker[0].body.contains("[SYSTEM]")
+            from_worker[0].body.contains("[INFO]")
                 && from_worker[0]
                     .body
-                    .contains("without calling send_message"),
+                    .contains("without a routed team message"),
             "unexpected body: {}",
             from_worker[0].body
         );

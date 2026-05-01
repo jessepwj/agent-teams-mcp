@@ -163,6 +163,7 @@ async fn collect_output(
                     full_text.push_str(&text);
                 }
             }
+            Ok(Some(AgentOutput::ToolOutput(_))) => {}
             Ok(Some(AgentOutput::TurnComplete | AgentOutput::Idle)) => break,
             Ok(Some(AgentOutput::Error(e))) => {
                 full_text.push_str(&format!("\n[error] {e}"));

@@ -34,7 +34,19 @@ use super::{AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig, s
 use crate::{Error, Result};
 
 /// Channel buffer size for agent output events.
-const OUTPUT_CHANNEL_SIZE: usize = 256;
+/// Capacity of the codex→agent_loop output channel. Must be large enough
+/// to absorb a single bursty turn's full event stream without blocking the
+/// reader, otherwise codex's stdout pump backs up, the JSON-RPC keepalive
+/// stalls, and the worker is reported as `agent error`.
+///
+/// 256 was empirically too small: a `cargo build` worker turn emits
+/// hundreds of `command/exec_command_output_delta` events per second on
+/// large compile outputs, the channel fills, the reader logs
+/// `Output channel full, dropping data message`, and the turn errors out.
+/// 4096 is an order of magnitude past worst-case `cargo build` measured on
+/// this repo (still bounded — runaway loops can't OOM the daemon — just
+/// wide enough to absorb normal builds).
+const OUTPUT_CHANNEL_SIZE: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // CodexBackend  (factory)
@@ -65,8 +77,7 @@ impl CodexBackend {
 
     /// Spawn the Codex child process.
     fn spawn_child(&self, config: &SpawnConfig) -> Result<Child> {
-        // Bug 29 — codex MCP server registration via user's GLOBAL
-        // ~/.codex/config.toml.
+        // Codex MCP registration via user's GLOBAL ~/.codex/config.toml.
         //
         // Why not CODEX_HOME isolation: codex auth lives under CODEX_HOME
         // and uses single-use refresh tokens (openai/codex#15410), so
@@ -76,18 +87,16 @@ impl CodexBackend {
         // in project config are silently ignored by codex
         // (openai/codex#13025).
         //
-        // Why not `-c mcp_servers.X.*` inline flags: empirically, codex
-        // does NOT spawn the MCP relay even when these flags are present
-        // (verified on 2026-04-26). Possibly the parser rejects array
-        // values (`args=[]`, `env_vars=["a","b"]`) silently.
+        // Why not `-c mcp_servers.X.*` inline flags for managed workers:
+        // historical codex versions ignored stdio MCP blocks supplied this
+        // way. The global managed block has been the reliable path.
         //
         // What works: write a managed block into the user's global
         // `~/.codex/config.toml` (idempotent — the block is bracketed
         // by markers so it can be safely re-written or removed). codex
-        // reads this on startup. `env_vars` lets it pass through
-        // TEAM_MODE_TEAM / TEAM_MODE_MEMBER from the worker process env
-        // to the MCP relay, so identity binding works without per-worker
-        // config files.
+        // reads this on startup. For the HTTP service, `env_http_headers`
+        // lets each worker supply its own team/member/worker id, while
+        // `bearer_token_env_var` supplies the service token at spawn time.
         if let Err(e) = ensure_global_codex_mcp_config() {
             tracing::warn!(
                 agent = %config.name,
@@ -106,11 +115,21 @@ impl CodexBackend {
             cmd.arg("-c").arg(format!("model=\"{model}\""));
         }
 
-        // Pass reasoning effort override via -c config flag
-        if let Some(ref effort) = config.reasoning_effort {
-            cmd.arg("-c")
-                .arg(format!("model_reasoning_effort=\"{effort}\""));
-        }
+        // Pass reasoning effort override via -c config flag.
+        //
+        // Project default is `high`: this codebase is large enough (Rust
+        // workspace + Web UI + Hook scripts) that medium-effort codex turns
+        // routinely under-explore the call graph and miss cross-file
+        // invariants. High-effort spends more API budget but gives reliable
+        // first-shot answers, which is net cheaper than re-prompting.
+        //
+        // Caller can still override via `worker_add(effort=...)` when a
+        // specific worker should run cheaper (e.g. e2e-tester sweeps,
+        // pure stylistic reviewer passes). Only when the caller leaves
+        // it unset do we apply the project default.
+        let effort = config.reasoning_effort.as_deref().unwrap_or("high");
+        cmd.arg("-c")
+            .arg(format!("model_reasoning_effort=\"{effort}\""));
 
         // Force full-access sandbox for managed workers.
         //
@@ -129,6 +148,20 @@ impl CodexBackend {
         // ask" semantics that `bypassPermissions` gives the claude-code
         // backend.
         cmd.arg("-c").arg("sandbox_mode=\"danger-full-access\"");
+
+        // Note on env inheritance: codex's default `shell_environment_policy
+        // .inherit = "core"` strips MSVC build vars (LIB / INCLUDE) needed
+        // by `cargo build` inside worker shells. We do NOT override this via
+        // a `-c` flag here because passing the literal string
+        // `shell_environment_policy.inherit="all"` triggers an AgentError on
+        // codex 0.124-alpha (TOML parse path differs from config.toml).
+        //
+        // Users who need worker `cargo build` should set the override in
+        // their `~/.codex/config.toml`:
+        //   [shell_environment_policy]
+        //   inherit = "all"
+        // and start the Team Mode service from an environment where vcvars64
+        // reached the service process for inheritance.
 
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -153,7 +186,6 @@ impl CodexBackend {
 
         Ok(child)
     }
-
 }
 
 /// Idempotently inject a managed `[mcp_servers."team-mode"]` block into
@@ -191,8 +223,8 @@ fn ensure_global_codex_mcp_config() -> Result<()> {
     })?;
 
     let config_path = codex_home.join("config.toml");
-    let relay = resolve_relay_exe()?;
-    let relay_str = relay.display().to_string();
+    let url = std::env::var("TEAM_MODE_HTTP_MCP_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8786/mcp".to_string());
 
     const BEGIN: &str = "# === BEGIN agent-teams-mcp managed (team-mode) ===";
     const END: &str = "# === END agent-teams-mcp managed (team-mode) ===";
@@ -202,13 +234,14 @@ fn ensure_global_codex_mcp_config() -> Result<()> {
          # block is regenerated on every codex worker spawn. Remove the markers\n\
          # to keep manual edits across spawns.\n\
          [mcp_servers.\"team-mode\"]\n\
-         type = \"stdio\"\n\
-         command = \"{cmd}\"\n\
-         args = []\n\
-         env_vars = [\"TEAM_MODE_TEAM\", \"TEAM_MODE_MEMBER\"]\n\
+         url = \"{url}\"\n\
+         bearer_token_env_var = \"TEAM_MODE_HTTP_MCP_TOKEN\"\n\
+         env_http_headers = {{ \"X-Team-Mode-Team\" = \"TEAM_MODE_TEAM\", \
+         \"X-Team-Mode-Member\" = \"TEAM_MODE_MEMBER\", \
+         \"X-Team-Mode-Worker-Id\" = \"TEAM_MODE_WORKER_ID\" }}\n\
          {end}\n",
         begin = BEGIN,
-        cmd = toml_escape(&relay_str),
+        url = toml_escape(&url),
         end = END,
     );
 
@@ -252,12 +285,8 @@ fn ensure_global_codex_mcp_config() -> Result<()> {
     // Atomic write: write to .tmp, rename. Avoids corrupting the user's
     // config if we crash mid-write.
     let tmp_path = config_path.with_extension("toml.agent-teams-tmp");
-    std::fs::write(&tmp_path, &new_contents).map_err(|e| {
-        Error::Other(format!(
-            "failed to write {}: {e}",
-            tmp_path.display()
-        ))
-    })?;
+    std::fs::write(&tmp_path, &new_contents)
+        .map_err(|e| Error::Other(format!("failed to write {}: {e}", tmp_path.display())))?;
     std::fs::rename(&tmp_path, &config_path).map_err(|e| {
         Error::Other(format!(
             "failed to rename {} -> {}: {e}",
@@ -270,31 +299,6 @@ fn ensure_global_codex_mcp_config() -> Result<()> {
         "wrote team-mode MCP block to global codex config"
     );
     Ok(())
-}
-
-/// Resolve the team_mode_mcp relay binary. Mirrors `daemon_exe_path`
-/// in the daemon client: prefer the env var override, fall back to a
-/// sibling of the current executable. Used by codex worker spawn to
-/// register the relay in the user's global ~/.codex/config.toml.
-fn resolve_relay_exe() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("TEAM_MODE_MCP_EXE") {
-        return Ok(PathBuf::from(p));
-    }
-    let mut exe = std::env::current_exe()
-        .map_err(|e| Error::Other(format!("current_exe failed: {e}")))?;
-    #[cfg(target_os = "windows")]
-    exe.set_file_name("team_mode_mcp.exe");
-    #[cfg(not(target_os = "windows"))]
-    exe.set_file_name("team_mode_mcp");
-    if exe.exists() {
-        Ok(exe)
-    } else {
-        Err(Error::Other(format!(
-            "team_mode_mcp relay not found next to current exe (looked at {}); \
-             set TEAM_MODE_MCP_EXE to override",
-            exe.display()
-        )))
-    }
 }
 
 /// TOML basic-string escape — handles backslash + double-quote (the
@@ -430,6 +434,12 @@ impl AgentBackend for CodexBackend {
         let ready_tx = output_tx.clone();
         let reader_alive = alive.clone();
         let reader_name = agent_name.clone();
+        // Active turn tracking for `interrupt_turn`. The reader task captures
+        // the turn id from `turn/started` events and clears it on
+        // `turn/completed`. `interrupt_turn` reads this snapshot to decide
+        // whether to issue a protocol-level interrupt or report "idle".
+        let active_turn_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let reader_active_turn_id = active_turn_id.clone();
 
         let reader_handle = tokio::spawn(async move {
             debug!(agent = %reader_name, "Background Codex reader started");
@@ -458,6 +468,29 @@ impl AgentBackend for CodexBackend {
                         // Try to parse as a JSON-RPC message
                         match serde_json::from_str::<JsonRpcMessage>(trimmed) {
                             Ok(JsonRpcMessage::Notification(notif)) => {
+                                // Track active turn id from `turn/started` /
+                                // `turn/completed` events. Stored in
+                                // `reader_active_turn_id` so `interrupt_turn`
+                                // can address the in-flight turn by id.
+                                match notif.method.as_str() {
+                                    EVENT_TURN_STARTED => {
+                                        if let Some(tid) = notif
+                                            .params
+                                            .as_ref()
+                                            .and_then(|p| p.get("turn"))
+                                            .and_then(|t| t.get("id"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            *reader_active_turn_id.lock().await =
+                                                Some(tid.to_string());
+                                        }
+                                    }
+                                    EVENT_TURN_COMPLETED => {
+                                        *reader_active_turn_id.lock().await = None;
+                                    }
+                                    _ => {}
+                                }
+
                                 if let Some(output) = map_notification_to_output(&notif)
                                     && send_agent_output(
                                         &output_tx,
@@ -536,6 +569,7 @@ impl AgentBackend for CodexBackend {
             alive,
             reader_handle: Some(reader_handle),
             pending_system_prompt: Arc::new(Mutex::new(pending_system_prompt)),
+            active_turn_id,
         };
 
         Ok(Box::new(session))
@@ -564,6 +598,11 @@ struct CodexSession {
     /// rides along with the user's first real message instead of burning a
     /// dedicated turn at startup.
     pending_system_prompt: Arc<Mutex<Option<String>>>,
+    /// Set by the reader task on `turn/started` events; cleared on
+    /// `turn/completed`. `interrupt_turn` reads this to decide whether
+    /// to issue a `turn/interrupt` JSON-RPC (turn id present = active turn,
+    /// `None` = idle, no-op).
+    active_turn_id: Arc<Mutex<Option<String>>>,
 }
 
 #[async_trait]
@@ -640,6 +679,42 @@ impl AgentSession for CodexSession {
         // into `member.execution.session_id` lets the web UI render the
         // worker's exact transcript instead of falling back to mtime guesses.
         Some(self.thread_id.clone())
+    }
+
+    /// Issue a `turn/interrupt` JSON-RPC if the worker is currently
+    /// processing a turn; no-op if idle. Used by `send_message(preempt=true)`
+    /// to abort an in-flight turn so a follow-up message can be processed
+    /// immediately. Per app-server semantics the turn ends with
+    /// `turn/completed status="interrupted"`; in-flight shell commands the
+    /// turn already issued continue running (the protocol doesn't kill them).
+    async fn interrupt_turn(&self) -> Result<bool> {
+        if !self.alive.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let turn_id = match self.active_turn_id.lock().await.clone() {
+            Some(id) => id,
+            None => {
+                debug!(agent = %self.name, "interrupt_turn: no active turn, no-op");
+                return Ok(false);
+            }
+        };
+        let id = next_id(&self.request_id);
+        let req = JsonRpcRequest::new(
+            id,
+            METHOD_TURN_INTERRUPT,
+            Some(serde_json::json!({
+                "threadId": self.thread_id,
+                "turnId": turn_id,
+            })),
+        );
+        debug!(
+            agent = %self.name,
+            thread_id = %self.thread_id,
+            turn_id = %turn_id,
+            "interrupt_turn: sending turn/interrupt"
+        );
+        send_request(&self.stdin, &req).await?;
+        Ok(true)
     }
 
     async fn shutdown(&mut self) -> Result<()> {

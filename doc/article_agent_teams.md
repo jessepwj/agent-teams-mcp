@@ -1,4 +1,4 @@
-> **[HISTORICAL — 2026-04]** 本文是项目早期的中文技术文章，描述的是基于 TeamOrchestrator + task DAG + 共识协议 + ConversationMemory 的旧架构，包含 consensus/checkpoint/TUI 等现已移出产品核心的模块。当前项目已重构为以 7 个 MCP 工具为接口的 Team Mode runtime。仅作为项目演化记录保留，当前权威参见 docs/architecture-background.md。
+> **[HISTORICAL — 2026-04]** 本文是项目早期的中文技术文章，描述的是基于 TeamOrchestrator + task DAG + 共识协议 + ConversationMemory 的旧架构，包含 consensus/checkpoint/TUI 等现已移出产品核心的模块。当前项目已重构为以 7 个 MCP 工具为接口的 Team Mode runtime。仅作为项目演化记录保留，当前权威参见 ../.plans/agent-teams-v2/docs/05-design-history/architecture-background-2026-04.md。
 
 # agent-teams：用 Rust 编排多 AI Agent 协作
 

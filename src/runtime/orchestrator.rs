@@ -249,6 +249,21 @@ impl RuntimeOrchestrator {
         Ok(managed.session.is_alive().await)
     }
 
+    /// Forward a `turn/interrupt` request to the agent's backend. Returns
+    /// `Ok(true)` if a protocol-level interrupt was issued, `Ok(false)` if
+    /// the backend doesn't support interrupt or the agent is idle. Errors
+    /// indicate transport-level failures. Used by the
+    /// `send_message(preempt=true)` MCP tool path.
+    pub async fn interrupt_turn(&self, member_id: impl AsRef<str>) -> Result<bool> {
+        let member_id = member_id.as_ref();
+        let managed = self.sessions.get(member_id).ok_or_else(|| {
+            Error::Other(format!(
+                "no managed session registered for spawn_key '{member_id}'"
+            ))
+        })?;
+        managed.session.interrupt_turn().await
+    }
+
     /// Whether the orchestrator currently has a registered session entry
     /// for `member_id`, regardless of whether the underlying child process
     /// is alive. Useful when the caller wants to decide whether re-spawn

@@ -335,6 +335,19 @@ pub trait AgentSession: Send + Sync {
     fn session_id(&self) -> Option<String> {
         None
     }
+
+    /// Attempt to interrupt the agent's current turn so a follow-up message
+    /// can be processed immediately. Returns `Ok(true)` if a protocol-level
+    /// interrupt was issued, `Ok(false)` if the backend doesn't support
+    /// interrupt or the agent is currently idle (no active turn). Errors
+    /// indicate transport-level failures.
+    ///
+    /// Used by the `send_message(preempt=true)` MCP tool path. Backends that
+    /// can't interrupt return the default `Ok(false)`; callers always treat
+    /// the new message as enqueued normally regardless of interrupt outcome.
+    async fn interrupt_turn(&self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // ---------------------------------------------------------------------------

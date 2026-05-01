@@ -75,6 +75,7 @@ async fn gemini_spawn_and_receive_output() {
                 AgentOutput::Message(text) => {
                     collected_text.push_str(&text);
                 }
+                AgentOutput::ToolOutput(_) => {}
                 AgentOutput::TurnComplete => {
                     got_turn_complete = true;
                     break;
@@ -120,6 +121,7 @@ async fn gemini_spawn_and_receive_output() {
                 AgentOutput::Message(text) => {
                     second_text.push_str(&text);
                 }
+                AgentOutput::ToolOutput(_) => {}
                 AgentOutput::TurnComplete => {
                     got_second_complete = true;
                     break;
@@ -227,6 +229,7 @@ async fn gemini_via_orchestrator() {
                     review_text.push('\n');
                 }
                 AgentOutput::Message(t) => review_text.push_str(&t),
+                AgentOutput::ToolOutput(_) => {}
                 AgentOutput::TurnComplete => break,
                 AgentOutput::Error(e) => panic!("Error: {e}"),
                 AgentOutput::Idle => break,
