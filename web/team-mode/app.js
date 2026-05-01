@@ -38,6 +38,9 @@ async function loadTeams() {
       state.diagnostics = null;
       state.diagnosticsError = "";
       state.diagnosticsLoading = false;
+      if (typeof closeTeamEvents === "function") {
+        closeTeamEvents();
+      }
       renderShell();
     }
   } catch (error) {
@@ -55,6 +58,9 @@ async function loadTeams() {
     state.diagnostics = null;
     state.diagnosticsError = "";
     state.diagnosticsLoading = false;
+    if (typeof closeTeamEvents === "function") {
+      closeTeamEvents();
+    }
     renderShell();
   } finally {
     state.loadingTeams = false;
@@ -85,6 +91,7 @@ function renderTeamSelect() {
 }
 
 async function loadTeam(teamId) {
+  const shouldOpenAtLatest = state.teamId !== teamId || !state.room;
   state.loadingTeam = true;
   state.teamError = "";
   state.detailError = "";
@@ -103,6 +110,9 @@ async function loadTeam(teamId) {
     state.teamDetail = teamDetail;
     state.room = room;
     state.members = members.members || [];
+    if (shouldOpenAtLatest) {
+      state.timelineForceScrollBottom = true;
+    }
     state.failedTeamId = null;
     applyDeepLink();
     if (!state.selectedMessageId && !state.selectedMemberName) {
@@ -110,6 +120,9 @@ async function loadTeam(teamId) {
       state.detailTab = "session";
     }
     renderShell();
+    if (typeof openTeamEvents === "function") {
+      await openTeamEvents(teamId);
+    }
     await loadDiagnostics(teamId);
   } catch (error) {
     state.teamError = localizedError("failedLoadTeamData", error);
@@ -122,6 +135,9 @@ async function loadTeam(teamId) {
     state.selectedMessageId = null;
     state.selectedMemberName = null;
     state.diagnosticsLoading = false;
+    if (typeof closeTeamEvents === "function") {
+      closeTeamEvents();
+    }
     renderShell();
   } finally {
     state.loadingTeam = false;
@@ -199,6 +215,9 @@ async function refreshCurrentTeam() {
     state.teamDetail = teamDetail;
     state.room = room;
     state.members = members.members || [];
+    if (typeof reconcileDashboardWorkersFromMembers === "function") {
+      reconcileDashboardWorkersFromMembers(teamId, state.members);
+    }
     state.refreshError = "";
     consecutiveRefreshFailures = 0;
     if (state.selectedMemberName && !state.members.some((member) => member.name === state.selectedMemberName)) {
@@ -231,6 +250,9 @@ async function refreshCurrentTeam() {
       state.selectedMemberName = null;
       state.selectedMessageId = null;
       clearMemberDetailCache();
+      if (typeof closeTeamEvents === "function") {
+        closeTeamEvents();
+      }
       setDeepLink("team", null);
       consecutiveRefreshFailures = 0;
       loadTeams();
@@ -334,7 +356,7 @@ function bindColumnResizer(splitterId, side) {
   };
 
   splitter.addEventListener("pointerdown", (event) => {
-    if (window.matchMedia?.("(max-width: 960px)").matches) {
+    if (window.matchMedia?.("(max-width: 820px)").matches) {
       return;
     }
     event.preventDefault?.();
@@ -370,6 +392,9 @@ function bindEvents() {
   bindColumnResizer("leftSplitter", "left");
   bindColumnResizer("rightSplitter", "right");
   bindConversationEvents();
+  if (typeof bindDashboardEvents === "function") {
+    bindDashboardEvents();
+  }
 
   window.addEventListener?.("resize", () => {
     if (rightPaneUsesBalancedWidth()) {
@@ -409,6 +434,13 @@ function bindEvents() {
 
   $("sessionTabButton").addEventListener("click", async () => {
     state.detailTab = "session";
+    if (!state.selectedMemberName) {
+      state.selectedMemberName = leadMemberName() || state.members[0]?.name || null;
+      state.selectedMessageId = null;
+      if (state.selectedMemberName) {
+        setDeepLink("member", state.selectedMemberName);
+      }
+    }
     renderShell();
     if (state.selectedMemberName) {
       await refreshMemberConversation(state.selectedMemberName);

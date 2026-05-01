@@ -40,9 +40,10 @@ select {
 }
 
 .app-shell {
-  --left-pane-width: 260px;
-  --right-pane-width: 360px;
+  --left-pane-width: clamp(13rem, 18vw, 17rem);
+  --right-pane-width: clamp(19rem, 30vw, 28rem);
   height: 100vh;
+  height: 100dvh;
   min-height: 0;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
@@ -50,6 +51,7 @@ select {
 }
 
 .banner {
+  grid-row: 1;
   padding: 10px 16px;
   border-bottom: 1px solid var(--line);
   background: #121821;
@@ -74,11 +76,18 @@ select {
   background: rgba(16, 22, 29, 0.96);
 }
 
+.topbar {
+  grid-row: 2;
+}
+
 .statusbar {
+  grid-row: 4;
   border-bottom: 0;
   border-top: 1px solid var(--line);
   justify-content: space-between;
   color: var(--muted);
+  min-height: 36px;
+  padding: 7px 16px;
 }
 
 .brand {
@@ -101,10 +110,19 @@ select {
 
 .topbar-controls {
   flex: 1;
-  display: grid;
-  grid-template-columns: 180px minmax(180px, 1fr) auto auto auto;
-  gap: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
   align-items: end;
+  min-width: 0;
+}
+
+.topbar-controls .field:not(.grow) {
+  flex: 0 0 180px;
+}
+
+.topbar-controls .grow {
+  flex: 1 1 260px;
 }
 
 .field {
@@ -157,8 +175,14 @@ select {
 
 .workspace {
   display: grid;
-  grid-template-columns: var(--left-pane-width) 6px minmax(0, 1fr) 6px var(--right-pane-width);
+  grid-template-columns:
+    minmax(12rem, var(--left-pane-width))
+    6px
+    minmax(0, 1fr)
+    6px
+    minmax(18rem, var(--right-pane-width));
   gap: 0;
+  height: 100%;
   min-height: 0;
   overflow: hidden;
 }
@@ -174,6 +198,7 @@ select {
   display: grid;
   /* header / scrollable timeline / sticky composer at the bottom */
   grid-template-rows: auto minmax(0, 1fr) auto;
+  container: timeline-pane / inline-size;
   overflow: hidden;
 }
 
@@ -288,6 +313,7 @@ select {
 .detail-pane {
   border-right: 0;
   border-left: 1px solid var(--line);
+  container: detail-pane / inline-size;
   overflow: auto;
 }
 
@@ -454,6 +480,29 @@ select {
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.chat-expand-button {
+  justify-self: start;
+  width: fit-content;
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-system .chat-expand-button {
+  justify-self: center;
+}
+
+.chat-expand-button:hover,
+.chat-expand-button:focus-visible {
+  border-color: var(--accent);
+  outline: none;
 }
 
 .chat-status {
@@ -1065,6 +1114,10 @@ select {
   overflow: auto;
 }
 
+.tool-row.expanded .tool-row-collapsed-preview {
+  display: none;
+}
+
 .code-block,
 .tool-row-collapsed-preview {
   padding: 9px;
@@ -1219,25 +1272,38 @@ details.detail-card summary {
   font-size: 13px;
 }
 
-@media (max-width: 1200px) {
-  .workspace {
-    grid-template-columns: minmax(220px, var(--left-pane-width)) 6px minmax(0, 1fr) 6px minmax(300px, var(--right-pane-width));
+@container timeline-pane (max-width: 27rem) {
+  .composer-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .composer-mention {
+    grid-column: 1 / -1;
+    align-items: center;
+  }
+
+  .composer-select {
+    width: 100%;
+    max-width: none;
   }
 }
 
-@media (max-width: 960px) {
+@container detail-pane (max-width: 24rem) {
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 820px) {
   .topbar {
     flex-direction: column;
     align-items: stretch;
   }
 
-  .topbar-controls {
-    grid-template-columns: 1fr 1fr;
-  }
-
   .workspace {
     grid-template-columns: 1fr;
-    overflow: auto;
+    height: auto;
+    overflow: visible;
     align-content: start;
   }
 
@@ -1264,16 +1330,28 @@ details.detail-card summary {
 }
 
 @media (max-width: 720px) {
-  .topbar-controls {
-    grid-template-columns: 1fr;
-  }
-
   .statusbar {
-    flex-direction: column;
-    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+  }
+}
+
+@media (max-width: 560px) {
+  .topbar-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
 
-  .detail-grid {
-    grid-template-columns: 1fr;
+  .topbar-controls > * {
+    min-width: 0;
+  }
+
+  .view-tabs,
+  .live-pill {
+    width: 100%;
+  }
+
+  .live-pill {
+    justify-content: center;
   }
 }

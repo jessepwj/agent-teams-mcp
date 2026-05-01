@@ -1,5 +1,8 @@
 function renderShell() {
   renderStaticText();
+  if (typeof renderDashboardShell === "function") {
+    renderDashboardShell();
+  }
   renderEmptyOrErrorBanner();
   renderHeader();
   renderLeftPane();
@@ -54,14 +57,12 @@ function renderComposer() {
   // Repopulate the <select> only when the membership list changed; otherwise
   // re-renders during typing would reset the focused option to the first
   // entry and surprise the user.
-  const desired = candidates.map((m) => m.name).join(",");
+  const desired = candidates.map((m) => `${m.name}:${deriveWorkerStatusMeta(m).kind}`).join(",");
   if (select.dataset.populatedFor !== desired) {
     select.innerHTML = candidates
       .map(
         (m) =>
-          `<option value="${escapeAttr(m.name)}">${escapeHtml(m.name)}${
-            m.kind === "lead" ? ` (${escapeHtml(label("lead"))})` : ""
-          }</option>`,
+          `<option value="${escapeAttr(m.name)}">${escapeHtml(composerRecipientLabel(m))}</option>`,
       )
       .join("");
     select.dataset.populatedFor = desired;
@@ -75,6 +76,14 @@ function renderComposer() {
   }
 
   form.style.display = state.teamId && candidates.length ? "" : "none";
+}
+
+function composerRecipientLabel(member) {
+  if (member.kind === "lead") {
+    return `${member.name} (${label("lead")})`;
+  }
+  const meta = deriveWorkerStatusMeta(member);
+  return `${member.name} · ${meta.label}`;
 }
 
 async function submitComposer() {
@@ -189,6 +198,7 @@ function renderHeader() {
   const liveParts = [];
   if (state.loadingTeams || state.loadingTeam) liveParts.push(t("loading"));
   else liveParts.push(t("ready"));
+  if (typeof dashboardTransportSummary === "function") liveParts.push(dashboardTransportSummary());
   if (state.teamError) liveParts.push(t("error"));
   if (state.refreshError && !state.loadingTeam) liveParts.push(t("refreshFailedFlag"));
   $("liveStatus").textContent = `${t("livePrefix")}：${liveParts.join(" · ")}`;
@@ -208,7 +218,7 @@ function renderLeftPane() {
   } else if (state.members.length === 0) {
     memberList.innerHTML = `<div class="empty">${t("noMembers")}</div>`;
   } else {
-    memberList.innerHTML = state.members
+    memberList.innerHTML = membersForDisplay()
       .map((member) => {
         const active = member.name === state.selectedMemberName ? " active" : "";
         const hue = senderHue(member.name);
@@ -216,7 +226,7 @@ function renderLeftPane() {
           <button class="list-button${active}" type="button" data-member="${escapeHtml(member.name)}" style="--sender-hue: ${hue}">
             <div class="message-head">
               ${renderSenderBadge(member.name, member.kind)}
-              ${renderMemberStatus(member.sessionState)}
+              ${renderMemberStatus(member)}
             </div>
             <div class="subtle">${escapeHtml(label(member.roleLabel || ""))}</div>
           </button>
@@ -279,7 +289,7 @@ function renderTimeline() {
         return `
           <article class="chat-system${active}" data-message="${escapeHtml(message.id)}">
             <div class="chat-system-time">${fmtTime(message.createdAt)}</div>
-            <div class="chat-system-text">${renderChatText(message.bodyPreview || message.body || "")}</div>
+            ${renderTimelineMessageBody(message, "chat-system-text")}
           </article>
         `;
       }
@@ -298,11 +308,11 @@ function renderTimeline() {
           </button>
           <div class="chat-content">
             <div class="chat-meta">
-              <button class="link-button chat-name" type="button" data-sender="${escapeHtml(message.sender)}" style="color: hsl(${senderHueValue}, 80%, 75%)">${escapeHtml(message.sender)}</button>
+              <button class="link-button chat-name" type="button" data-sender="${escapeHtml(message.sender)}" title="${escapeHtml(message.sender)}" style="color: hsl(${senderHueValue}, 80%, 75%)">${escapeHtml(message.sender)}</button>
               <span class="chat-time">${fmtTime(message.createdAt)}</span>
               ${status}
             </div>
-            <div class="chat-bubble">${renderChatText(message.bodyPreview || message.body || "")}</div>
+            ${renderTimelineMessageBody(message, "chat-bubble")}
           </div>
         </article>
       `;
@@ -337,7 +347,45 @@ function renderTimeline() {
     });
   });
 
+  document.querySelectorAll("[data-message-expand]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const id = button.getAttribute("data-message-expand");
+      if (!id) return;
+      if (state.timelineExpandedMessages.has(id)) {
+        state.timelineExpandedMessages.delete(id);
+      } else {
+        state.timelineExpandedMessages.add(id);
+      }
+      renderTimeline();
+    });
+  });
+
   restoreTimelineScroll(scrollSnapshot);
+}
+
+function membersForDisplay() {
+  return [...(state.members || [])].sort((a, b) => {
+    const aLead = a.kind === "lead" || a.name === "lead";
+    const bLead = b.kind === "lead" || b.name === "lead";
+    if (aLead !== bLead) return aLead ? -1 : 1;
+    return String(a.name || "").localeCompare(String(b.name || ""));
+  });
+}
+
+function renderTimelineMessageBody(message, className) {
+  const fullText = message.body || "";
+  const previewText = message.bodyPreview || fullText;
+  const hasFullText = fullText && fullText !== previewText;
+  const expanded = state.timelineExpandedMessages.has(message.id);
+  const visibleText = hasFullText && expanded ? fullText : previewText;
+  const toggle = hasFullText
+    ? `<button class="chat-expand-button" type="button" data-message-expand="${escapeHtml(message.id)}">${expanded ? t("hideFullMessage") : t("showFullMessage")}</button>`
+    : "";
+  return `
+    <div class="${className}">${renderChatText(visibleText || "")}</div>
+    ${toggle}
+  `;
 }
 
 
@@ -424,14 +472,6 @@ function renderSessionPanel() {
     renderMemberConversation(state.selectedMemberName);
     return;
   }
-  if (state.selectedMessageId) {
-    const message = allMessages().find((item) => item.id === state.selectedMessageId);
-    if (message) {
-      $("detailTitle").textContent = `${t("message")} ${message.id}`;
-      $("detailBody").innerHTML = `<div class="empty">${t("pickMessageOrMember")}</div>`;
-      return;
-    }
-  }
   const lead = leadMemberName() || state.members[0]?.name || null;
   if (lead) {
     state.selectedMemberName = lead;
@@ -507,7 +547,7 @@ async function renderMessageDetail(message) {
                       ${renderSenderBadge(item.sender, item.senderKind)}
                       <span class="pill">${fmtTime(item.createdAt)}</span>
                     </div>
-                    <div class="message-body">${escapeHtml(item.bodyPreview || item.body || "")}</div>
+                    <div class="message-body">${escapeHtml(item.body || item.bodyPreview || "")}</div>
                   </div>
                 `,
               )
@@ -558,13 +598,21 @@ function renderMemberDetailContent(name, data, activity) {
   const envKeys = Array.isArray(execution.envKeys) ? execution.envKeys : [];
   const redactedEnv = execution.redactedEnv || {};
   const isLead = profile.kind === "lead" || isLeadName(name);
+  const currentMember = state.members.find((member) => member.name === name);
+  const statusMember = currentMember || {
+    name: profile.name || name,
+    kind: profile.kind,
+    status: profile.status,
+    sessionState: execution.sessionState,
+    lastActivityAt: summary.lastActivityAt,
+  };
   $("detailTitle").textContent = isLead ? t("leadActivity") : `${t("member")} ${name}`;
   $("detailBody").innerHTML = `
       <div class="detail-card">
         <div class="detail-head">
           ${renderSenderBadge(profile.name || name, profile.kind)}
           <span class="badge ${isLead ? "lead" : "worker"}">${escapeHtml(label(profile.kind || "member"))}</span>
-          ${renderMemberStatus(execution.sessionState)}
+          ${renderMemberStatus(statusMember)}
           <span class="pill">${escapeHtml(label(profile.roleLabel || ""))}</span>
         </div>
         <div class="subtle">${escapeHtml(profile.name || name)} · ${fmtTime(profile.joinedAt)}</div>
@@ -665,6 +713,12 @@ function renderFooter() {
   if (state.teamError) statusBits.push(t("teamLoadFailed"));
   if (state.refreshError) statusBits.push(state.refreshError);
   $("countsSummary").textContent = statusBits.join(" · ");
+  const revision = state.bundleRevision || document.querySelector('meta[name="bundle-revision"]')?.getAttribute("content") || "";
+  const bundleSummary = $("bundleRevisionSummary");
+  if (bundleSummary) {
+    bundleSummary.textContent = revision ? `Bundle ${revision.slice(0, 8)}` : "Bundle unknown";
+    bundleSummary.title = revision ? `Bundle revision ${revision}` : "Bundle revision unavailable";
+  }
 }
 
 function renderEmptyOrErrorBanner() {
@@ -688,6 +742,7 @@ function renderEmptyOrErrorBanner() {
 Object.assign(globalThis, {
   renderShell,
   composerRecipientCandidates,
+  composerRecipientLabel,
   renderComposer,
   submitComposer,
   setComposerStatus,

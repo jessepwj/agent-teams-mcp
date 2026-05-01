@@ -169,39 +169,118 @@ function avatarInitials(name) {
   return trimmed.slice(0, 2).toUpperCase();
 }
 
-/// Map a raw `sessionState` (from the read_model) to a visual presentation:
+const ACTIVE_MEMBER_WINDOW_MS = 5 * 60 * 1000;
+
+/// Map member state to a visual presentation. `sessionState=running` only
+/// means the worker process is alive; recent `lastActivityAt` distinguishes
+/// actively working members from idle-but-alive members.
 /// tone class controls colour, anim controls dot motion, labelKey is the
 /// raw label that flows through the i18n `label()` lookup. The lead member
 /// is the only state where "static" is appropriate even though the process
 /// is healthy — because lead is not a managed worker, "running" semantics
 /// don't apply and the cyan tone is the brand accent.
-function memberStatusMeta(sessionState) {
-  const raw = String(sessionState || "unknown").toLowerCase();
+function deriveWorkerStatusMeta(member = {}, execution = {}, runtime = {}) {
+  const profile = member?.profile || member || {};
+  const memberName = profile.name || member.name || runtime.name || "";
+  const memberKind = profile.kind || member.kind || "";
+  const profileStatus = profile.status || member.status || "";
+  const profileActive = profile.active ?? member.active ?? (profileStatus ? profileStatus === "active" : true);
+  const activityAt =
+    runtime.lastActivityAt ||
+    member.lastActivityAt ||
+    execution.lastActivityAt ||
+    member.activity?.lastActivityAt ||
+    null;
+  const explicitAlive = runtime.alive;
+  const sessionState =
+    execution.sessionState ||
+    runtime.sessionState ||
+    member.sessionState ||
+    member.status ||
+    (explicitAlive === true ? "alive" : explicitAlive === false ? "dead" : "unknown");
+  const raw = String(explicitAlive === false ? "dead" : sessionState || "unknown").toLowerCase();
+  const finish = (tone, anim, kind, lastActivity = null) => {
+    const labelText = label(kind);
+    return {
+      kind,
+      label: labelText,
+      badge_color: tone,
+      ring_color: tone,
+      tone,
+      anim,
+      raw: kind,
+      lastActivityAt: lastActivity,
+    };
+  };
+  if (memberKind === "lead" || memberName === "lead" || raw === "coordinator") {
+    return finish("lead", "static", raw === "coordinator" ? "coordinator" : "active", activityAt);
+  }
+  if (!profileActive) {
+    return finish("muted", "static", String(profileStatus || "stopped").toLowerCase(), activityAt);
+  }
   switch (raw) {
-    case "coordinator":
-      return { tone: "lead", anim: "static", raw };
     case "running":
-      return { tone: "good", anim: "pulse", raw };
+    case "alive": {
+      const freshness = memberActivityFreshness(activityAt);
+      if (freshness === "idle") {
+        return finish("muted", "static", "idle", activityAt);
+      }
+      if (freshness === "active") {
+        return finish("good", "pulse", "active", activityAt);
+      }
+      return finish("good", "static", "online", activityAt);
+    }
     case "starting":
-      return { tone: "warn", anim: "spin", raw };
+    case "spawn":
+      return finish("warn", "spin", raw);
+    case "revived":
+      return finish("good", "pulse", raw, activityAt);
+    case "active":
+      return finish("good", "pulse", raw, activityAt);
+    case "online":
+      return finish("good", "static", raw, activityAt);
+    case "idle":
+      return finish("muted", "static", raw, activityAt);
     case "dead":
     case "failed":
-      return { tone: "bad", anim: "static", raw };
+      return finish("bad", "static", raw);
     case "stopped":
     case "paused":
-      return { tone: "muted", anim: "static", raw };
+      return finish("muted", "static", raw);
     case "not_spawned":
     case "not-spawned":
-      return { tone: "muted", anim: "static", raw: "not_spawned" };
+      return finish("muted", "static", "not_spawned");
+    case "pending":
+      return finish("muted", "static", raw);
     default:
-      return { tone: "muted", anim: "static", raw: "unknown" };
+      return finish("muted", "static", "unknown");
   }
 }
 
-function renderMemberStatus(sessionState) {
-  const meta = memberStatusMeta(sessionState);
-  const text = label(meta.raw);
-  return `<span class="status-pill status-${meta.tone}" title="${escapeAttr(text)}">
+function memberStatusMeta(memberOrSessionState, lastActivityAt = null) {
+  const isObject = memberOrSessionState && typeof memberOrSessionState === "object";
+  const member = isObject
+    ? memberOrSessionState
+    : { sessionState: memberOrSessionState, lastActivityAt };
+  return deriveWorkerStatusMeta(member, {}, { lastActivityAt });
+}
+
+function memberActivityFreshness(lastActivityAt) {
+  if (!lastActivityAt) {
+    return "unknown";
+  }
+  const timestamp = Date.parse(lastActivityAt);
+  if (!Number.isFinite(timestamp)) {
+    return "unknown";
+  }
+  return Date.now() - timestamp <= ACTIVE_MEMBER_WINDOW_MS ? "active" : "idle";
+}
+
+function renderMemberStatus(memberOrSessionState, lastActivityAt = null) {
+  const meta = memberStatusMeta(memberOrSessionState, lastActivityAt);
+  const text = meta.label || label(meta.raw);
+  const title = meta.lastActivityAt ? `${text} · ${fmtTime(meta.lastActivityAt)}` : text;
+  return `<span class="status-pill status-${meta.tone}" title="${escapeAttr(title)}">
     <span class="status-dot status-dot-${meta.anim}" aria-hidden="true"></span>
     <span class="status-text">${escapeHtml(text)}</span>
   </span>`;
@@ -239,7 +318,9 @@ Object.assign(globalThis, {
   restoreTimelineScroll,
   isSystemChatMessage,
   avatarInitials,
+  deriveWorkerStatusMeta,
   memberStatusMeta,
+  memberActivityFreshness,
   renderMemberStatus,
   renderChatDeliveryStatus,
   renderChatText,

@@ -437,27 +437,24 @@ function renderSystemItem(item) {
 }
 
 function renderToolCallItem(item) {
-  const expandable = !toolHasCollapsedPreview(item);
-  const expandedByDefault = expandable && ["Edit", "TodoWrite"].includes(item.toolName);
+  const hasCollapsedPreview = toolHasCollapsedPreview(item);
+  const expandable = true;
+  const expandedByDefault = !hasCollapsedPreview && ["Edit", "TodoWrite"].includes(item.toolName);
   const summary = getToolSummary(item);
   const statusLabel = toolStatusLabel(item.status);
-  const preview = toolHasCollapsedPreview(item) ? renderToolCollapsedPreview(item) : "";
+  const preview = hasCollapsedPreview ? renderToolCollapsedPreview(item) : "";
   return `
-    <div class="tool-row timeline-item ${expandedByDefault ? "expanded" : "collapsed"} status-${escapeHtml(item.status)} ${expandable ? "" : "interactive"}" data-tool-row>
-      <div class="tool-row-header ${expandable ? "" : "non-expandable"}" ${expandable ? `role="button" tabindex="0" title="${t("showDetails")}"` : ""}>
+    <div class="tool-row timeline-item ${expandedByDefault ? "expanded" : "collapsed"} status-${escapeHtml(item.status)}" data-tool-row>
+      <div class="tool-row-header" role="button" tabindex="0" title="${t("showDetails")}">
         ${item.status === "pending" ? `<span class="tool-spinner" aria-label="${t("running")}"></span>` : ""}
         ${item.status === "aborted" ? `<span class="tool-aborted-icon">×</span>` : ""}
         <span class="tool-name">${escapeHtml(toolDisplayName(item.toolName))}</span>
-        <span class="tool-summary">${escapeHtml(summary)}${item.status === "aborted" ? ` <span class="tool-aborted-label">(${t("interrupted")})</span>` : ""}</span>
+        <span class="tool-summary" title="${escapeHtml(summary)}">${escapeHtml(summary)}${item.status === "aborted" ? ` <span class="tool-aborted-label">(${t("interrupted")})</span>` : ""}</span>
         <span class="tool-status">${escapeHtml(statusLabel)}</span>
-        ${expandable ? `<span class="expand-chevron" aria-hidden="true">${expandedByDefault ? "▾" : "▸"}</span>` : ""}
+        <span class="expand-chevron" aria-hidden="true">${expandedByDefault ? "▾" : "▸"}</span>
       </div>
       ${preview}
-      ${
-        expandable
-          ? `<div class="tool-row-content">${renderToolExpandedContent(item)}</div>`
-          : ""
-      }
+      <div class="tool-row-content">${renderToolExpandedContent(item)}</div>
     </div>
   `;
 }

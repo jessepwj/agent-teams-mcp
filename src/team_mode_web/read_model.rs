@@ -17,9 +17,11 @@ use super::state::TeamModeWebState;
 
 mod conversation;
 mod diagnostics;
+mod events;
 
 pub use conversation::read_member_conversation;
 pub use diagnostics::read_diagnostics;
+pub use events::read_events;
 
 /// Reserved sender name for messages originating from the read-only web UI.
 ///
@@ -527,9 +529,7 @@ fn execution_session_state_label(
     // Skip the synthetic web-user member — it has no execution profile and
     // the sidecar would always say "not-spawned"; keep the existing label
     // (`not_spawned`) for it.
-    if member.profile.role_label == WEB_USER_ROLE_LABEL
-        && member.profile.name == WEB_USER_SENDER
-    {
+    if member.profile.role_label == WEB_USER_ROLE_LABEL && member.profile.name == WEB_USER_SENDER {
         return "not_spawned".into();
     }
     // Cross-reference the disk session_state with the runtime sidecar so

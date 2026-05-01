@@ -1,6 +1,6 @@
 const REFRESH_INTERVAL_MS = 2000;
 const COLUMN_WIDTHS_STORAGE_KEY = "team-mode-web-column-widths";
-const DEFAULT_COLUMN_WIDTHS = { left: 260, right: null };
+const DEFAULT_COLUMN_WIDTHS = { left: null, right: null };
 const FALLBACK_RIGHT_PANE_WIDTH = 360;
 const TIMELINE_BOTTOM_THRESHOLD_PX = 120;
 const COLUMN_LIMITS = {
@@ -27,6 +27,9 @@ const state = {
   diagnostics: null,
   diagnosticsError: "",
   diagnosticsLoading: false,
+  bundleRevision: document
+    .querySelector('meta[name="bundle-revision"]')
+    ?.getAttribute("content") || "",
   deepLink: null,
   failedTeamId: null,
   memberDetailKey: "",
@@ -42,6 +45,7 @@ const state = {
   composerMentions: [],
   composerSending: false,
   timelineForceScrollBottom: false,
+  timelineExpandedMessages: new Set(),
   columnWidths: loadColumnWidths(),
   detailTab: "session",
 };
@@ -86,11 +90,15 @@ const STRINGS = {
     noFinalReply: "暂无最终回复",
     thinking: "思考",
     running: "运行中",
+    online: "在线",
+    idle: "空闲",
     complete: "完成",
     failed: "失败",
     interrupted: "已中断",
     showDetails: "展开详情",
     hideDetails: "收起详情",
+    showFullMessage: "展开全文",
+    hideFullMessage: "收起",
     copy: "复制",
     copied: "已复制",
     noSelection: "未选择",
@@ -245,11 +253,15 @@ const STRINGS = {
     noFinalReply: "No final reply",
     thinking: "Thinking",
     running: "Running",
+    online: "Online",
+    idle: "Idle",
     complete: "Complete",
     failed: "Failed",
     interrupted: "Interrupted",
     showDetails: "Show details",
     hideDetails: "Hide details",
+    showFullMessage: "Show full message",
+    hideFullMessage: "Collapse",
     copy: "Copy",
     copied: "Copied",
     noSelection: "No selection",
@@ -397,9 +409,12 @@ function loadColumnWidths() {
       return fallback;
     }
     const stored = JSON.parse(localStorage.getItem(COLUMN_WIDTHS_STORAGE_KEY) || "{}");
+    const storedLeft = Number(stored.left);
     const storedRight = Number(stored.right);
     return {
-      left: clamp(Number(stored.left) || fallback.left, COLUMN_LIMITS.left.min, COLUMN_LIMITS.left.max),
+      left: Number.isFinite(storedLeft) && storedLeft > 0
+        ? clamp(storedLeft, COLUMN_LIMITS.left.min, COLUMN_LIMITS.left.max)
+        : null,
       right: Number.isFinite(storedRight) && storedRight > 0
         ? clamp(storedRight, COLUMN_LIMITS.right.min, COLUMN_LIMITS.right.max)
         : null,
@@ -425,8 +440,21 @@ function applyColumnWidths() {
   if (!workspace?.style?.setProperty) {
     return;
   }
-  workspace.style.setProperty("--left-pane-width", `${state.columnWidths.left}px`);
-  workspace.style.setProperty("--right-pane-width", `${resolvedRightPaneWidth(workspace)}px`);
+  applyOptionalColumnWidth(workspace, "--left-pane-width", state.columnWidths.left);
+  applyOptionalColumnWidth(workspace, "--right-pane-width", state.columnWidths.right);
+}
+
+function applyOptionalColumnWidth(workspace, name, value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    workspace.style.setProperty(name, `${numeric}px`);
+    return;
+  }
+  if (typeof workspace.style.removeProperty === "function") {
+    workspace.style.removeProperty(name);
+    return;
+  }
+  workspace.style.values?.delete?.(name);
 }
 
 function resolvedRightPaneWidth(workspace = $("workspace")) {
@@ -435,13 +463,18 @@ function resolvedRightPaneWidth(workspace = $("workspace")) {
     return clamp(explicitRight, COLUMN_LIMITS.right.min, COLUMN_LIMITS.right.max);
   }
 
+  const measured = measuredPaneWidth("right");
+  if (Number.isFinite(measured) && measured > 0) {
+    return clamp(Math.round(measured), COLUMN_LIMITS.right.min, COLUMN_LIMITS.right.max);
+  }
+
   const workspaceWidth = Number(workspace?.clientWidth);
   if (!Number.isFinite(workspaceWidth) || workspaceWidth <= 0) {
     return FALLBACK_RIGHT_PANE_WIDTH;
   }
 
   const splitterWidth = 12;
-  const remaining = workspaceWidth - state.columnWidths.left - splitterWidth;
+  const remaining = workspaceWidth - resolvedPaneWidth("left") - splitterWidth;
   return clamp(
     Math.round(remaining / 2),
     COLUMN_LIMITS.right.min,
@@ -450,12 +483,33 @@ function resolvedRightPaneWidth(workspace = $("workspace")) {
 }
 
 function resolvedPaneWidth(side) {
-  return side === "right" ? resolvedRightPaneWidth() : state.columnWidths.left;
+  const explicit = Number(state.columnWidths[side]);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return clamp(explicit, COLUMN_LIMITS[side].min, COLUMN_LIMITS[side].max);
+  }
+  if (side === "right") {
+    return resolvedRightPaneWidth();
+  }
+  const measured = measuredPaneWidth("left");
+  if (Number.isFinite(measured) && measured > 0) {
+    return clamp(Math.round(measured), COLUMN_LIMITS.left.min, COLUMN_LIMITS.left.max);
+  }
+  return 260;
 }
 
 function rightPaneUsesBalancedWidth() {
   const explicitRight = Number(state.columnWidths.right);
   return !(Number.isFinite(explicitRight) && explicitRight > 0);
+}
+
+function measuredPaneWidth(side) {
+  const pane = side === "right" ? $("detailPane") : document.querySelector?.(".left-pane");
+  const rectWidth = Number(pane?.getBoundingClientRect?.().width);
+  if (Number.isFinite(rectWidth) && rectWidth > 0) {
+    return rectWidth;
+  }
+  const clientWidth = Number(pane?.clientWidth);
+  return Number.isFinite(clientWidth) && clientWidth > 0 ? clientWidth : null;
 }
 
 const VALUE_LABELS = {
@@ -465,6 +519,8 @@ const VALUE_LABELS = {
     worker: "工作者",
     coordinator: "主协调",
     running: "运行中",
+    online: "在线",
+    idle: "空闲",
     starting: "启动中",
     failed: "失败",
     dead: "已离线",
@@ -472,6 +528,9 @@ const VALUE_LABELS = {
     paused: "已暂停",
     not_spawned: "未启动",
     active: "活跃",
+    alive: "在线",
+    revived: "已恢复",
+    spawn: "启动中",
     removed: "已移除",
     unknown: "未知",
     delivered: "已投递",
@@ -509,6 +568,8 @@ const VALUE_LABELS = {
   en: {
     coordinator: "Coordinator",
     running: "Running",
+    online: "Online",
+    idle: "Idle",
     starting: "Starting",
     failed: "Failed",
     dead: "Offline",
@@ -516,6 +577,9 @@ const VALUE_LABELS = {
     paused: "Paused",
     not_spawned: "Not spawned",
     unknown: "Unknown",
+    alive: "Online",
+    revived: "Revived",
+    spawn: "Spawning",
   },
 };
 

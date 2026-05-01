@@ -11,6 +11,7 @@ use agent_teams::team_mode::domain::{
     DeliveryStatus, ExecutionMode, ExecutionProfile, MemberKind, Message, MessageKind,
     VisibilityRule,
 };
+use agent_teams::team_mode::runtime_workers::{RuntimeWorkerStore, STATE_RUNNING};
 use agent_teams::team_mode::service::member_service::AddMemberRequest;
 use agent_teams::team_mode::service::{
     CreateTeamRequest, InboxService, MessageService, TeamService,
@@ -18,9 +19,11 @@ use agent_teams::team_mode::service::{
 use agent_teams::team_mode::storage::{
     MemberStore, MessageStore, ProjectionStore, RoomStore, TeamStore,
 };
-use agent_teams::team_mode_web::router;
 use agent_teams::team_mode_web::routes::WebResponse;
-use chrono::{TimeZone, Utc};
+use agent_teams::team_mode_web::{
+    StaticBundleMode, TeamModeWebApp, TeamModeWebServerConfig, router,
+};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use tempfile::tempdir;
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -95,6 +98,7 @@ fn seed_data_with_cwd(base_dir: &std::path::Path, cwd: Option<&str>) {
                 skills: vec!["review".into()],
                 session_state: Some(ExecutionSessionState::Running),
                 session_id: None,
+                reasoning_effort: None,
             }),
         })
         .unwrap();
@@ -168,6 +172,346 @@ fn json(response: &WebResponse) -> serde_json::Value {
     serde_json::from_slice(&response.body).unwrap()
 }
 
+fn write_claude_session_fixture(home: &Path, repo_path: &Path, session_id: &str, content: &str) {
+    let mut candidates = Vec::new();
+    if let Ok(canonical) = repo_path.canonicalize() {
+        candidates.push(strip_windows_ext_prefix_for_test(&canonical));
+        candidates.push(canonical);
+    }
+    candidates.push(repo_path.to_path_buf());
+
+    for candidate in candidates {
+        let encoded = agent_teams::util::session_discovery::encode_project_path(&candidate);
+        let session_dir = home.join(".claude").join("projects").join(encoded);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join(format!("{session_id}.jsonl")), content).unwrap();
+    }
+}
+
+fn strip_windows_ext_prefix_for_test(path: &Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn html_visible_text_contains(html: &str, needle: &str) -> bool {
+    let mut visible = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+    let mut tag = String::new();
+    for ch in html.chars() {
+        if in_tag {
+            if ch == '>' {
+                let tag_name = tag.trim_start().to_ascii_lowercase();
+                if tag_name.starts_with("script") {
+                    in_script = true;
+                } else if tag_name.starts_with("/script") {
+                    in_script = false;
+                } else if tag_name.starts_with("style") {
+                    in_style = true;
+                } else if tag_name.starts_with("/style") {
+                    in_style = false;
+                }
+                tag.clear();
+                in_tag = false;
+            } else {
+                tag.push(ch);
+            }
+        } else if ch == '<' {
+            in_tag = true;
+        } else if !in_script && !in_style {
+            visible.push(ch);
+        }
+    }
+    visible.contains(needle)
+}
+
+fn frontend_js_bundle(app: &agent_teams::team_mode_web::TeamModeWebApp) -> String {
+    let mut bundle = String::new();
+    for asset in [
+        "/app.js",
+        "/app-state.js",
+        "/app-api.js",
+        "/app-utils.js",
+        "/app-diagnostics.js",
+        "/app-render.js",
+        "/app-conversation.js",
+        "/app-dashboard.js",
+        "/app-dashboard-render.js",
+    ] {
+        let response = app.handle_request("GET", asset);
+        assert_eq!(response.status as u16, 200, "missing JS asset: {asset}");
+        assert!(
+            response.content_type.starts_with("application/javascript"),
+            "unexpected JS content-type for {asset}: {}",
+            response.content_type
+        );
+        bundle.push_str(&response.body_text());
+        bundle.push('\n');
+    }
+    bundle
+}
+
+fn next_events_cursor(app: &agent_teams::team_mode_web::TeamModeWebApp) -> String {
+    let response = app.handle_request("GET", "/api/teams/demo/events");
+    assert_eq!(response.status as u16, 200);
+    json(&response)["page"]["nextCursor"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn hex_encode_for_test(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn save_event_message(base_dir: &Path, id: &str, created_at: DateTime<Utc>) {
+    MessageStore::new(base_dir)
+        .save(&Message {
+            id: id.into(),
+            room_id: "main".into(),
+            team_id: Some("demo".into()),
+            thread_id: Some(format!("{id}-thread")),
+            reply_to: None,
+            sender: "lead".into(),
+            kind: MessageKind::Dispatch,
+            subject: Some("Event".into()),
+            body: "Please inspect @alice".into(),
+            mentions: vec!["alice".into()],
+            visibility: vec![VisibilityRule::Team],
+            audience_policy: None,
+            effective_visibility_reason: None,
+            effective_recipients: vec!["alice".into()],
+            delivered_to: vec!["alice".into()],
+            dropped_for: vec![],
+            read_by: vec![],
+            acked_by: vec![],
+            delivery_status: DeliveryStatus::Delivered,
+            created_at,
+            expires_at: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn events_empty_team_returns_empty_response_with_cursor() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let app = router(dir.path());
+
+    let response = app.handle_request("GET", "/api/teams/demo/events");
+    assert_eq!(response.status as u16, 200);
+    let events = json(&response);
+    assert_eq!(events["teamId"], "demo");
+    assert!(!events["generatedAt"].as_str().unwrap().is_empty());
+    assert!(events["events"].as_array().unwrap().is_empty());
+    assert_eq!(events["page"]["hasMoreAfter"], false);
+    assert!(!events["page"]["nextCursor"].as_str().unwrap().is_empty());
+    assert!(events["limitations"].as_array().unwrap().is_empty());
+
+    let empty_cursor_response = app.handle_request("GET", "/api/teams/demo/events?cursor=");
+    assert_eq!(empty_cursor_response.status as u16, 200);
+    assert!(
+        json(&empty_cursor_response)["events"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn events_invalid_cursor_returns_400() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let app = router(dir.path());
+
+    let response = app.handle_request("GET", "/api/teams/demo/events?cursor=not-hex");
+
+    assert_eq!(response.status as u16, 400);
+    assert_eq!(
+        json(&response),
+        serde_json::json!({ "error": "invalid cursor" })
+    );
+}
+
+#[test]
+fn events_tampered_cursor_payload_returns_400() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let app = router(dir.path());
+    let cursor = hex_encode_for_test("[\"not\", \"a\", \"cursor\", \"object\"]");
+
+    let response = app.handle_request("GET", &format!("/api/teams/demo/events?cursor={cursor}"));
+
+    assert_eq!(response.status as u16, 400);
+    assert_eq!(
+        json(&response),
+        serde_json::json!({ "error": "invalid cursor" })
+    );
+}
+
+#[test]
+fn events_after_cursor_returns_message_created() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let app = router(dir.path());
+    let cursor = next_events_cursor(&app);
+
+    save_event_message(dir.path(), "msg-event-1", Utc::now());
+
+    let response = app.handle_request("GET", &format!("/api/teams/demo/events?cursor={cursor}"));
+    assert_eq!(response.status as u16, 200);
+    let events = json(&response);
+    let items = events["events"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["eventType"], "messageCreated");
+    assert_eq!(items[0]["source"], "messages");
+    assert_eq!(items[0]["payload"]["message"]["id"], "msg-event-1");
+    assert_eq!(items[0]["payload"]["message"]["sender"], "lead");
+}
+
+#[test]
+fn events_pagination_with_limit_does_not_skip_events() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let app = router(dir.path());
+    let mut cursor = next_events_cursor(&app);
+
+    let first_at = Utc::now() + Duration::seconds(1);
+    save_event_message(dir.path(), "msg-event-page-1", first_at);
+    save_event_message(
+        dir.path(),
+        "msg-event-page-2",
+        first_at + Duration::seconds(1),
+    );
+    save_event_message(
+        dir.path(),
+        "msg-event-page-3",
+        first_at + Duration::seconds(2),
+    );
+
+    let mut seen = Vec::new();
+    loop {
+        let response = app.handle_request(
+            "GET",
+            &format!("/api/teams/demo/events?cursor={cursor}&limit=1"),
+        );
+        assert_eq!(response.status as u16, 200);
+        let page = json(&response);
+        let items = page["events"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        seen.push(
+            items[0]["payload"]["message"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        cursor = page["page"]["nextCursor"].as_str().unwrap().to_string();
+        if !page["page"]["hasMoreAfter"].as_bool().unwrap() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        seen,
+        vec!["msg-event-page-1", "msg-event-page-2", "msg-event-page-3"]
+    );
+}
+
+#[test]
+fn events_returns_file_changed_when_lead_pending_changes_without_consuming() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let app = router(dir.path());
+    let cursor = next_events_cursor(&app);
+    let pending_path = dir.path().join("demo").join("lead_pending.jsonl");
+    fs::write(&pending_path, "{\"team\":\"demo\",\"body\":\"wake\"}\n").unwrap();
+
+    let response = app.handle_request("GET", &format!("/api/teams/demo/events?cursor={cursor}"));
+    assert_eq!(response.status as u16, 200);
+    let events = json(&response);
+    let items = events["events"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["eventType"], "fileChanged");
+    assert_eq!(items[0]["source"], "filesystem");
+    assert_eq!(items[0]["payload"]["fileId"], "leadPending");
+    assert_eq!(items[0]["payload"]["path"], "demo/lead_pending.jsonl");
+    assert_eq!(items[0]["payload"]["changeKind"], "modified");
+    assert_eq!(
+        fs::read_to_string(&pending_path).unwrap(),
+        "{\"team\":\"demo\",\"body\":\"wake\"}\n"
+    );
+}
+
+#[test]
+fn events_ignore_legacy_root_lead_pending_file() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let app = router(dir.path());
+    let cursor = next_events_cursor(&app);
+    let legacy_pending_path = dir.path().join("lead_pending.jsonl");
+    fs::write(
+        &legacy_pending_path,
+        "{\"team\":\"demo\",\"body\":\"legacy wake\"}\n",
+    )
+    .unwrap();
+
+    let response = app.handle_request("GET", &format!("/api/teams/demo/events?cursor={cursor}"));
+    assert_eq!(response.status as u16, 200);
+    let events = json(&response);
+    let items = events["events"].as_array().unwrap();
+    assert!(items.is_empty());
+    assert_eq!(
+        fs::read_to_string(&legacy_pending_path).unwrap(),
+        "{\"team\":\"demo\",\"body\":\"legacy wake\"}\n"
+    );
+}
+
+#[test]
+fn events_returns_worker_status_changed_for_runtime_worker() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let app = router(dir.path());
+    let cursor = next_events_cursor(&app);
+
+    RuntimeWorkerStore::new(dir.path())
+        .upsert_state(
+            "demo",
+            "bob",
+            "demo__bob",
+            Some("codex".into()),
+            STATE_RUNNING,
+            Some("spawned for test".into()),
+        )
+        .unwrap();
+
+    let response = app.handle_request("GET", &format!("/api/teams/demo/events?cursor={cursor}"));
+    assert_eq!(response.status as u16, 200);
+    let events = json(&response);
+    let items = events["events"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["eventType"], "workerStatusChanged");
+    assert_eq!(items[0]["source"], "runtimeWorkers");
+    assert_eq!(items[0]["payload"]["workerName"], "bob");
+    assert_eq!(items[0]["payload"]["sessionState"], STATE_RUNNING);
+    assert_eq!(items[0]["payload"]["lifecycleEvent"], "alive");
+}
+
 #[test]
 fn healthz_and_read_routes_work() {
     let dir = tempdir().unwrap();
@@ -177,6 +521,14 @@ fn healthz_and_read_routes_work() {
     let response = app.handle_request("GET", "/healthz");
     assert_eq!(response.status as u16, 200);
     assert_eq!(response.body_text(), "ok");
+
+    let response = app.handle_request("GET", "/api/bundle-revision");
+    assert_eq!(response.status as u16, 200);
+    assert!(response.content_type.starts_with("application/json"));
+    let bundle = json(&response);
+    let revision = bundle["bundleRevision"].as_str().unwrap();
+    assert_eq!(revision.len(), 16);
+    assert!(revision.chars().all(|ch| ch.is_ascii_hexdigit()));
 
     let response = app.handle_request("GET", "/api/teams");
     assert_eq!(response.status as u16, 200);
@@ -263,33 +615,47 @@ fn diagnostics_route_reports_sources_and_lead_session() {
     let repo_cwd = repo_path.to_string_lossy().to_string();
 
     seed_data_with_cwd(data_dir.path(), Some(repo_cwd.as_str()));
+    MemberStore::new(data_dir.path())
+        .update("demo", "alice", |member| {
+            if let Some(execution) = member.execution.as_mut() {
+                execution.session_id = Some("session-1".into());
+            }
+        })
+        .unwrap();
     fs::write(
         repo_path.join("lead_pending.jsonl"),
         "{\"state\":\"queued\"}\n",
     )
     .unwrap();
+    let team_pending_path = data_dir.path().join("demo").join("lead_pending.jsonl");
+    fs::write(&team_pending_path, "{\"state\":\"team queued\"}\n").unwrap();
     fs::write(repo_path.join("mcp.log"), "booted\n").unwrap();
     fs::write(repo_path.join(".lead-pending-wake.log"), "wake\n").unwrap();
-
-    let encoded = agent_teams::util::session_discovery::encode_project_path(&repo_path);
-    let session_dir = home_dir
-        .path()
-        .join(".claude")
-        .join("projects")
-        .join(encoded);
-    fs::create_dir_all(&session_dir).unwrap();
     fs::write(
-        session_dir.join("session-1.jsonl"),
+        repo_path.join(".lead-sessions.json"),
+        r#"{"42":{"session_id":"session-1"}}"#,
+    )
+    .unwrap();
+
+    write_claude_session_fixture(
+        home_dir.path(),
+        &repo_path,
+        "session-1",
         r#"{"type":"user","message":{"role":"user","content":"Please inspect the team"},"timestamp":"2025-01-01T00:00:00Z"}
 {"type":"assistant","message":{"content":[{"type":"text","text":"Team looks healthy."},{"type":"tool_use","name":"Read","input":{"path":"src/lib.rs"}}]},"timestamp":"2025-01-01T00:00:01Z"}
 {"tool_name":"Read","tool_input":{"path":"src/lib.rs"},"timestamp":"2025-01-01T00:00:00Z"}
 {"usage":{"input_tokens":111,"output_tokens":222,"cache_read_input_tokens":33,"cache_creation_input_tokens":44}}
 "#,
-    )
-    .unwrap();
+    );
 
     with_temp_home(home_dir.path(), || {
-        let app = router(data_dir.path());
+        let app = TeamModeWebApp::with_config(
+            data_dir.path(),
+            TeamModeWebServerConfig {
+                session_home: Some(home_dir.path().to_path_buf()),
+                ..TeamModeWebServerConfig::default()
+            },
+        );
         let response = app.handle_request("GET", "/api/teams/demo/diagnostics");
         assert_eq!(response.status as u16, 200);
         let diagnostics = json(&response);
@@ -305,7 +671,16 @@ fn diagnostics_route_reports_sources_and_lead_session() {
         );
 
         let sources = diagnostics["sources"].as_array().unwrap();
-        assert_eq!(sources.len(), 4);
+        assert_eq!(sources.len(), 5);
+        assert!(
+            sources
+                .iter()
+                .any(
+                    |source| source["label"].as_str().unwrap() == "Lead Pending Queue (team)"
+                        && source["exists"].as_bool().unwrap()
+                        && source["preview"].as_str().unwrap().contains("team queued")
+                )
+        );
         assert!(
             sources
                 .iter()
@@ -362,7 +737,7 @@ fn diagnostics_route_reports_sources_and_lead_session() {
         assert_eq!(response.status as u16, 200);
         let conversation = json(&response);
         assert_eq!(conversation["member"], "alice");
-        assert_eq!(conversation["source"]["confidence"], "cwd_latest");
+        assert_eq!(conversation["source"]["confidence"], "session_id");
         assert_eq!(conversation["source"]["sessionId"], "session-1");
         let items = conversation["items"].as_array().unwrap();
         assert!(
@@ -403,7 +778,7 @@ fn diagnostics_route_is_stable_without_files() {
         let response = app.handle_request("GET", "/api/teams/demo/diagnostics");
         assert_eq!(response.status as u16, 200);
         let diagnostics = json(&response);
-        assert_eq!(diagnostics["sources"].as_array().unwrap().len(), 4);
+        assert_eq!(diagnostics["sources"].as_array().unwrap().len(), 5);
         assert!(
             diagnostics["sources"]
                 .as_array()
@@ -424,15 +799,19 @@ fn api_only_allows_get_and_does_not_mutate_files() {
     let messages_path = dir.path().join("demo").join("messages.jsonl");
     let before = fs::read_to_string(&messages_path).unwrap();
     let pending_path = dir.path().join("lead_pending.jsonl");
+    let team_pending_path = dir.path().join("demo").join("lead_pending.jsonl");
     assert!(!pending_path.exists());
+    assert!(!team_pending_path.exists());
 
     let response = app.handle_request("POST", "/api/teams");
     assert_eq!(response.status as u16, 405);
 
     for target in [
         "/api/teams",
+        "/api/bundle-revision",
         "/api/teams/demo",
         "/api/teams/demo/diagnostics",
+        "/api/teams/demo/events",
         "/api/teams/demo/rooms/main",
         "/api/teams/demo/members",
         "/api/teams/demo/members/alice",
@@ -446,6 +825,7 @@ fn api_only_allows_get_and_does_not_mutate_files() {
     let after = fs::read_to_string(&messages_path).unwrap();
     assert_eq!(before, after);
     assert!(!pending_path.exists());
+    assert!(!team_pending_path.exists());
 }
 
 #[test]
@@ -571,13 +951,24 @@ fn static_assets_and_root_are_served() {
     assert_eq!(response.status as u16, 200);
     assert_eq!(response.content_type, "text/html; charset=utf-8");
     let html = response.body_text();
-    assert!(html.contains("Team Mode Web"));
+    assert!(
+        html.contains("团队模式 Web") || html.contains("Team Mode Web"),
+        "HTML root should contain brand kicker (中文 or English)"
+    );
+    let bundle_revision =
+        json(&app.handle_request("GET", "/api/bundle-revision"))["bundleRevision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert!(html.contains(&format!(
+        r#"<meta name="bundle-revision" content="{bundle_revision}""#
+    )));
+    assert!(html.contains(&format!("Bundle {bundle_revision}")));
     assert!(html.contains("/app.js"));
     assert!(html.contains("/styles.css"));
-    assert!(!html.contains("<form"), "homepage should not contain forms");
     for banned in ["Send", "Start", "Stop", "Delete", "Ack"] {
         assert!(
-            !html.contains(banned),
+            !html_visible_text_contains(&html, banned),
             "homepage leaked write action text: {banned}"
         );
     }
@@ -588,11 +979,11 @@ fn static_assets_and_root_are_served() {
     let response = app.handle_request("GET", "/app.js");
     assert_eq!(response.status as u16, 200);
     assert!(response.content_type.starts_with("application/javascript"));
-    let js = response.body_text();
+    let js = frontend_js_bundle(&app);
     assert!(js.contains("Lead Activity"));
     assert!(js.contains("Refresh failed"));
-    assert!(js.contains("#message="));
-    assert!(js.contains("#member="));
+    assert!(js.contains("params.get(\"message\")"));
+    assert!(js.contains("params.get(\"member\")"));
     assert!(js.contains("failedTeamId"));
     assert!(js.contains("resolveSelectedTeamId"));
     assert!(js.contains("Team Diagnostics"));
@@ -617,4 +1008,74 @@ fn static_assets_and_root_are_served() {
     let response = app.handle_request("GET", "/styles.css");
     assert_eq!(response.status as u16, 200);
     assert_eq!(response.content_type, "text/css; charset=utf-8");
+}
+
+#[test]
+fn dev_static_bundle_reads_disk_without_restarting_app() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let web_dir = dir.path().join("web").join("team-mode");
+    fs::create_dir_all(&web_dir).unwrap();
+    fs::write(
+        web_dir.join("index.html"),
+        r#"<html><head><meta name="bundle-revision" content="__TEAM_MODE_WEB_BUNDLE_REVISION__"></head><body>Bundle __TEAM_MODE_WEB_BUNDLE_REVISION__</body></html>"#,
+    )
+    .unwrap();
+    fs::write(web_dir.join("app.js"), "const version = 'one';").unwrap();
+    fs::write(web_dir.join("styles.css"), "body { color: red; }").unwrap();
+    fs::write(web_dir.join("dashboard.css"), ".dashboard { color: blue; }").unwrap();
+
+    let app = TeamModeWebApp::with_config(
+        dir.path(),
+        TeamModeWebServerConfig {
+            static_bundle: StaticBundleMode::Dev {
+                root: web_dir.clone(),
+            },
+            ..TeamModeWebServerConfig::default()
+        },
+    );
+
+    let revision = json(&app.handle_request("GET", "/api/bundle-revision"));
+    assert_eq!(revision["bundleRevision"].as_str().unwrap(), "dev");
+    let html = app.handle_request("GET", "/").body_text();
+    assert!(html.contains(r#"content="dev""#));
+    assert!(html.contains("Bundle dev"));
+
+    let js = app.handle_request("GET", "/app.js").body_text();
+    assert_eq!(js, "const version = 'one';");
+    fs::write(web_dir.join("app.js"), "const version = 'two';").unwrap();
+    let js = app.handle_request("GET", "/app.js").body_text();
+    assert_eq!(js, "const version = 'two';");
+
+    let nested = app.handle_request("GET", "/nested/app.js");
+    assert_eq!(nested.status as u16, 404);
+}
+
+#[test]
+fn dev_static_bundle_missing_whitelisted_asset_returns_500_without_baked_fallback() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let web_dir = dir.path().join("web").join("team-mode");
+    fs::create_dir_all(&web_dir).unwrap();
+
+    let app = TeamModeWebApp::with_config(
+        dir.path(),
+        TeamModeWebServerConfig {
+            static_bundle: StaticBundleMode::Dev { root: web_dir },
+            ..TeamModeWebServerConfig::default()
+        },
+    );
+
+    let response = app.handle_request("GET", "/app.js");
+    assert_eq!(response.status as u16, 500);
+    assert_eq!(response.content_type, "application/json; charset=utf-8");
+    let body = response.body_text();
+    assert!(
+        body.contains("failed to read dev static asset"),
+        "unexpected body: {body}"
+    );
+    assert!(
+        !body.contains("Lead Activity") && !body.contains("Refresh failed"),
+        "missing dev asset fell back to baked JavaScript: {body}"
+    );
 }

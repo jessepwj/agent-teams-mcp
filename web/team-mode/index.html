@@ -3,8 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="bundle-revision" content="__TEAM_MODE_WEB_BUNDLE_REVISION__" />
     <title>团队模式 Web</title>
     <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/dashboard.css" />
     <!-- Load order matters: dependencies first, then app.js wires it up.
          Plain scripts (not module) so top-level function decls are shared
          across files via the global scope. -->
@@ -14,6 +16,8 @@
     <script src="/app-diagnostics.js"></script>
     <script src="/app-render.js"></script>
     <script src="/app-conversation.js"></script>
+    <script src="/app-dashboard-render.js"></script>
+    <script src="/app-dashboard.js"></script>
     <script src="/app.js"></script>
   </head>
   <body>
@@ -33,103 +37,120 @@
             <span id="searchLabel">搜索</span>
             <input id="searchInput" type="search" placeholder="筛选消息、成员或提及" />
           </label>
+          <div class="view-tabs" role="tablist" aria-label="主视图">
+            <button class="view-tab active" id="chatViewButton" type="button" role="tab" aria-controls="workspace">群聊</button>
+            <button class="view-tab" id="dashboardViewButton" type="button" role="tab" aria-controls="dashboardWorkspace">Dashboard</button>
+          </div>
           <div class="live-pill" id="liveStatus">状态：空闲</div>
           <button id="languageToggleButton" class="chip" type="button" title="Switch language">English</button>
           <button id="reloadButton" class="icon-button" type="button" title="刷新">↻</button>
         </div>
       </header>
 
-      <main class="workspace" id="workspace">
-        <aside class="sidebar left-pane">
-          <section class="pane-section">
-            <div class="section-title" id="roomsTitle">房间</div>
-            <div class="simple-list" id="roomList"></div>
-          </section>
-          <section class="pane-section">
-            <div class="section-title" id="membersTitle">成员</div>
-            <div class="simple-list" id="memberList"></div>
-          </section>
-          <section class="pane-section">
-            <div class="section-title" id="filtersTitle">筛选</div>
-            <div class="filter-row">
-              <button class="chip" id="clearFiltersButton" type="button">重置筛选</button>
-              <button class="chip" id="focusLeadButton" type="button">负责人活动</button>
-            </div>
-            <div class="filter-summary" id="filterSummary">未启用筛选。</div>
-          </section>
-        </aside>
+      <div class="main-stage" id="mainStage">
+        <main class="workspace" id="workspace" role="tabpanel" aria-labelledby="chatViewButton">
+          <aside class="sidebar left-pane">
+            <section class="pane-section">
+              <div class="section-title" id="roomsTitle">房间</div>
+              <div class="simple-list" id="roomList"></div>
+            </section>
+            <section class="pane-section">
+              <div class="section-title" id="membersTitle">成员</div>
+              <div class="simple-list" id="memberList"></div>
+            </section>
+            <section class="pane-section">
+              <div class="section-title" id="filtersTitle">筛选</div>
+              <div class="filter-row">
+                <button class="chip" id="clearFiltersButton" type="button">重置筛选</button>
+                <button class="chip" id="focusLeadButton" type="button">负责人活动</button>
+              </div>
+              <div class="filter-summary" id="filterSummary">未启用筛选。</div>
+            </section>
+          </aside>
 
-        <div
-          class="splitter"
-          id="leftSplitter"
-          role="separator"
-          tabindex="0"
-          aria-orientation="vertical"
-          aria-label="调整左侧栏宽度"
-          title="拖动调整左侧栏宽度"
-        ></div>
+          <div
+            class="splitter"
+            id="leftSplitter"
+            role="separator"
+            tabindex="0"
+            aria-orientation="vertical"
+            aria-label="调整左侧栏宽度"
+            title="拖动调整左侧栏宽度"
+          ></div>
 
-        <section class="timeline-pane">
-          <div class="pane-header">
-            <div>
-              <div class="section-title" id="timelineTitle">聊天时间线</div>
-              <div class="subtle" id="timelineSubtitle">选择团队以加载消息。</div>
+          <section class="timeline-pane">
+            <div class="pane-header">
+              <div>
+                <div class="section-title" id="timelineTitle">聊天时间线</div>
+                <div class="subtle" id="timelineSubtitle">选择团队以加载消息。</div>
+              </div>
+              <div class="stats" id="timelineStats"></div>
             </div>
-            <div class="stats" id="timelineStats"></div>
-          </div>
-          <div class="timeline" id="messageList"></div>
+            <div class="timeline" id="messageList"></div>
 
-          <form class="composer" id="composerForm" autocomplete="off">
-            <div class="composer-row">
-              <label class="composer-mention" for="composerMention" id="composerMentionLabel">
-                <span class="muted" id="composerMentionPrefix">@</span>
-                <select
-                  id="composerMention"
-                  class="composer-select"
-                  multiple
-                  size="4"
-                  title="按住 Ctrl/Cmd 多选；按住 Shift 选择范围"
-                ></select>
-              </label>
-              <textarea
-                id="composerInput"
-                class="composer-input"
-                rows="2"
-                placeholder="输入消息，回车发送，Shift+回车换行"
-              ></textarea>
-              <button type="submit" id="composerSend" class="composer-send">发送</button>
-            </div>
-            <div class="composer-status muted" id="composerStatus" aria-live="polite"></div>
-          </form>
+            <form class="composer" id="composerForm" autocomplete="off">
+              <div class="composer-row">
+                <label class="composer-mention" for="composerMention" id="composerMentionLabel">
+                  <span class="muted" id="composerMentionPrefix">@</span>
+                  <select
+                    id="composerMention"
+                    class="composer-select"
+                    multiple
+                    size="4"
+                    title="按住 Ctrl/Cmd 多选；按住 Shift 选择范围"
+                  ></select>
+                </label>
+                <textarea
+                  id="composerInput"
+                  class="composer-input"
+                  rows="2"
+                  placeholder="输入消息，回车发送，Shift+回车换行"
+                ></textarea>
+                <button type="submit" id="composerSend" class="composer-send">发送</button>
+              </div>
+              <div class="composer-status muted" id="composerStatus" aria-live="polite"></div>
+            </form>
+          </section>
+
+          <div
+            class="splitter"
+            id="rightSplitter"
+            role="separator"
+            tabindex="0"
+            aria-orientation="vertical"
+            aria-label="调整详情栏宽度"
+            title="拖动调整详情栏宽度"
+          ></div>
+
+          <aside class="sidebar detail-pane" id="detailPane">
+            <section class="pane-section">
+              <div class="section-title" id="detailPaneTitle">详情面板</div>
+              <div class="detail-tabs" role="tablist" aria-label="右侧栏内容">
+                <button class="detail-tab active" id="sessionTabButton" type="button">会话</button>
+                <button class="detail-tab" id="detailTabButton" type="button">详情</button>
+                <button class="detail-tab" id="diagnosticsTabButton" type="button">诊断</button>
+              </div>
+              <div class="detail-title" id="detailTitle">未选择</div>
+              <div class="detail-body" id="detailBody">请选择消息或成员。</div>
+            </section>
+          </aside>
+        </main>
+
+        <section
+          class="dashboard-workspace"
+          id="dashboardWorkspace"
+          role="tabpanel"
+          aria-labelledby="dashboardViewButton"
+          hidden
+        >
+          <div class="dashboard-root" id="dashboardRoot" aria-live="polite"></div>
         </section>
-
-        <div
-          class="splitter"
-          id="rightSplitter"
-          role="separator"
-          tabindex="0"
-          aria-orientation="vertical"
-          aria-label="调整详情栏宽度"
-          title="拖动调整详情栏宽度"
-        ></div>
-
-        <aside class="sidebar detail-pane" id="detailPane">
-          <section class="pane-section">
-            <div class="section-title" id="detailPaneTitle">详情面板</div>
-            <div class="detail-tabs" role="tablist" aria-label="右侧栏内容">
-              <button class="detail-tab active" id="sessionTabButton" type="button">会话</button>
-              <button class="detail-tab" id="detailTabButton" type="button">详情</button>
-              <button class="detail-tab" id="diagnosticsTabButton" type="button">诊断</button>
-            </div>
-            <div class="detail-title" id="detailTitle">未选择</div>
-            <div class="detail-body" id="detailBody">请选择消息或成员。</div>
-          </section>
-        </aside>
-      </main>
+      </div>
 
       <footer class="statusbar">
         <div id="statusSummary">只读</div>
         <div id="countsSummary">0 条消息</div>
+        <div id="bundleRevisionSummary">Bundle __TEAM_MODE_WEB_BUNDLE_REVISION__</div>
       </footer>
     </div>
   </body>

@@ -3,10 +3,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-const INDEX_HTML: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/web/team-mode/index.html"
-));
+const INDEX_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/index.processed.html"));
+const BUNDLE_REVISION: &str = env!("TEAM_MODE_WEB_BUNDLE_REVISION");
 const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/web/team-mode/app.js"));
 const APP_STATE_JS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -32,9 +30,21 @@ const APP_CONVERSATION_JS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/web/team-mode/app-conversation.js"
 ));
+const APP_DASHBOARD_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/web/team-mode/app-dashboard.js"
+));
+const APP_DASHBOARD_RENDER_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/web/team-mode/app-dashboard-render.js"
+));
 const STYLES_CSS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/web/team-mode/styles.css"
+));
+const DASHBOARD_CSS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/web/team-mode/dashboard.css"
 ));
 const JS_ASSETS: &[(&str, &str)] = &[
     ("app.js", APP_JS),
@@ -44,11 +54,13 @@ const JS_ASSETS: &[(&str, &str)] = &[
     ("app-diagnostics.js", APP_DIAGNOSTICS_JS),
     ("app-render.js", APP_RENDER_JS),
     ("app-conversation.js", APP_CONVERSATION_JS),
+    ("app-dashboard.js", APP_DASHBOARD_JS),
+    ("app-dashboard-render.js", APP_DASHBOARD_RENDER_JS),
 ];
 
 use super::error::{ErrorBody, StatusCode, WebError};
 use super::read_model;
-use super::state::TeamModeWebState;
+use super::state::{StaticBundleMode, TeamModeWebState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebResponse {
@@ -126,45 +138,55 @@ pub fn handle_request_with_body(
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
 
-    // POST routes — kept apart from the GET match so a typo in a GET path
-    // doesn't accidentally accept a body it didn't ask for.
-    if method == "POST" {
-        let result = match segments.as_slice() {
-            ["api", "teams", team, "rooms", "main", "messages"] => {
-                read_model::post_main_room_message(state, team, body)
-                    .map(|body| WebResponse::json(StatusCode::Created, &body))
-            }
-            _ => Err(WebError::not_found(format!(
-                "route 'POST {path}' not found"
-            ))),
-        };
-        return match result {
+    if method != "GET" {
+        if method == "POST"
+            && matches!(
+                segments.as_slice(),
+                ["api", "teams", _, "rooms", "main", "messages"]
+            )
+        {
+            let result = match segments.as_slice() {
+                ["api", "teams", team, "rooms", "main", "messages"] => {
+                    read_model::post_main_room_message(state, team, body)
+                        .map(|body| WebResponse::json(StatusCode::Created, &body))
+                }
+                _ => unreachable!("POST message route was checked before dispatch"),
+            };
+            return match result {
+                Ok(response) => response,
+                Err(err) => error_response(err),
+            };
+        }
+
+        if is_known_get_only_api_path(segments.as_slice()) {
+            return method_not_allowed_response(method, path);
+        }
+
+        if is_common_write_method(method) {
+            return error_response(WebError::not_found(format!(
+                "route '{method} {path}' not found"
+            )));
+        }
+
+        return method_not_allowed_response(method, path);
+    }
+
+    if let Some(response) = javascript_asset(state, path) {
+        return match response {
             Ok(response) => response,
             Err(err) => error_response(err),
         };
     }
 
-    if method != "GET" {
-        return WebResponse::json(
-            StatusCode::MethodNotAllowed,
-            &ErrorBody {
-                error: format!(
-                    "method '{method}' not supported on '{path}'; team-mode-web accepts \
-                     GET for reads and POST for sending messages"
-                ),
-            },
-        );
-    }
-
-    if let Some(asset) = javascript_asset(path) {
-        return WebResponse::javascript(StatusCode::Ok, asset);
-    }
-
     let result = match segments.as_slice() {
-        [] => return WebResponse::html(StatusCode::Ok, INDEX_HTML),
-        ["index.html"] => return WebResponse::html(StatusCode::Ok, INDEX_HTML),
-        ["styles.css"] => return WebResponse::css(StatusCode::Ok, STYLES_CSS),
+        [] => return static_html_response(state),
+        ["index.html"] => return static_html_response(state),
+        ["styles.css"] => return static_css_response(state, "styles.css"),
+        ["dashboard.css"] => return static_css_response(state, "dashboard.css"),
         ["healthz"] => return WebResponse::text(StatusCode::Ok, "ok"),
+        ["api", "bundle-revision"] => {
+            return WebResponse::json(StatusCode::Ok, &bundle_revision_response(state));
+        }
         ["api", "teams"] => {
             read_model::list_teams(state).map(|body| WebResponse::json(StatusCode::Ok, &body))
         }
@@ -173,6 +195,18 @@ pub fn handle_request_with_body(
         }
         ["api", "teams", team, "diagnostics"] => read_model::read_diagnostics(state, team)
             .map(|body| WebResponse::json(StatusCode::Ok, &body)),
+        ["api", "teams", team, "events"] => {
+            let params = parse_query(query);
+            read_model::read_events(
+                state,
+                team,
+                params.get("cursor").map(String::as_str),
+                params
+                    .get("limit")
+                    .and_then(|value| value.parse::<usize>().ok()),
+            )
+            .map(|body| WebResponse::json(StatusCode::Ok, &body))
+        }
         ["api", "teams", team, "rooms", "main"] => {
             let params = parse_query(query);
             let limit = params
@@ -209,17 +243,124 @@ pub fn handle_request_with_body(
     }
 }
 
-fn javascript_asset(path: &str) -> Option<&'static str> {
+fn javascript_asset(
+    state: &Arc<TeamModeWebState>,
+    path: &str,
+) -> Option<Result<WebResponse, WebError>> {
     let asset_name = path.trim_start_matches('/');
     if asset_name.contains('/') || !asset_name.ends_with(".js") {
         return None;
     }
-    JS_ASSETS
+    let baked = JS_ASSETS
         .iter()
-        .find_map(|(name, body)| (*name == asset_name).then_some(*body))
+        .find_map(|(name, body)| (*name == asset_name).then_some(*body))?;
+    Some(match state.static_bundle() {
+        StaticBundleMode::Baked => Ok(WebResponse::javascript(StatusCode::Ok, baked)),
+        StaticBundleMode::Dev { root } => read_dev_static(root, asset_name)
+            .map(|body| WebResponse::javascript(StatusCode::Ok, body)),
+    })
 }
 
-fn error_response(err: WebError) -> WebResponse {
+fn static_html_response(state: &Arc<TeamModeWebState>) -> WebResponse {
+    match state.static_bundle() {
+        StaticBundleMode::Baked => WebResponse::html(StatusCode::Ok, INDEX_HTML),
+        StaticBundleMode::Dev { root } => match read_dev_static(root, "index.html") {
+            Ok(body) => WebResponse::html(
+                StatusCode::Ok,
+                body.replace("__TEAM_MODE_WEB_BUNDLE_REVISION__", "dev"),
+            ),
+            Err(err) => error_response(err),
+        },
+    }
+}
+
+fn static_css_response(state: &Arc<TeamModeWebState>, asset_name: &str) -> WebResponse {
+    match state.static_bundle() {
+        StaticBundleMode::Baked => match asset_name {
+            "styles.css" => WebResponse::css(StatusCode::Ok, STYLES_CSS),
+            "dashboard.css" => WebResponse::css(StatusCode::Ok, DASHBOARD_CSS),
+            _ => error_response(WebError::not_found(format!(
+                "route '/{asset_name}' not found"
+            ))),
+        },
+        StaticBundleMode::Dev { root } => match asset_name {
+            "styles.css" | "dashboard.css" => match read_dev_static(root, asset_name) {
+                Ok(body) => WebResponse::css(StatusCode::Ok, body),
+                Err(err) => error_response(err),
+            },
+            _ => error_response(WebError::not_found(format!(
+                "route '/{asset_name}' not found"
+            ))),
+        },
+    }
+}
+
+fn read_dev_static(root: &std::path::Path, asset_name: &str) -> Result<String, WebError> {
+    std::fs::read_to_string(root.join(asset_name)).map_err(|err| {
+        WebError::internal(format!(
+            "failed to read dev static asset '{}': {err}",
+            root.join(asset_name).display()
+        ))
+    })
+}
+
+fn bundle_revision_response(state: &Arc<TeamModeWebState>) -> BundleRevisionResponse {
+    BundleRevisionResponse {
+        bundle_revision: match state.static_bundle() {
+            StaticBundleMode::Baked => BUNDLE_REVISION.into(),
+            StaticBundleMode::Dev { .. } => "dev".into(),
+        },
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleRevisionResponse {
+    bundle_revision: String,
+}
+
+fn is_known_get_only_api_path(segments: &[&str]) -> bool {
+    matches!(
+        segments,
+        ["api", "bundle-revision"]
+            | ["api", "teams"]
+            | ["api", "teams", _]
+            | ["api", "teams", _, "diagnostics"]
+            | ["api", "teams", _, "events"]
+            | ["api", "teams", _, "events", "stream"]
+            | ["api", "teams", _, "rooms", "main"]
+            | ["api", "teams", _, "members"]
+            | ["api", "teams", _, "members", _]
+            | ["api", "teams", _, "members", _, "activity"]
+            | ["api", "teams", _, "members", _, "conversation"]
+    )
+}
+
+fn is_common_write_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+}
+
+fn method_not_allowed_response(method: &str, path: &str) -> WebResponse {
+    WebResponse::json(
+        StatusCode::MethodNotAllowed,
+        &ErrorBody {
+            error: format!(
+                "method '{method}' not supported on '{path}'; team-mode-web accepts \
+                 GET for reads and POST for sending messages"
+            ),
+        },
+    )
+}
+
+pub(crate) fn validate_events_cursor(
+    state: &Arc<TeamModeWebState>,
+    team: &str,
+    cursor: Option<&str>,
+) -> Result<(), WebError> {
+    read_model::read_events(state, team, cursor, Some(1)).map(|_| ())
+}
+
+pub(crate) fn error_response(err: WebError) -> WebResponse {
     WebResponse::json(
         err.status_code(),
         &ErrorBody {

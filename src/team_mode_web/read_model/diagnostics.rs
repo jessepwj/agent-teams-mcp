@@ -1,4 +1,5 @@
 use super::*;
+use crate::team_mode::data_dir;
 
 pub fn read_diagnostics(
     state: &TeamModeWebState,
@@ -10,9 +11,14 @@ pub fn read_diagnostics(
         .ok_or_else(|| WebError::not_found(format!("team '{team_id}' not found")))?;
     let project_root = diagnostics_project_root(&team);
     let base_dir = state.base_dir().to_path_buf();
-    let sources = diagnostics_sources(&project_root, &base_dir);
+    let sources = diagnostics_sources(&project_root, &base_dir, &team.id);
 
-    let lead_session = read_lead_session_diagnostics(&project_root, &base_dir);
+    let lead_session = read_lead_session_diagnostics(
+        &project_root,
+        &base_dir,
+        team.owner_cc_pid,
+        state.session_home(),
+    );
 
     Ok(DiagnosticsResponse {
         team_id: team.id.clone(),
@@ -21,7 +27,7 @@ pub fn read_diagnostics(
         generated_at: Utc::now(),
         limitations: vec![
             "These diagnostics are file/session-level observations, not per-member stdout/stderr.".into(),
-            "Lead pending queue sources are probed in the project root and the web data base_dir; the real source may live in either place.".into(),
+            "Lead pending queue sources include the canonical per-team file plus legacy project-root/base-dir files for migration forensics.".into(),
         ],
         sources,
         lead_session,
@@ -36,13 +42,23 @@ fn diagnostics_project_root(team: &Team) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn diagnostics_sources(project_root: &Path, base_dir: &Path) -> Vec<DiagnosticsSourceView> {
+fn diagnostics_sources(
+    project_root: &Path,
+    base_dir: &Path,
+    team_id: &str,
+) -> Vec<DiagnosticsSourceView> {
     let mut seen_paths = BTreeSet::new();
     let mut sources = Vec::new();
     let mcp_log_path = preferred_diagnostics_path(project_root, base_dir, "mcp.log");
     let wake_log_path =
         preferred_diagnostics_path(project_root, base_dir, ".lead-pending-wake.log");
     let candidates = [
+        (
+            "lead_pending_jsonl_team",
+            "Lead Pending Queue (team)",
+            "file",
+            data_dir::lead_pending_file_for_team(base_dir, team_id),
+        ),
         (
             "lead_pending_jsonl_project_root",
             "Lead Pending Queue (project root)",
@@ -149,13 +165,29 @@ fn read_preview(path: &Path) -> String {
 fn read_lead_session_diagnostics(
     project_root: &Path,
     base_dir: &Path,
+    owner_cc_pid: Option<u32>,
+    session_home: Option<&Path>,
 ) -> LeadSessionDiagnosticsView {
-    let mut sessions = session_discovery::discover_sessions(project_root);
+    let mut sessions = discover_sessions(session_home, project_root);
     if sessions.is_empty() && base_dir != project_root {
-        sessions = session_discovery::discover_sessions(base_dir);
+        sessions = discover_sessions(session_home, base_dir);
     }
-    let discovered = !sessions.is_empty();
-    let latest = sessions.first();
+    let mapped_lead_session_id =
+        owner_cc_pid.and_then(|pid| lookup_lead_session_id(project_root, base_dir, pid));
+    if let Some(session_id) = mapped_lead_session_id.as_deref() {
+        if !sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            if let Some(session) =
+                find_mapped_session_file(project_root, base_dir, session_id, session_home)
+            {
+                sessions.insert(0, session);
+            }
+        }
+    }
+    let latest = select_lead_session(&sessions, mapped_lead_session_id.as_deref());
+    let discovered = latest.is_some();
 
     let mut view = LeadSessionDiagnosticsView {
         discovered,
@@ -172,6 +204,12 @@ fn read_lead_session_diagnostics(
     };
 
     if let Some(session) = latest {
+        if mapped_lead_session_id.as_deref() == Some(session.session_id.as_str()) {
+            view.limitations.push(
+                "Lead session matched by the Stop hook's {owner_cc_pid -> claude_session_id} map."
+                    .into(),
+            );
+        }
         match session_discovery::parse_session_file(&session.path) {
             Ok((tool_calls, token_usage)) => {
                 view.recent_tool_calls = tool_calls
@@ -199,4 +237,152 @@ fn read_lead_session_diagnostics(
     }
 
     view
+}
+
+fn select_lead_session<'a>(
+    sessions: &'a [session_discovery::SessionFile],
+    mapped_lead_session_id: Option<&str>,
+) -> Option<&'a session_discovery::SessionFile> {
+    mapped_lead_session_id
+        .and_then(|session_id| {
+            sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+        })
+        .or_else(|| sessions.first())
+}
+
+fn lookup_lead_session_id(project_root: &Path, base_dir: &Path, pid: u32) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let candidates = [
+        Some(project_root.join(".lead-sessions.json")),
+        base_dir
+            .parent()
+            .map(|path| path.join(".lead-sessions.json")),
+        Some(base_dir.join(".lead-sessions.json")),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if !seen.insert(candidate.display().to_string()) {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        if let Some(session_id) = parsed
+            .get(pid.to_string())
+            .and_then(|entry| entry.get("session_id"))
+            .and_then(|value| value.as_str())
+        {
+            return Some(session_id.to_string());
+        }
+    }
+
+    None
+}
+
+fn find_mapped_session_file(
+    project_root: &Path,
+    base_dir: &Path,
+    session_id: &str,
+    session_home: Option<&Path>,
+) -> Option<session_discovery::SessionFile> {
+    let mut seen = BTreeSet::new();
+    for home in candidate_home_dirs(session_home) {
+        for project in candidate_project_paths(project_root, base_dir) {
+            let path = home
+                .join(".claude")
+                .join("projects")
+                .join(session_discovery::encode_project_path(&project))
+                .join(format!("{session_id}.jsonl"));
+            if !seen.insert(path.display().to_string()) {
+                continue;
+            }
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            return Some(session_discovery::SessionFile {
+                path,
+                session_id: session_id.to_string(),
+                modified: metadata.modified().ok().map(DateTime::<Utc>::from),
+                size: metadata.len(),
+            });
+        }
+    }
+
+    None
+}
+
+fn candidate_home_dirs(session_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    let mut homes = Vec::new();
+    for candidate in candidate_home_dir_values(session_home) {
+        if seen.insert(candidate.display().to_string()) {
+            homes.push(candidate);
+        }
+    }
+    homes
+}
+
+fn candidate_home_dir_values(session_home: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(home) = session_home {
+        return vec![home.to_path_buf()];
+    }
+    [
+        dirs::home_dir(),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn discover_sessions(
+    session_home: Option<&Path>,
+    repo_path: &Path,
+) -> Vec<session_discovery::SessionFile> {
+    match session_home {
+        Some(home) => session_discovery::discover_sessions_with_home(home, repo_path),
+        None => session_discovery::discover_sessions(repo_path),
+    }
+}
+
+fn candidate_project_paths(project_root: &Path, base_dir: &Path) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    let mut paths = Vec::new();
+    for candidate in [
+        project_root
+            .canonicalize()
+            .ok()
+            .map(strip_windows_ext_prefix),
+        Some(project_root.to_path_buf()),
+        base_dir.parent().map(Path::to_path_buf),
+        Some(base_dir.to_path_buf()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if seen.insert(candidate.display().to_string()) {
+            paths.push(candidate);
+        }
+    }
+    paths
+}
+
+fn strip_windows_ext_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
 }

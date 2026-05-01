@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::team_mode::runtime_workers::RuntimeWorkerStore;
@@ -30,9 +31,52 @@ pub fn install_shared_message_service(svc: MessageService) {
     let _ = SHARED_MESSAGE_SERVICE.set(svc);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaticBundleMode {
+    Baked,
+    Dev { root: PathBuf },
+}
+
+impl StaticBundleMode {
+    pub fn from_env() -> Self {
+        let fallback_root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("web")
+            .join("team-mode");
+        Self::from_env_values(
+            std::env::var("TEAM_MODE_WEB_DEV_BUNDLE").ok(),
+            std::env::var_os("TEAM_MODE_WEB_DEV_BUNDLE_DIR").map(PathBuf::from),
+            fallback_root,
+        )
+    }
+
+    fn from_env_values(
+        enabled_value: Option<String>,
+        configured_root: Option<PathBuf>,
+        fallback_root: PathBuf,
+    ) -> Self {
+        let enabled = enabled_value
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(false);
+        if !enabled {
+            return Self::Baked;
+        }
+
+        let root = configured_root.unwrap_or(fallback_root);
+        Self::Dev { root }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TeamModeWebState {
-    pub(crate) base_dir: std::path::PathBuf,
+    pub(crate) base_dir: PathBuf,
+    session_home: Option<PathBuf>,
+    static_bundle: StaticBundleMode,
     pub(crate) team_service: TeamService,
     pub(crate) member_service: MemberService,
     pub(crate) room_service: RoomService,
@@ -42,7 +86,19 @@ pub struct TeamModeWebState {
 }
 
 impl TeamModeWebState {
-    pub fn new(base_dir: impl Into<std::path::PathBuf>) -> Self {
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self::with_session_home_and_static_bundle(base_dir, None, StaticBundleMode::Baked)
+    }
+
+    pub fn with_session_home(base_dir: impl Into<PathBuf>, session_home: Option<PathBuf>) -> Self {
+        Self::with_session_home_and_static_bundle(base_dir, session_home, StaticBundleMode::Baked)
+    }
+
+    pub fn with_session_home_and_static_bundle(
+        base_dir: impl Into<PathBuf>,
+        session_home: Option<PathBuf>,
+        static_bundle: StaticBundleMode,
+    ) -> Self {
         let base_dir = base_dir.into();
         let team_store = TeamStore::new(base_dir.clone());
         let member_store = MemberStore::new(base_dir.clone());
@@ -75,6 +131,8 @@ impl TeamModeWebState {
 
         Self {
             base_dir,
+            session_home,
+            static_bundle,
             team_service,
             member_service,
             room_service,
@@ -84,7 +142,59 @@ impl TeamModeWebState {
         }
     }
 
-    pub(crate) fn base_dir(&self) -> &std::path::Path {
+    pub(crate) fn base_dir(&self) -> &Path {
         &self.base_dir
+    }
+
+    pub(crate) fn session_home(&self) -> Option<&Path> {
+        self.session_home.as_deref()
+    }
+
+    pub(crate) fn static_bundle(&self) -> &StaticBundleMode {
+        &self.static_bundle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StaticBundleMode;
+    use std::path::PathBuf;
+
+    #[test]
+    fn dev_static_bundle_env_parser_disables_falsey_and_invalid_values() {
+        let fallback = PathBuf::from("fallback-web-team-mode");
+
+        for value in [
+            None,
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("no"),
+            Some("maybe"),
+        ] {
+            let mode = StaticBundleMode::from_env_values(
+                value.map(str::to_string),
+                Some(PathBuf::from("configured-web-team-mode")),
+                fallback.clone(),
+            );
+            assert_eq!(mode, StaticBundleMode::Baked, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn dev_static_bundle_env_parser_uses_configured_or_fallback_root_when_enabled() {
+        let fallback = PathBuf::from("fallback-web-team-mode");
+        let configured = PathBuf::from("configured-web-team-mode");
+
+        let configured_mode = StaticBundleMode::from_env_values(
+            Some("true".into()),
+            Some(configured.clone()),
+            fallback.clone(),
+        );
+        assert_eq!(configured_mode, StaticBundleMode::Dev { root: configured });
+
+        let fallback_mode =
+            StaticBundleMode::from_env_values(Some("1".into()), None, fallback.clone());
+        assert_eq!(fallback_mode, StaticBundleMode::Dev { root: fallback });
     }
 }

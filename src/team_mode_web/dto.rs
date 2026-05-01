@@ -95,6 +95,36 @@ pub struct PageView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EventsResponse {
+    pub team_id: String,
+    pub generated_at: DateTime<Utc>,
+    pub events: Vec<EventView>,
+    pub page: EventsPageView,
+    #[serde(default)]
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsPageView {
+    pub has_more_after: bool,
+    pub next_cursor: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventView {
+    pub id: String,
+    pub team_id: String,
+    pub event_type: String,
+    pub occurred_at: DateTime<Utc>,
+    pub source: String,
+    pub cursor: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageView {
     pub id: String,
     pub sender: String,

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::routes;
-use super::state::TeamModeWebState;
+use super::sse::{self, SseConfig};
+use super::state::{StaticBundleMode, TeamModeWebState};
 
 /// Cap incoming POST bodies. Messages are short text + a small mentions
 /// array, so 256 KiB is generous and prevents a misbehaving client from
@@ -20,12 +21,22 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 pub struct TeamModeWebApp {
     state: Arc<TeamModeWebState>,
+    config: TeamModeWebServerConfig,
 }
 
 impl TeamModeWebApp {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self::with_config(base_dir, TeamModeWebServerConfig::default())
+    }
+
+    pub fn with_config(base_dir: impl Into<PathBuf>, config: TeamModeWebServerConfig) -> Self {
         Self {
-            state: Arc::new(TeamModeWebState::new(base_dir)),
+            state: Arc::new(TeamModeWebState::with_session_home_and_static_bundle(
+                base_dir,
+                config.session_home.clone(),
+                config.static_bundle.clone(),
+            )),
+            config,
         }
     }
 
@@ -40,6 +51,27 @@ impl TeamModeWebApp {
         body: &[u8],
     ) -> routes::WebResponse {
         routes::handle_request_with_body(&self.state, method, target, body)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TeamModeWebServerConfig {
+    pub sse: SseConfig,
+    pub max_connections: Option<usize>,
+    pub session_home: Option<PathBuf>,
+    /// Internal extension point for tests/embedding/dev tooling. Default
+    /// production behavior is `Baked`; dev mode must be explicitly selected.
+    pub static_bundle: StaticBundleMode,
+}
+
+impl Default for TeamModeWebServerConfig {
+    fn default() -> Self {
+        Self {
+            sse: SseConfig::default(),
+            max_connections: None,
+            session_home: None,
+            static_bundle: StaticBundleMode::from_env(),
+        }
     }
 }
 
@@ -59,14 +91,31 @@ pub fn serve(base_dir: impl Into<PathBuf>, addr: SocketAddr) -> std::io::Result<
 }
 
 pub fn serve_listener(base_dir: impl Into<PathBuf>, listener: TcpListener) -> std::io::Result<()> {
-    let app = TeamModeWebApp::new(base_dir);
+    serve_listener_with_config(base_dir, listener, TeamModeWebServerConfig::default())
+}
+
+pub fn serve_listener_with_config(
+    base_dir: impl Into<PathBuf>,
+    listener: TcpListener,
+    config: TeamModeWebServerConfig,
+) -> std::io::Result<()> {
+    let app = TeamModeWebApp::with_config(base_dir, config.clone());
+    let mut accepted = 0_usize;
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                accepted += 1;
                 let app = app.clone();
                 std::thread::spawn(move || {
                     let _ = handle_stream(app, stream);
                 });
+                if config
+                    .max_connections
+                    .map(|max| accepted >= max)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
             }
             Err(err) => return Err(err),
         }
@@ -111,14 +160,20 @@ fn handle_stream(app: TeamModeWebApp, mut stream: TcpStream) -> std::io::Result<
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let target = parts.next().unwrap_or("/").to_string();
+    let headers = lines
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            Some((key.trim().to_string(), value.trim().to_string()))
+        })
+        .collect::<Vec<_>>();
 
     // Parse Content-Length to know how many body bytes to expect (after the
     // \r\n\r\n boundary). 0 / missing → no body.
-    let content_length = lines
-        .filter_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                v.trim().parse::<usize>().ok()
+    let content_length = headers
+        .iter()
+        .filter_map(|(key, value)| {
+            if key.eq_ignore_ascii_case("content-length") {
+                value.parse::<usize>().ok()
             } else {
                 None
             }
@@ -163,6 +218,29 @@ fn handle_stream(app: TeamModeWebApp, mut stream: TcpStream) -> std::io::Result<
         return Ok(());
     }
 
+    if method == "GET" {
+        if let Some(stream_request) = parse_sse_request(&target, &headers) {
+            if let Err(err) = routes::validate_events_cursor(
+                &app.state,
+                &stream_request.team_id,
+                stream_request.initial_cursor.as_deref(),
+            ) {
+                let response = routes::error_response(err);
+                write_response(&mut stream, &response)?;
+                return Ok(());
+            }
+            let elapsed_ms = started.elapsed().as_millis();
+            eprintln!("[team_mode_web] {method} {target} -> 200 stream in {elapsed_ms}ms");
+            return sse::stream_events(
+                app.state.clone(),
+                stream,
+                stream_request.team_id,
+                stream_request.initial_cursor,
+                app.config.sse.clone(),
+            );
+        }
+    }
+
     let response = app.handle_request_with_body(&method, &target, body_slice);
     let elapsed_ms = started.elapsed().as_millis();
     write_response(&mut stream, &response)?;
@@ -171,6 +249,51 @@ fn handle_stream(app: TeamModeWebApp, mut stream: TcpStream) -> std::io::Result<
         response.status as u16
     );
     Ok(())
+}
+
+#[derive(Debug)]
+struct SseRequest {
+    team_id: String,
+    initial_cursor: Option<String>,
+}
+
+fn parse_sse_request(target: &str, headers: &[(String, String)]) -> Option<SseRequest> {
+    let (path, query) = split_target(target);
+    let segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let ["api", "teams", team, "events", "stream"] = segments.as_slice() else {
+        return None;
+    };
+    let header_cursor = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("last-event-id"))
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.is_empty());
+    Some(SseRequest {
+        team_id: (*team).to_string(),
+        initial_cursor: header_cursor.or_else(|| query_param(query, "cursor")),
+    })
+}
+
+fn split_target(target: &str) -> (&str, Option<&str>) {
+    target
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((target, None))
+}
+
+fn query_param(query: Option<&str>, name: &str) -> Option<String> {
+    let query = query?;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == name && !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
