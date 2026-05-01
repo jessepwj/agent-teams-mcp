@@ -80,34 +80,69 @@ impl RuntimeWorkerStore {
         note: Option<String>,
     ) -> Result<()> {
         let daemon_pid = std::process::id();
-        self.update_file(|file| {
+        let reason = note.clone().unwrap_or_else(|| "unspecified".to_string());
+        let result = self.update_file(|file| {
             let now = Utc::now();
             if let Some(worker) = file
                 .workers
                 .iter_mut()
                 .find(|worker| worker.team == team && worker.name == name)
             {
+                let prev_state = worker.state.clone();
                 worker.spawn_key = spawn_key.into();
                 worker.adapter = adapter.clone();
                 worker.state = state.into();
                 worker.daemon_pid = Some(daemon_pid);
                 worker.note = note.clone();
                 worker.updated_at = now;
-                return Ok(());
+                return Ok(prev_state);
             }
 
             file.workers.push(RuntimeWorkerRecord {
                 team: team.into(),
                 name: name.into(),
                 spawn_key: spawn_key.into(),
-                adapter,
+                adapter: adapter.clone(),
                 state: state.into(),
                 daemon_pid: Some(daemon_pid),
                 note,
                 updated_at: now,
             });
-            Ok(())
-        })
+            Ok("absent".to_string())
+        });
+
+        match result {
+            Ok(prev_state) => {
+                tracing::info!(
+                    event = "runtime_worker.state_change",
+                    team_id = %team,
+                    worker_name = %name,
+                    prev_state = %prev_state,
+                    new_state = %state,
+                    reason = %reason,
+                    spawn_key = %spawn_key,
+                    adapter = ?adapter,
+                    daemon_pid,
+                    "runtime worker state changed"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                tracing::error!(
+                    event = "runtime_worker.state_change_failed",
+                    team_id = %team,
+                    worker_name = %name,
+                    new_state = %state,
+                    reason = %reason,
+                    spawn_key = %spawn_key,
+                    adapter = ?adapter,
+                    daemon_pid,
+                    error = %err,
+                    "runtime worker state change failed"
+                );
+                Err(err)
+            }
+        }
     }
 
     pub fn remove_team(&self, team: &str) -> Result<()> {
@@ -200,6 +235,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::team_mode::tracing_capture::capture_events;
 
     #[test]
     fn daemon_restart_marks_live_workers_dead() {
@@ -216,5 +252,44 @@ mod tests {
             store.state_for("team", "worker").unwrap().as_deref(),
             Some(STATE_DEAD)
         );
+    }
+
+    #[test]
+    fn runtime_worker_upsert_emits_state_change_info_log() {
+        let mut last_events = Vec::new();
+        let event = (0..25)
+            .find_map(|_| {
+                let dir = tempdir().unwrap();
+                let store = RuntimeWorkerStore::new(dir.path());
+                let (result, events) = capture_events(|| {
+                    store.upsert_state(
+                        "team",
+                        "worker",
+                        "team__worker",
+                        Some("codex".into()),
+                        STATE_RUNNING,
+                        Some("spawned by worker_add".into()),
+                    )
+                });
+                result.unwrap();
+                let event = events
+                    .iter()
+                    .find(|event| event.field("event") == Some("runtime_worker.state_change"))
+                    .cloned();
+                last_events = events;
+                event
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "runtime worker state_change log should be emitted; last captured events: {last_events:?}"
+                )
+            });
+        assert_eq!(event.field("team_id"), Some("team"));
+        assert_eq!(event.field("worker_name"), Some("worker"));
+        assert_eq!(event.field("prev_state"), Some("absent"));
+        assert_eq!(event.field("new_state"), Some(STATE_RUNNING));
+        assert_eq!(event.field("reason"), Some("spawned by worker_add"));
+        assert_eq!(event.field("adapter"), Some("Some(\"codex\")"));
+        assert_eq!(event.field("spawn_key"), Some("team__worker"));
     }
 }

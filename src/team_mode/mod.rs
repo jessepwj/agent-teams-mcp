@@ -10,6 +10,8 @@ pub mod mcp;
 pub mod runtime_workers;
 pub mod service;
 pub mod storage;
+#[cfg(test)]
+mod tracing_capture;
 
 pub use domain::*;
 pub use mcp::*;

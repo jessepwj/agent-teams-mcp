@@ -90,6 +90,97 @@ pub fn validate_slug_name(name: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Process names that are shell wrappers / launchers we should walk past
+/// when locating the owning Claude Code (CC) process. Lowercased, no `.exe`
+/// suffix — match against `process.name().to_lowercase().trim_end_matches(".exe")`.
+///
+/// Why: when `.mcp.json` invokes a wrapper script (e.g. `mcp-launcher.cmd`
+/// to source vcvars64.bat on Windows), the MCP relay's direct parent is
+/// `cmd.exe`, not the CC node process. Recording cmd.exe's PID as
+/// `team.owner_cc_pid` causes:
+///   - daemon's lead-watchdog to see that PID die first and self-terminate
+///   - `lead-pending-wake.js` ancestor-chain routing to discard messages
+///     because cmd.exe is not in the CC's ancestor chain (it's a sibling
+///     branch under the same root)
+///
+/// We must walk past these wrappers to find the real CC.
+const SHELL_WRAPPER_NAMES: &[&str] = &["cmd", "sh", "bash", "zsh", "pwsh", "powershell", "conhost"];
+
+/// Maximum ancestors to walk when resolving the CC PID. A small bound
+/// guards against pathological process trees (cycles shouldn't happen on
+/// real OSes, but a stale parent slot pointing at a recycled PID could
+/// loop us). Real CC ↔ MCP chains are 1–3 deep; 8 is generous.
+const MAX_PARENT_WALK_DEPTH: u8 = 8;
+
+/// Walk the parent chain starting from `start_pid`, skipping shell wrapper
+/// processes, to find the owning CC process PID. The caller must have
+/// refreshed the System view first (so `sys.process(...)` returns valid
+/// data for ancestors).
+///
+/// Same algorithm as `current_cc_pid` but lets the caller supply the
+/// starting PID and reuse a System view across multiple walks (e.g. the
+/// MCP startup zombie sweep walks every peer's chain in one refresh).
+pub fn resolve_cc_pid_from(start_pid: u32, sys: &sysinfo::System) -> Option<u32> {
+    use sysinfo::Pid;
+
+    let me = Pid::from_u32(start_pid);
+    let mut current = sys.process(me)?.parent()?;
+
+    for _ in 0..MAX_PARENT_WALK_DEPTH {
+        let proc = match sys.process(current) {
+            Some(p) => p,
+            // Parent vanished mid-walk — return what we have so far. Don't
+            // fall through to None, because the most-recently-walked PID
+            // is still our best estimate of "real CC", just possibly
+            // through a wrapper. Trade a slightly-wrong PID for a usable
+            // owner binding.
+            None => return Some(current.as_u32()),
+        };
+        let name_lc = proc.name().to_string_lossy().to_lowercase();
+        let stem = name_lc.trim_end_matches(".exe");
+        if !SHELL_WRAPPER_NAMES.contains(&stem) {
+            return Some(current.as_u32());
+        }
+        current = match proc.parent() {
+            Some(p) => p,
+            None => return Some(current.as_u32()),
+        };
+    }
+
+    // Walked the limit and still in wrappers — return whatever we ended on
+    // rather than None so the team isn't left unbound. This is a defensive
+    // fallback; real chains never need this many hops.
+    Some(current.as_u32())
+}
+
+/// Return the PID of the Claude Code process that owns this MCP relay,
+/// walking past shell wrappers (cmd / bash / pwsh / etc) that may sit
+/// between us and the real CC.
+///
+/// Used by `team_create` to bind a team to its lead CC, and by the
+/// daemon RPC layer to attach `owner_cc_pid` to every tool invocation
+/// so push-routing can attribute pending messages to the right CC.
+///
+/// Returns `None` if the process tree query fails or no non-wrapper
+/// ancestor is found within `MAX_PARENT_WALK_DEPTH` hops. Callers MUST
+/// tolerate `None` — for legacy reasons, downstream code treats a missing
+/// owner as "unbound" rather than erroring out.
+pub fn current_cc_pid() -> Option<u32> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+
+    // Refresh ALL processes — we don't know up-front which ancestor PIDs
+    // we'll need. The cost is one-time per call (callers cache the result
+    // in `team.owner_cc_pid`), and the alternative (refresh-as-we-walk)
+    // requires multiple syscalls plus complicated process-not-found
+    // handling on Windows where PIDs can recycle quickly.
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    resolve_cc_pid_from(std::process::id(), &sys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

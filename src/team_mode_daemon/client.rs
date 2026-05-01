@@ -2,8 +2,8 @@ use std::fs::OpenOptions;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -18,6 +18,7 @@ use crate::team_mode::mcp::tools::ToolExecution;
 use crate::team_mode_daemon::ipc::{
     DaemonInfo, DaemonRequest, DaemonResponse, info_path, read_frame, read_info, write_frame,
 };
+use crate::util::current_cc_pid;
 
 pub struct DaemonToolClient {
     base_dir: PathBuf,
@@ -39,15 +40,30 @@ pub struct DaemonToolClient {
 
 impl DaemonToolClient {
     pub fn new(base_dir: impl Into<PathBuf>, project_root: impl Into<PathBuf>) -> Self {
-        let caller_team = std::env::var("TEAM_MODE_TEAM").ok().filter(|s| !s.is_empty());
+        let caller_team = std::env::var("TEAM_MODE_TEAM")
+            .ok()
+            .filter(|s| !s.is_empty());
         let caller_member = std::env::var("TEAM_MODE_MEMBER")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "lead".to_string());
+        // Worker-spawned MCP relays (codex / claude-code subprocess MCPs)
+        // share their parent-walk with the worker process, NOT the lead CC.
+        // Computing `current_cc_pid()` from a worker would yield the worker's
+        // own ancestor chain (a codex CLI, ultimately rooted in the daemon),
+        // which has no semantic relationship to any lead CC. Sending that
+        // value as `owner_cc_pid` on every tool call would let the daemon
+        // overwrite valid team bindings with junk (Bug 8). Suppress entirely
+        // when we can identify ourselves as a worker relay via env.
+        let owner_cc_pid = if caller_team.is_some() {
+            None
+        } else {
+            current_cc_pid()
+        };
         Self {
             base_dir: base_dir.into(),
             project_root: project_root.into(),
-            owner_cc_pid: current_parent_pid(),
+            owner_cc_pid,
             caller_team,
             caller_member,
             cached_info: Mutex::new(None),
@@ -63,7 +79,7 @@ impl DaemonToolClient {
                 Ok(value) => return Ok(value),
                 Err(err) => {
                     last_error = Some(err.to_string());
-                    *self.cached_info.lock().unwrap() = None;
+                    *self.lock_cached_info()? = None;
                 }
             }
         }
@@ -74,7 +90,7 @@ impl DaemonToolClient {
     }
 
     fn ensure_daemon(&self) -> Result<DaemonInfo> {
-        if let Some(info) = self.cached_info.lock().unwrap().clone() {
+        if let Some(info) = self.lock_cached_info()?.clone() {
             if is_pid_alive(info.pid) && self.ping_info(&info).is_ok() {
                 return Ok(info);
             }
@@ -88,7 +104,7 @@ impl DaemonToolClient {
 
         if let Ok(info) = read_info(&self.base_dir) {
             if is_pid_alive(info.pid) && self.ping_info(&info).is_ok() {
-                *self.cached_info.lock().unwrap() = Some(info.clone());
+                *self.lock_cached_info()? = Some(info.clone());
                 return Ok(info);
             }
         }
@@ -119,7 +135,7 @@ impl DaemonToolClient {
 
             if let Ok(info) = read_info(&self.base_dir) {
                 if is_pid_alive(info.pid) && self.ping_info(&info).is_ok() {
-                    *self.cached_info.lock().unwrap() = Some(info.clone());
+                    *self.lock_cached_info()? = Some(info.clone());
                     return Ok(info);
                 }
             }
@@ -193,7 +209,7 @@ impl DaemonToolClient {
             while Instant::now() < deadline {
                 if let Ok(info) = read_info(&self.base_dir) {
                     if info.token == token && self.ping_info(&info).is_ok() {
-                        *self.cached_info.lock().unwrap() = Some(info.clone());
+                        *self.lock_cached_info()? = Some(info.clone());
                         return Ok(info);
                     }
                 }
@@ -205,6 +221,12 @@ impl DaemonToolClient {
 
         let _ = fs2::FileExt::unlock(&lock);
         result
+    }
+
+    fn lock_cached_info(&self) -> Result<MutexGuard<'_, Option<DaemonInfo>>> {
+        self.cached_info
+            .lock()
+            .map_err(|_| Error::Other("poisoned mutex: daemon cached_info".into()))
     }
 
     fn ping_info(&self, info: &DaemonInfo) -> Result<()> {
@@ -346,20 +368,4 @@ pub fn prune_stale_endpoint(base_dir: &std::path::Path) {
             "failed to prune stale daemon endpoint",
         ),
     }
-}
-
-fn current_parent_pid() -> Option<u32> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
-    let mut sys = System::new_with_specifics(
-        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
-    );
-    let me = Pid::from_u32(std::process::id());
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[me]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    sys.process(me)
-        .and_then(|p| p.parent())
-        .map(|ppid| ppid.as_u32())
 }

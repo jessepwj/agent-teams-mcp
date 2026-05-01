@@ -1,6 +1,7 @@
 //! MCP runtime for Team Mode.
 
 pub mod executor;
+pub mod http_transport;
 pub mod resources;
 pub mod runtime;
 pub mod schemas;

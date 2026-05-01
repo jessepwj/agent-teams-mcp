@@ -13,9 +13,9 @@ pub struct CreateTeamRequest {
     pub description: Option<String>,
     pub cwd: Option<String>,
     pub lead_member_id: Option<String>,
-    /// PID of the Claude Code process that owns this team. Set by the MCP
-    /// dispatch layer to `std::process::parent_id()` so push routing can
-    /// later filter messages to the correct CC client.
+    /// PID of the Claude Code process that owns this team. The MCP dispatch
+    /// layer resolves it via the shared ancestor-walk helper so push routing
+    /// can later filter messages to the correct CC client.
     pub owner_cc_pid: Option<u32>,
 }
 
@@ -38,20 +38,26 @@ impl TeamService {
         }
 
         let existing = self.team_store.list()?;
-        if existing.iter().any(|team| team.name == request.name) {
+        let request_id = request.id.as_deref();
+        if let Some(id) = request_id {
+            validate_name(id)?;
+        }
+
+        if let Some(team) = existing
+            .iter()
+            .find(|team| team.name == request.name || request_id == Some(team.id.as_str()))
+        {
+            let id_matches = request_id.map(|id| id == team.id).unwrap_or(true);
+            if id_matches && team.name == request.name && team.status == TeamStatus::Active {
+                return self.rebind_existing_active_team(team.clone(), request.owner_cc_pid);
+            }
             return Err(Error::TeamAlreadyExists {
                 name: request.name.clone(),
             });
         }
 
         let team_id = match request.id {
-            Some(id) => {
-                validate_name(&id)?;
-                if existing.iter().any(|team| team.id == id) {
-                    return Err(Error::TeamAlreadyExists { name: id });
-                }
-                id
-            }
+            Some(id) => id,
             None => loop {
                 let candidate = Uuid::new_v4().to_string();
                 if !existing.iter().any(|team| team.id == candidate) {
@@ -73,6 +79,24 @@ impl TeamService {
             updated_at: now,
         };
 
+        self.team_store.save(&team)?;
+        Ok(team)
+    }
+
+    fn rebind_existing_active_team(
+        &self,
+        mut team: Team,
+        owner_cc_pid: Option<u32>,
+    ) -> Result<Team> {
+        let Some(owner_cc_pid) = owner_cc_pid else {
+            return Ok(team);
+        };
+        if team.owner_cc_pid == Some(owner_cc_pid) {
+            return Ok(team);
+        }
+
+        team.owner_cc_pid = Some(owner_cc_pid);
+        team.updated_at = Utc::now();
         self.team_store.save(&team)?;
         Ok(team)
     }
@@ -164,5 +188,56 @@ mod tests {
             owner_cc_pid: None,
         });
         assert!(matches!(duplicate_id, Err(Error::TeamAlreadyExists { .. })));
+    }
+
+    #[test]
+    fn create_existing_active_team_rebinds_owner_without_same_owner_churn() {
+        let dir = tempdir().unwrap();
+        let store = TeamStore::new(dir.path());
+        let service = TeamService::new(store.clone());
+
+        let first = service
+            .create(CreateTeamRequest {
+                id: Some("team-1".into()),
+                name: "Main".into(),
+                description: None,
+                cwd: None,
+                lead_member_id: Some("lead".into()),
+                owner_cc_pid: Some(111),
+            })
+            .unwrap();
+
+        let same_owner = service
+            .create(CreateTeamRequest {
+                id: Some("team-1".into()),
+                name: "Main".into(),
+                description: None,
+                cwd: None,
+                lead_member_id: Some("lead".into()),
+                owner_cc_pid: Some(111),
+            })
+            .unwrap();
+        assert_eq!(same_owner.owner_cc_pid, Some(111));
+        assert_eq!(same_owner.created_at, first.created_at);
+        assert_eq!(same_owner.updated_at, first.updated_at);
+
+        let mut stale = same_owner.clone();
+        stale.updated_at -= chrono::Duration::seconds(60);
+        store.save(&stale).unwrap();
+
+        let rebound = service
+            .create(CreateTeamRequest {
+                id: Some("team-1".into()),
+                name: "Main".into(),
+                description: None,
+                cwd: None,
+                lead_member_id: Some("lead".into()),
+                owner_cc_pid: Some(222),
+            })
+            .unwrap();
+
+        assert_eq!(rebound.owner_cc_pid, Some(222));
+        assert_eq!(rebound.created_at, first.created_at);
+        assert!(rebound.updated_at > stale.updated_at);
     }
 }

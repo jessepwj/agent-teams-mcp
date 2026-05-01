@@ -1,12 +1,16 @@
 use super::*;
-use crate::team_mode::domain::MessageKind;
+use crate::team_mode::domain::{MemberKind, MessageKind};
 use crate::team_mode::mcp::resources::{room_uri, thread_uri};
 use crate::team_mode::service::SendMessageRequest;
+
+mod inbox;
 
 impl TeamModeToolset {
     pub(super) fn send_message(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
         let team_name = required_identifier(args, "team")?;
         let text = required_text(args, "text")?;
+        let explicit_mentions = optional_identifier_list(args, "mentions")?;
+        let preempt = optional_bool(args, "preempt")?.unwrap_or(false);
 
         // Bug 29: caller identity is injected by `inject_call_context` in
         // the daemon. Defaults to "lead" for the lead's own MCP relay (no
@@ -21,6 +25,14 @@ impl TeamModeToolset {
             .and_then(|v| v.as_str())
             .map(String::from);
         let caller_is_lead = caller_member == LEAD_NAME;
+
+        // preempt is lead-only: workers can't abort each other's turns.
+        if preempt && !caller_is_lead {
+            return Err(Error::Other(format!(
+                "send_message: preempt=true is reserved for lead; caller \
+                 '{caller_member}' may not preempt other workers."
+            )));
+        }
 
         let _team = self
             .team_service
@@ -76,11 +88,14 @@ impl TeamModeToolset {
             }
         }
 
-        // @mention parsing — empty body defaults to @lead (worker's
-        // natural target when reporting back). Lead sending with no
-        // @mention is an error: the lead has no implicit recipient.
-        let body_handles = extract_handles(&text);
-        let resolved_handles: Vec<String> = if body_handles.is_empty() {
+        // Dispatch mention parsing. A non-empty explicit `mentions` array
+        // wins; otherwise only the leading @handle block on the first line
+        // routes. Later prose may contain @handle-looking text without
+        // causing unmatched/self-mention failures.
+        let dispatch_handles = explicit_mentions
+            .filter(|mentions| !mentions.is_empty())
+            .unwrap_or_else(|| extract_dispatch_handles(&text));
+        let resolved_handles: Vec<String> = if dispatch_handles.is_empty() {
             if caller_is_lead {
                 let mut available = available_handles(&active_workers);
                 available.sort();
@@ -94,7 +109,7 @@ impl TeamModeToolset {
                 vec!["lead".to_string()]
             }
         } else {
-            body_handles
+            dispatch_handles
         };
 
         // Resolve @handles case-insensitively. Each user-visible handle
@@ -263,13 +278,12 @@ impl TeamModeToolset {
         // splice "@lead " in front of the body so downstream consumers see
         // the routing the same way explicit @mentions are surfaced (and
         // the web UI / inbox view shows the recipient).
-        let final_body = if !filtered_body.contains("@lead")
-            && live_recipients.iter().any(|r| r == LEAD_NAME)
-        {
-            format!("@lead {filtered_body}")
-        } else {
-            filtered_body
-        };
+        let final_body =
+            if !filtered_body.contains("@lead") && live_recipients.iter().any(|r| r == LEAD_NAME) {
+                format!("@lead {filtered_body}")
+            } else {
+                filtered_body
+            };
 
         // Sender = caller. Lead callers produce a Dispatch (canonical
         // command from the control plane); worker callers produce a
@@ -280,20 +294,22 @@ impl TeamModeToolset {
             MessageKind::Reply
         };
 
-        let message = self.message_service.send(SendMessageRequest {
-            team_id: team_name.clone(),
-            room_id: room_id.clone(),
-            sender: caller_member.clone(),
-            kind,
-            subject: None,
-            body: final_body,
-            mentions: live_recipients.clone(),
-            visibility: Vec::new(),
-            audience_policy: None,
-            reply_to: None,
-            thread_id: None,
-            expires_at: None,
-        })?;
+        let message = self
+            .message_service
+            .send_with_explicit_mentions(SendMessageRequest {
+                team_id: team_name.clone(),
+                room_id: room_id.clone(),
+                sender: caller_member.clone(),
+                kind,
+                subject: None,
+                body: final_body,
+                mentions: live_recipients.clone(),
+                visibility: Vec::new(),
+                audience_policy: None,
+                reply_to: None,
+                thread_id: None,
+                expires_at: None,
+            })?;
 
         let mut updated = vec![
             team_uri(&team_name),
@@ -313,6 +329,53 @@ impl TeamModeToolset {
             .cloned()
             .map(Value::String)
             .collect();
+
+        // Best-effort preempt: if the lead asked to interrupt the in-flight
+        // turn of each live recipient, dispatch the protocol-level
+        // turn/interrupt now. The message is already enqueued (above), so
+        // even if interrupt fails the new message will still be processed
+        // when the current turn finishes naturally — preempt only affects
+        // *when* it's processed, never *whether*.
+        let mut interrupt_results: Vec<Value> = Vec::new();
+        if preempt {
+            for recipient in &live_recipients {
+                if recipient == LEAD_NAME {
+                    // Lead has no spawned process to interrupt.
+                    continue;
+                }
+                let key = spawn_key(&team_name, recipient);
+                let outcome = self.async_runtime.block_on({
+                    let orch = Arc::clone(&self.runtime_orchestrator);
+                    let key = key.clone();
+                    async move { orch.lock().await.interrupt_turn(&key).await }
+                });
+                let entry = match outcome {
+                    Ok(true) => {
+                        json!({"recipient": recipient, "interrupted": true})
+                    }
+                    Ok(false) => {
+                        json!({
+                            "recipient": recipient,
+                            "interrupted": false,
+                            "reason": "no_active_turn_or_unsupported",
+                        })
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            recipient = %recipient,
+                            error = %err,
+                            "preempt: turn/interrupt dispatch failed"
+                        );
+                        json!({
+                            "recipient": recipient,
+                            "interrupted": false,
+                            "error": err.to_string(),
+                        })
+                    }
+                };
+                interrupt_results.push(entry);
+            }
+        }
 
         let mut payload = json!({
             "message": message,
@@ -360,94 +423,13 @@ impl TeamModeToolset {
                     )),
                 );
             }
+            if preempt {
+                map.insert("preempted".into(), Value::Bool(true));
+                map.insert("interrupt_results".into(), Value::Array(interrupt_results));
+            }
         }
 
         Ok(success_with_updates(payload, updated))
-    }
-
-    pub(super) fn inbox_read(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
-        let team_name = required_identifier(args, "team")?;
-        let limit = optional_usize(args, "limit")?.unwrap_or(20).clamp(1, 100);
-        let unread_only = optional_bool(args, "unread_only")?.unwrap_or(true);
-        let auto_ack = optional_bool(args, "auto_ack")?.unwrap_or(false);
-
-        self.team_service
-            .get(&team_name)?
-            .ok_or_else(|| Error::TeamNotFound {
-                name: team_name.clone(),
-            })?;
-
-        let inbox = self.inbox_service.peek(&team_name, LEAD_NAME, None)?;
-
-        let mut items: Vec<_> = inbox
-            .items
-            .into_iter()
-            .filter(|item| {
-                if !unread_only {
-                    return true;
-                }
-                !matches!(item.status, crate::team_mode::domain::InboxStatus::Acked)
-            })
-            .collect();
-        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        items.truncate(limit);
-
-        let mut messages_out: Vec<Value> = Vec::with_capacity(items.len());
-        let mut ack_ids: Vec<String> = Vec::with_capacity(items.len());
-        for item in items {
-            let message = match self.message_store.get(&team_name, &item.message_id) {
-                Ok(Some(m)) => m,
-                _ => continue,
-            };
-            messages_out.push(json!({
-                "id": message.id,
-                "from": message.sender,
-                "kind": kind_to_str(&message.kind),
-                "text": message.body,
-                "reply_to": message.reply_to,
-                "thread_id": message.thread_id,
-                "status": status_to_str(&item.status),
-                "created_at": message.created_at,
-            }));
-            ack_ids.push(message.id);
-        }
-
-        if auto_ack && !ack_ids.is_empty() {
-            let _ = self.inbox_service.read(&team_name, LEAD_NAME, &ack_ids);
-            let _ = self.inbox_service.ack(&team_name, LEAD_NAME, &ack_ids);
-        }
-
-        let unread_count = self
-            .inbox_service
-            .count(&team_name, LEAD_NAME, None)
-            .map(|c| c.unread)
-            .unwrap_or(0);
-
-        let mut payload = json!({
-            "team": team_name,
-            "lead": LEAD_NAME,
-            "unread_count": unread_count,
-            "total_returned": messages_out.len(),
-            "messages": messages_out,
-        });
-        // Inbox is a fallback channel — when it returns nothing, surface a
-        // hint so the model doesn't fall into a poll loop. The Stop hook
-        // delivers replies as `<system-reminder>` automatically; calling
-        // this tool without backlog-checking intent is wasted work.
-        if messages_out.is_empty() {
-            if let Value::Object(map) = &mut payload {
-                map.insert(
-                    "hint".into(),
-                    Value::String(
-                        "No messages in inbox. Worker replies arrive automatically \
-                         via the Stop hook on your next turn — calling inbox_read \
-                         is rarely needed; only useful for explicit backlog audits."
-                            .into(),
-                    ),
-                );
-            }
-        }
-        Ok(success(payload))
     }
 }
 
@@ -461,4 +443,195 @@ fn available_handles(active_workers: &[String]) -> Vec<String> {
     // Lead first; everything else alphabetical.
     out[1..].sort();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::team_mode::service::AddMemberRequest;
+
+    const TEST_OWNER_CC_PID: u32 = u32::MAX;
+
+    fn create_demo_team_for_message_test(tools: &TeamModeToolset) {
+        tools
+            .call_tool(
+                "team_create",
+                Some(json!({
+                    "name": "demo",
+                    "_owner_cc_pid": TEST_OWNER_CC_PID
+                })),
+            )
+            .unwrap();
+    }
+
+    fn add_member_for_message_test(tools: &TeamModeToolset, team: &str, name: &str) {
+        tools
+            .member_service
+            .add(AddMemberRequest {
+                team_id: team.to_string(),
+                name: name.to_string(),
+                kind: MemberKind::Member,
+                role_label: "worker".into(),
+                role_description: None,
+                execution: None,
+            })
+            .unwrap();
+    }
+
+    fn assert_no_dropped_recipients(message: &Value) {
+        match message.get("droppedFor") {
+            None => {}
+            Some(Value::Array(items)) => assert!(items.is_empty()),
+            Some(other) => panic!("droppedFor must be an array when present, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_message_first_line_single_recipient_ignores_body_references() {
+        let dir = tempdir().unwrap();
+        let tools = TeamModeToolset::new_for_test(dir.path());
+        create_demo_team_for_message_test(&tools);
+        add_member_for_message_test(&tools, "demo", "alice");
+        add_member_for_message_test(&tools, "demo", "bob");
+
+        let response = tools
+            .call_tool(
+                "send_message",
+                Some(json!({
+                    "team": "demo",
+                    "text": "@lead\nThis prose mentions @alice and @bob as examples.",
+                    "_caller_member": "alice",
+                    "_caller_team": "demo"
+                })),
+            )
+            .unwrap();
+        let value = response.result.structured_content.unwrap();
+        assert_eq!(value["matched_recipients"], json!(["lead"]));
+        assert_eq!(value["message"]["mentions"], json!(["lead"]));
+        assert_no_dropped_recipients(&value["message"]);
+    }
+
+    #[test]
+    fn send_message_body_example_mentions_are_plain_text() {
+        let dir = tempdir().unwrap();
+        let tools = TeamModeToolset::new_for_test(dir.path());
+        create_demo_team_for_message_test(&tools);
+        add_member_for_message_test(&tools, "demo", "alice");
+
+        let response = tools
+            .call_tool(
+                "send_message",
+                Some(json!({
+                    "team": "demo",
+                    "text": "@lead\nExample text can say @ghost without routing.",
+                    "_caller_member": "alice",
+                    "_caller_team": "demo"
+                })),
+            )
+            .unwrap();
+        let value = response.result.structured_content.unwrap();
+        assert_eq!(value["matched_recipients"], json!(["lead"]));
+        assert_eq!(value["message"]["mentions"], json!(["lead"]));
+        assert_no_dropped_recipients(&value["message"]);
+    }
+
+    #[test]
+    fn send_message_first_line_multiple_recipients_route_all() {
+        let dir = tempdir().unwrap();
+        let tools = TeamModeToolset::new_for_test(dir.path());
+        create_demo_team_for_message_test(&tools);
+        add_member_for_message_test(&tools, "demo", "alice");
+        add_member_for_message_test(&tools, "demo", "bob");
+
+        let err = tools
+            .call_tool(
+                "send_message",
+                Some(json!({
+                    "team": "demo",
+                    "text": "@alice @bob\nBody references @ghost as documentation.",
+                    "_caller_member": "lead"
+                })),
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("all targeted workers are dead"), "got: {msg}");
+        assert!(msg.contains("alice"), "got: {msg}");
+        assert!(msg.contains("bob"), "got: {msg}");
+        assert!(
+            !msg.contains("ghost"),
+            "body prose mention was parsed: {msg}"
+        );
+    }
+
+    #[test]
+    fn send_message_explicit_mentions_override_body_parsing() {
+        let dir = tempdir().unwrap();
+        let tools = TeamModeToolset::new_for_test(dir.path());
+        create_demo_team_for_message_test(&tools);
+        add_member_for_message_test(&tools, "demo", "alice");
+        add_member_for_message_test(&tools, "demo", "bob");
+
+        let response = tools
+            .call_tool(
+                "send_message",
+                Some(json!({
+                    "team": "demo",
+                    "text": "No routing line here.\nBody says @bob and @ghost.",
+                    "mentions": ["lead"],
+                    "_caller_member": "alice",
+                    "_caller_team": "demo"
+                })),
+            )
+            .unwrap();
+        let value = response.result.structured_content.unwrap();
+        assert_eq!(value["matched_recipients"], json!(["lead"]));
+        assert_eq!(value["message"]["mentions"], json!(["lead"]));
+        assert_no_dropped_recipients(&value["message"]);
+    }
+
+    #[test]
+    fn extract_dispatch_handles_uses_leading_first_line_mentions_only() {
+        assert_eq!(
+            extract_dispatch_handles("@alice @bob please\n@ghost later"),
+            vec!["alice", "bob"]
+        );
+        assert_eq!(
+            extract_dispatch_handles("please @alice\n@bob later"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            extract_dispatch_handles("  @lead\nbody @alice"),
+            vec!["lead"]
+        );
+    }
+
+    #[test]
+    fn send_message_preempt_by_worker_is_rejected() {
+        let dir = tempdir().unwrap();
+        let tools = TeamModeToolset::new_for_test(dir.path());
+        create_demo_team_for_message_test(&tools);
+        add_member_for_message_test(&tools, "demo", "alice");
+        add_member_for_message_test(&tools, "demo", "bob");
+
+        // Worker `alice` tries to preempt worker `bob` — must be rejected.
+        let err = tools
+            .call_tool(
+                "send_message",
+                Some(json!({
+                    "team": "demo",
+                    "text": "@bob something",
+                    "preempt": true,
+                    "_caller_member": "alice",
+                    "_caller_team": "demo"
+                })),
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("preempt=true is reserved for lead"),
+            "expected lead-only rejection; got: {msg}"
+        );
+    }
 }

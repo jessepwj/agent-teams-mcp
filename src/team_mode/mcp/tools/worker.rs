@@ -215,6 +215,15 @@ impl TeamModeToolset {
         config
             .env
             .insert("TEAM_MODE_MEMBER".into(), worker_name.clone());
+        config
+            .env
+            .insert("TEAM_MODE_WORKER_ID".into(), worker_name.clone());
+        if let Ok(url) = std::env::var("TEAM_MODE_HTTP_MCP_URL") {
+            config.env.insert("TEAM_MODE_HTTP_MCP_URL".into(), url);
+        }
+        if let Ok(token) = std::env::var("TEAM_MODE_HTTP_MCP_TOKEN") {
+            config.env.insert("TEAM_MODE_HTTP_MCP_TOKEN".into(), token);
+        }
         // Pass through whatever the caller stored — `None` means the
         // backend CLI consults its own config (e.g. `~/.codex/config.toml`).
         // No project-level hardcoding: a user who set `model_reasoning_effort
@@ -362,10 +371,7 @@ impl TeamModeToolset {
                 member_store: Some(self.member_store.clone()),
             };
             let loop_handle = agent_loop.start(rx);
-            self.loop_handles
-                .lock()
-                .unwrap()
-                .insert(key.clone(), loop_handle);
+            self.lock_loop_handles()?.insert(key.clone(), loop_handle);
         }
 
         let mode_str = match mode {
@@ -433,7 +439,7 @@ impl TeamModeToolset {
         let _ = self
             .async_runtime
             .block_on(async move { orch.lock().await.shutdown_managed_member(&key_clone).await });
-        if let Some(h) = self.loop_handles.lock().unwrap().remove(&key) {
+        if let Some(h) = self.lock_loop_handles()?.remove(&key) {
             let _ = h.shutdown_tx.send(());
         }
         let _ = self.runtime_workers.upsert_state(

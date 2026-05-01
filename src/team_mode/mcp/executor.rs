@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::team_mode::mcp::schemas::ToolDescriptor;
@@ -10,6 +11,16 @@ pub trait TeamModeToolExecutor: Send {
 }
 
 impl TeamModeToolExecutor for TeamModeToolset {
+    fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
+        Ok(TeamModeToolset::list_tools(self))
+    }
+
+    fn call_tool(&self, name: &str, arguments: Option<Value>) -> Result<ToolExecution> {
+        TeamModeToolset::call_tool(self, name, arguments)
+    }
+}
+
+impl TeamModeToolExecutor for Arc<TeamModeToolset> {
     fn list_tools(&self) -> Result<Vec<ToolDescriptor>> {
         Ok(TeamModeToolset::list_tools(self))
     }

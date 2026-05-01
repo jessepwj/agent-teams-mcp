@@ -333,14 +333,15 @@ fn send_message_rejects_no_mention_in_text() {
 }
 
 #[test]
-fn duplicate_team_name_is_rejected() {
+fn duplicate_team_create_rebinds_existing_team() {
     let dir = tempdir().unwrap();
     let mut rt = TeamModeMcpRuntime::new(dir.path());
     rt.handle_request(req(1, "initialize", None)).unwrap();
 
-    call(&mut rt, 2, "team_create", json!({"name": "dup-team"}));
+    let first = call(&mut rt, 2, "team_create", json!({"name": "dup-team"}));
+    assert_tool_ok(&first);
     let resp = call(&mut rt, 3, "team_create", json!({"name": "dup-team"}));
-    assert_tool_err(&resp);
+    assert_tool_ok(&resp);
 }
 
 #[test]

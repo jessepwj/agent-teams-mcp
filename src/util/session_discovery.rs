@@ -58,6 +58,16 @@ pub fn discover_sessions(repo_path: &Path) -> Vec<SessionFile> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
+    discover_sessions_with_home(&home, repo_path)
+}
+
+/// Discover JSONL session files for a repository path under an explicit home.
+///
+/// Production callers usually use [`discover_sessions`]. This injection point
+/// keeps tests and embedded web hosts hermetic when `dirs::home_dir()` should
+/// not resolve to the real user profile.
+pub fn discover_sessions_with_home(home: impl AsRef<Path>, repo_path: &Path) -> Vec<SessionFile> {
+    let home = home.as_ref();
     let projects_root = home.join(".claude").join("projects");
 
     // Candidate paths to encode — try each until we find a matching dir.

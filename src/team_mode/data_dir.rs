@@ -6,13 +6,14 @@
 //! ```text
 //! .agent-teams/
 //! ├── README.md                  (auto-generated)
-//! ├── lead_pending.jsonl         (worker→lead push queue)
+//! ├── lead_pending.jsonl         (legacy worker→lead push queue)
 //! ├── .locks/                    (centralized file locks)
 //! └── <team-name>/
 //!     ├── team.json
 //!     ├── members.json
 //!     ├── room.json
-//!     └── messages.jsonl
+//!     ├── messages.jsonl
+//!     └── lead_pending.jsonl     (worker→lead push queue)
 //! ```
 //!
 //! Rebuildable views (inbox / thread projections) are NOT persisted —
@@ -39,7 +40,10 @@ pub const LEGACY_NAME: &str = ".team-mode-data";
 /// Auto-generated README at the base-dir root.
 pub const FILE_README: &str = "README.md";
 
-/// Cross-team push queue (one file, JSONL, each line tagged with `team`).
+/// Lead pending queue file name.
+///
+/// Canonical writes live under each team directory. The base-dir root path is
+/// retained for legacy migration and forensic diagnostics.
 pub const FILE_LEAD_PENDING: &str = "lead_pending.jsonl";
 
 /// Directory that collects every advisory lock file.
@@ -88,6 +92,10 @@ pub fn room_file(base: &Path, team_id: &str) -> PathBuf {
 
 pub fn messages_file(base: &Path, team_id: &str) -> PathBuf {
     team_dir(base, team_id).join(MESSAGES_FILE)
+}
+
+pub fn lead_pending_file_for_team(base: &Path, team_id: &str) -> PathBuf {
+    team_dir(base, team_id).join(FILE_LEAD_PENDING)
 }
 
 pub fn lead_pending_file(base: &Path) -> PathBuf {
@@ -153,7 +161,7 @@ coordinated through here.
 | Path | What it is | Safe to edit? |
 |---|---|---|
 | `README.md` | this file, auto-generated | regenerated on startup |
-| `lead_pending.jsonl` | worker → lead push queue (consumed by Claude Code FileChanged hook) | managed automatically |
+| `lead_pending.jsonl` | legacy worker → lead push queue kept for migration/diagnostics | managed automatically |
 | `.locks/` | file locks | never |
 | `<team-name>/` | per-team subdirectory, one per team | see below |
 
@@ -165,6 +173,7 @@ coordinated through here.
 | `members.json` | unified member list (identity + execution profile, versioned) | avoid |
 | `room.json` | main room record | avoid |
 | `messages.jsonl` | append-only message transcript (source of truth) | no — corrupts projections |
+| `lead_pending.jsonl` | worker → lead push queue for this team | managed automatically |
 
 Inbox/thread views are NOT persisted. They are rebuilt from
 `messages.jsonl` into an in-memory cache at startup and kept in sync
@@ -173,7 +182,7 @@ as new messages arrive.
 ## Want push notifications for worker replies?
 
 See `docs/push-notifications.md` in the agent-teams-rs repo for how to
-wire `~/.claude/settings.json` to read `lead_pending.jsonl` via the
+wire `~/.claude/settings.json` to read `<team-name>/lead_pending.jsonl` via the
 `FileChanged` + `asyncRewake` hook chain.
 
 ## Commands
@@ -262,6 +271,10 @@ mod tests {
         assert_eq!(
             lead_pending_file(&base),
             PathBuf::from("/tmp/base/lead_pending.jsonl")
+        );
+        assert_eq!(
+            lead_pending_file_for_team(&base, "demo"),
+            PathBuf::from("/tmp/base/demo/lead_pending.jsonl")
         );
         assert_eq!(
             lock_path(&base, "teams"),

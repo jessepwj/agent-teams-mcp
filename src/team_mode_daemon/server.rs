@@ -99,7 +99,9 @@ pub fn serve_daemon(base_dir: PathBuf, project_root: PathBuf, token: String) -> 
         std::thread::Builder::new()
             .name("worker-liveness".into())
             .spawn(move || run_worker_liveness_watchdog(toolset))
-            .map_err(|err| Error::Other(format!("failed to spawn worker-liveness thread: {err}")))?;
+            .map_err(|err| {
+                Error::Other(format!("failed to spawn worker-liveness thread: {err}"))
+            })?;
     }
 
     for incoming in listener.incoming() {
@@ -193,6 +195,7 @@ fn handle_request(
 ///   one strike. After 3 strikes in a row, exit.
 /// - Any team regains a live lead (rare, e.g. PID reuse within a check
 ///   window) → reset the strike counter.
+///
 /// Background watcher: periodically reconcile the sidecar's claimed
 /// per-worker `state` against the orchestrator's actual `is_alive` view.
 ///

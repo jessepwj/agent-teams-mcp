@@ -19,6 +19,12 @@ const ERR_INVALID_REQUEST: i32 = -32600;
 const ERR_METHOD_NOT_FOUND: i32 = -32601;
 const ERR_RUNTIME: i32 = -32000;
 
+#[derive(Debug, Clone)]
+pub enum StdioExitReason {
+    StdinEof,
+    StdinReadError(String),
+}
+
 pub struct TeamModeMcpRuntime {
     tools: Box<dyn TeamModeToolExecutor>,
     resources: TeamModeResourceRegistry,
@@ -253,10 +259,15 @@ impl TeamModeMcpRuntime {
     }
 
     pub fn run_stdio(&mut self) -> Result<()> {
+        self.run_stdio_with_exit_reason().map(|_| ())
+    }
+
+    pub fn run_stdio_with_exit_reason(&mut self) -> Result<StdioExitReason> {
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut reader = io::BufReader::new(stdin.lock());
         let mut writer = io::BufWriter::new(stdout.lock());
+        let exit_reason;
 
         loop {
             let message = match read_json_rpc_message(&mut reader) {
@@ -267,16 +278,19 @@ impl TeamModeMcpRuntime {
                     // session end) from "process signal-killed us" (we'd
                     // never reach here) when debugging disconnect issues.
                     tracing::warn!("MCP: stdin EOF — parent closed the pipe, exiting run_stdio");
+                    exit_reason = StdioExitReason::StdinEof;
                     break;
                 }
                 Err(err) => {
-                    tracing::error!(error = %err, "MCP: stdin read error, exiting run_stdio");
+                    let error = err.to_string();
+                    tracing::error!(%error, "MCP: stdin read error, exiting run_stdio");
                     let response = serde_json::to_value(JsonRpcErrorResponse::new(
                         Value::Null,
                         ERR_INVALID_REQUEST,
-                        err.to_string(),
+                        error.clone(),
                     ))?;
                     write_json_rpc_message(&mut writer, &response)?;
+                    exit_reason = StdioExitReason::StdinReadError(error);
                     break;
                 }
             };
@@ -315,7 +329,7 @@ impl TeamModeMcpRuntime {
         }
 
         writer.flush()?;
-        Ok(())
+        Ok(exit_reason)
     }
 }
 

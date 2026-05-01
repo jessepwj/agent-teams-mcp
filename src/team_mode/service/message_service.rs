@@ -40,6 +40,12 @@ pub struct MessageService {
     lead_pending_writer: Option<LeadPendingWriter>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyMentionMode {
+    FullBody,
+    ExplicitOnly,
+}
+
 impl MessageService {
     pub fn new(
         message_store: MessageStore,
@@ -68,6 +74,18 @@ impl MessageService {
     }
 
     pub fn send(&self, request: SendMessageRequest) -> Result<Message> {
+        self.send_inner(request, BodyMentionMode::FullBody)
+    }
+
+    pub fn send_with_explicit_mentions(&self, request: SendMessageRequest) -> Result<Message> {
+        self.send_inner(request, BodyMentionMode::ExplicitOnly)
+    }
+
+    fn send_inner(
+        &self,
+        request: SendMessageRequest,
+        body_mention_mode: BodyMentionMode,
+    ) -> Result<Message> {
         let SendMessageRequest {
             team_id,
             room_id,
@@ -92,7 +110,10 @@ impl MessageService {
 
         let active_members = self.active_members_by_name(&team_id)?;
 
-        let mut mention_candidates = parse_mentions_from_body(&body);
+        let mut mention_candidates = match body_mention_mode {
+            BodyMentionMode::FullBody => parse_mentions_from_body(&body),
+            BodyMentionMode::ExplicitOnly => Vec::new(),
+        };
         for mention in mentions {
             push_unique_candidate(
                 &mut mention_candidates,
@@ -238,19 +259,20 @@ impl MessageService {
             n.notify();
         }
 
-        // Best-effort: append to lead_pending.jsonl if the team's lead is
-        // among the recipients.
+        // Best-effort: append to <team_id>/lead_pending.jsonl if the team's
+        // lead is among the recipients. File path encodes team ownership;
+        // the per-team Stop hook polls only files for teams it owns (via
+        // GET /lead-pending/my-teams).
         if let Some(writer) = &self.lead_pending_writer {
             if let Ok(Some(team)) = self.team_store.get(&team_id) {
                 if let Some(lead_name) = team.lead_member_id.as_deref() {
-                    // Route only to the CC process that owns this team
-                    // (set at team_create time via parent_id). None means
-                    // unbound — hook script will fall back to broadcasting.
-                    let owner_pid = team.owner_cc_pid;
-                    if let Err(err) = writer.maybe_write(&message, lead_name, &sender, owner_pid) {
-                        tracing::warn!(
+                    if let Err(err) = writer.maybe_write(&message, lead_name, &sender) {
+                        tracing::error!(
+                            event = "lead_pending.append_failed",
+                            team_id = %team_id,
                             error = %err,
-                            msg_id = %message.id,
+                            message_id = %message.id,
+                            lead_member_id = %lead_name,
                             "lead_pending write failed; message still delivered via inbox"
                         );
                     }
