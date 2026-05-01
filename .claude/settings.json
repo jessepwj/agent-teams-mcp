@@ -5,7 +5,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/hooks/lead-pending-wake.js\""
+            "command": "node scripts/hooks/lead-pending-async-wake.js",
+            "asyncRewake": true,
+            "timeout": 7200
           }
         ]
       }
@@ -15,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/hooks/lead-pending-mid-turn.js\""
+            "command": "node scripts/hooks/lead-pending-mid-turn.js"
           }
         ]
       }
