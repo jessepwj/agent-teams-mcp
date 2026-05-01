@@ -42,17 +42,17 @@ docs/                            ← user-facing guides
 .plans/refactor-data-layout/spec.md   ← design spec for current storage layout
 ```
 
-For the architecture overview see [`README.md`](README.md) and [`docs/team-mode-mcp-final.md`](docs/team-mode-mcp-final.md).
+For the architecture overview see [`README.md`](README.md) and [`.plans/agent-teams-v2/docs/05-design-history/legacy/team-mode-mcp-final.md`](.plans/agent-teams-v2/docs/05-design-history/legacy/team-mode-mcp-final.md).
 
 ## Where to add things
 
 | Want to | Look at |
 |---|---|
 | Add a new backend (e.g. `cursor`) | `src/backend/<name>.rs` — implement the `Backend` trait; register in `src/backend/mod.rs`. AgentLoop drives all backends uniformly. |
-| Change MCP tool schema / behaviour | `src/team_mode/mcp/tools.rs` (8 handlers). Keep operational guidance in **runtime hint fields** on responses, not in static descriptions — see [`docs/usage-tips.md`](docs/usage-tips.md) §3. |
+| Change MCP tool schema / behaviour | `src/team_mode/mcp/tools.rs` (8 handlers). Keep operational guidance in **runtime hint fields** on responses, not in static descriptions — see [`.plans/agent-teams-v2/docs/03-operations/usage-tips.md`](.plans/agent-teams-v2/docs/03-operations/usage-tips.md) §3. |
 | Change message routing rules | `src/team_mode/service/message_service.rs` — keep unit tests in sync. |
 | Change storage layout | `src/team_mode/storage/*` + bump version field + handle migrations. Existing format is documented in [`.plans/refactor-data-layout/spec.md`](.plans/refactor-data-layout/spec.md). |
-| Touch the Stop hook | `scripts/hooks/lead-pending-wake.js`. **Read [`docs/hook-push-design.md`](docs/hook-push-design.md) first** — there are non-obvious invariants (loop prevention, ESC handling, ancestor routing). |
+| Touch the Stop hook | `scripts/hooks/lead-pending-wake.js`. **Read [`.plans/agent-teams-v2/docs/05-design-history/hook-push-design.md`](.plans/agent-teams-v2/docs/05-design-history/hook-push-design.md) first** — there are non-obvious invariants (loop prevention, ESC handling, ancestor routing). |
 | Touch web UI | `src/team_mode_web/` (Rust handlers) + `web/team-mode/` (JS / HTML / CSS). Smoke test: `cd web/team-mode && node app.smoke.test.mjs`. |
 
 ## Testing
@@ -81,8 +81,8 @@ For the architecture overview see [`README.md`](README.md) and [`docs/team-mode-
 2. `cargo clippy -- -D warnings` clean (or note the exception)
 3. `cargo fmt --check` clean
 4. Run `bash scripts/setup.sh` to confirm a fresh-clone user would succeed
-5. If you changed user-visible behaviour, update [`docs/usage-tips.md`](docs/usage-tips.md) and the README
-6. If you fixed a bug worth remembering, add a one-line note to the bug journal in [`docs/design-decisions.md`](docs/design-decisions.md)
+5. If you changed user-visible behaviour, update [`.plans/agent-teams-v2/docs/03-operations/usage-tips.md`](.plans/agent-teams-v2/docs/03-operations/usage-tips.md) and the README
+6. If you fixed a bug worth remembering, add a one-line note to the bug journal in [`.plans/agent-teams-v2/docs/05-design-history/design-decisions.md`](.plans/agent-teams-v2/docs/05-design-history/design-decisions.md)
 
 ## License
 

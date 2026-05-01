@@ -33,8 +33,8 @@ A web UI (auto-launched at `http://127.0.0.1:8787`) renders the live chat betwee
 git clone https://github.com/jessepwj/agent-teams-mcp
 cd agent-teams-mcp
 
-# Cross-platform bootstrap: builds both binaries, generates .mcp.json
-# with absolute paths, runs 300 unit tests.
+# Cross-platform bootstrap: builds the HTTP service, generates .mcp.json,
+# and runs 300 unit tests.
 bash scripts/setup.sh
 # or:  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 
@@ -52,19 +52,19 @@ Inside the Claude Code session, run `/mcp` — you should see `team-mode` connec
 
 Claude Code exposes MCP tool calls but, by design, does not auto-react to MCP `resources/updated` notifications. So a naive MCP server that puts worker replies in a "resource" gets no push back to the lead's terminal. The official [`Channels` API](https://code.claude.com/docs/en/channels) would solve this but requires claude.ai OAuth login; many people run Claude Code with an API key.
 
-This project uses the documented **Stop hook + `exit 0` + JSON `{decision: "block"}`** pattern to implement a server → client → session push that works under API-key auth:
+This project uses the documented **Stop hook + `asyncRewake`** pattern to implement a service → client → session push that works under API-key auth:
 
 ```
 Worker reply
     ↓
-Rust daemon appends a JSON line to <repo-root>/lead_pending.jsonl
+team_mode_service appends a JSON line to .agent-teams/<team>/lead_pending.jsonl
     ↓
 Claude Code's Stop hook (project-level, .claude/settings.json) fires when CC's turn ends
     ↓
-scripts/hooks/lead-pending-wake.js polls lead_pending.jsonl for entries
-   addressed to this CC (matched via process ancestor chain)
+scripts/hooks/lead-pending-async-wake.js asks the service for this CC's teams
+   and atomically drains the matching per-team pending files
     ↓
-On hit: writes {decision:"block", reason:"<reply contents>"} to stdout, exits 0
+On hit: writes the reply to stderr and exits 2
     ↓
 CC enters a NEW turn with the reply injected as a <system-reminder>
     ↓
@@ -73,19 +73,19 @@ Claude reads the reminder and continues working
 
 No polling, no token burn, no special login. Median end-to-end latency: ~50 ms.
 
-> **Historical note:** earlier versions of this project used `FileChanged + asyncRewake`. That path was abandoned because Anthropic's `<system-reminder>` injection only fires at turn boundaries (issues #17601, #50947), making it unreliable for workers that take longer than a single turn to reply. The Stop-hook shepherd loop is the current truth — see [`docs/hook-push-design.md`](docs/hook-push-design.md) for the full design rationale.
+> **Historical note:** earlier versions used a long synchronous Stop-hook shepherd loop and a stdio MCP relay. ADR-020 moved the default control plane to a durable localhost Streamable HTTP service, and ADR-022 moved worker-reply wakeups to `asyncRewake` with per-team pending files. The old stdio `team_mode_mcp` + `team_mode_daemon` path is kept only as a legacy rollback / fallback route.
 
 ---
 
 ## What you get
 
 - **Tiny MCP surface (8 tools)** — `team_create / team_list / team_delete / worker_add / worker_list / worker_remove / send_message / inbox_read`. That's it.
-- **Detached daemon architecture** — `team_mode_mcp` is a thin stdio relay that Claude Code spawns; `team_mode_daemon` is a long-lived, project-scoped process that owns every worker subprocess. The daemon survives `/mcp reconnect` — your workers don't die when you reconnect MCP. (See [`docs/worker-detach-refactor.md`](docs/worker-detach-refactor.md).)
-- **True push to the lead's terminal** — Stop hook + JSON block + ancestor-chain routing surface worker replies as `<system-reminder>` automatically. Idle CC sessions wake up when the next turn boundary arrives.
+- **Durable HTTP service architecture** — `team_mode_service` is a long-lived localhost Streamable HTTP MCP service on `127.0.0.1:8786/mcp`. Claude Code connects through `.mcp.json` + `scripts/mcp-http-headers.js`, while the service owns worker subprocesses and the web UI. The old stdio `team_mode_mcp` + `team_mode_daemon` pair remains documented only as a legacy rollback / fallback path.
+- **True push to the lead's terminal** — Stop hook `asyncRewake` + per-team pending-file routing surface worker replies as `<system-reminder>` automatically. Idle CC sessions wake up when the next turn boundary arrives.
 - **Live web UI on 127.0.0.1:8787+** — three-pane layout (teams list / group chat / session details). Per-sender colors, `@mention` highlighting, click-to-filter, full Claude Code & Codex JSONL session transcripts, and a sticky composer so a human user can type into the team as a peer (lead included). Auto-opens on `team_create`.
 - **Multi-backend workers** — `claude-code`, `codex`, `gemini-cli`. The lead must remain Claude Code (see [Codex as Lead](#codex-as-lead)).
 - **Strict `@mention` routing** — `send_message` rejects unmatched handles up-front and returns the active worker list (always including `@lead`) so the caller can self-correct. Matching is case-insensitive (`@Alice` finds worker `alice`). Workers with no `@mention` default to `@lead`.
-- **Caller-attributed messaging (Bug 29)** — `send_message` derives `sender` from caller identity, not from a parameter. Lead's MCP relay → `sender = "lead"`; a worker's relay (env-injected at `worker_add`) → `sender = <worker name>`. Workers can only send into their bound team. No forging.
+- **Caller-attributed messaging (Bug 29)** — `send_message` derives `sender` from HTTP caller identity, not from a parameter. Claude Code headers → `sender = "lead"`; worker env-backed HTTP headers → `sender = <worker name>`. Workers can only send into their bound team. No forging.
 - **Explicit-only worker replies (Bug 29)** — workers MUST call `mcp__team-mode__send_message` to communicate. Their stdout (LLM thinking, codex shell output, ANSI escapes) is treated as private working notes and never copied into messages. If a worker finishes a turn without calling the tool, the lead receives a `[SYSTEM]` "completed turn without sending message" notice.
 - **Strict slug validation** — worker / team names match `[a-z0-9_.-]{1,64}` (must start lowercase letter or digit). Names that can't be `@mention`ed are rejected on creation, not silently broken later.
 - **Worker liveness + revival** — `worker_remove` is a soft delete (process stopped, profile retained for fast resume). `worker_add` with `on_existing=reuse` brings a worker back. Dead workers are detected via OS process check; the response includes a `hint` telling you exactly what to do.
@@ -107,19 +107,13 @@ No polling, no token burn, no special login. Median end-to-end latency: ~50 ms.
 ┌────────────────────────────────────────────────────────────┐
 │  Claude Code (your CLI session) — the LEAD                 │
 │                                                            │
-│  .mcp.json          ──► spawns team_mode_mcp via stdio ───┐│
-│  .claude/           ──► Stop hook = lead-pending-wake.js  ││
+│  .mcp.json          ──► http://127.0.0.1:8786/mcp        ││
+│  .claude/           ──► Stop hook = asyncRewake script    ││
 │   settings.json                                           ││
 └───────────────────────────────────────────────────────────┘│
-                                                            │ stdio JSON-RPC
-┌──────────────────────────────────────────────────────────▼─┐
-│  team_mode_mcp.exe (THIS REPO — thin relay, no state)     │
-│  └─ forwards every tool call over local TCP to ↓          │
-└────┬───────────────────────────────────────────────────────┘
-     │ length-prefixed JSON over 127.0.0.1, token-authed
-     ▼
+                                                            │ Streamable HTTP MCP
 ┌─────────────────────────────────────────────────────────────┐
-│  team_mode_daemon.exe (THIS REPO — long-lived, detached)   │
+│  team_mode_service(.exe) (THIS REPO — durable localhost)   │
 │   ┌────────────────────────────────────────────────────┐   │
 │   │  MCP runtime — 8 tools                             │   │
 │   ├────────────────────────────────────────────────────┤   │
@@ -134,7 +128,7 @@ No polling, no token burn, no special login. Median end-to-end latency: ~50 ms.
 │   │  Storage (.agent-teams/)                           │   │
 │   │   <team>/  team.json members.json(v=1)             │   │
 │   │           room.json messages.jsonl                 │   │
-│   │   runtime/daemon.json runtime/workers.json         │   │
+│   │   runtime/http-mcp.json runtime/workers.json       │   │
 │   │   .locks/ README.md (auto-generated)               │   │
 │   ├────────────────────────────────────────────────────┤   │
 │   │  team_mode_web — read-only web UI on :8787+        │   │
@@ -149,11 +143,11 @@ No polling, no token burn, no special login. Median end-to-end latency: ~50 ms.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Why two binaries?** The thin relay design means MCP can crash, restart, or `/mcp reconnect` without taking down your workers. The daemon owns all process state; the relay is stateless. The daemon self-kills 15 seconds after the last team is deleted (`lead-watchdog`), and is auto-respawned on the next tool call.
+**Why a service?** ADR-020 retired the old default stdio relay because stdin EOF and ESC handling made MCP lifetime unreliable on Windows. The durable HTTP service stays up across Claude Code reconnects and owns all worker state. Stop it explicitly with `scripts/team-mode-service.ps1 stop` when you want it gone. The old stdio `team_mode_mcp` + `team_mode_daemon` implementation is retained only as a legacy rollback / fallback route.
 
 **Data flow**:
 - Lead → worker: `send_message` writes to `messages.jsonl`. The worker's `AgentLoop` wakes via `InboxNotifier` and injects the message into the worker's stdin.
-- Worker → lead: worker's reply enters `MessageService::send` with `Kind::Reply`. `LeadPendingWriter` appends it to `<repo-root>/lead_pending.jsonl`. The Stop hook (next CC turn) blocks with `{decision:"block", reason:"<contents>"}`. CC re-enters with the contents as a `<system-reminder>`.
+- Worker → lead: worker's reply enters `MessageService::send` with `Kind::Reply`. `LeadPendingWriter` appends it to `.agent-teams/<team>/lead_pending.jsonl`. The `asyncRewake` Stop hook drains that per-team file and wakes Claude Code with a `<system-reminder>`.
 
 ---
 
@@ -170,13 +164,13 @@ No polling, no token burn, no special login. Median end-to-end latency: ~50 ms.
 | `send_message` | `team`, `text` | — | Send into the team room; `sender` derived from caller identity (lead's relay → `"lead"`; a worker's relay → that worker, env-injected at `worker_add`). `text` SHOULD contain `@handles` — workers default to `@lead` when omitted, lead must specify; unmatched handles fail with the available handle list (always includes `@lead`). Workers can only send into their bound team. Mixed live/dead recipient lists return `dead_recipients_hint` plus `[SYSTEM]` notices delivered to the lead's inbox. |
 | `inbox_read` | `team` | `limit`, `unread_only`, `auto_ack` | Pull-mode fallback for the lead's inbox. **Not the canonical channel** — replies arrive automatically via the Stop hook; `inbox_read` is for backlog audits only. |
 
-Full schemas in [`docs/mcp-tools-reference.md`](docs/mcp-tools-reference.md).
+Full schemas in [`.plans/agent-teams-v2/docs/02-current-system/mcp-tools-reference.md`](.plans/agent-teams-v2/docs/02-current-system/mcp-tools-reference.md).
 
 ---
 
 ## Web UI
 
-The daemon runs an embedded read-only web server on `127.0.0.1:8787` (auto-increments to 8799 on port conflicts). It auto-opens in your default browser when you call `team_create` (disable with `TEAM_MODE_WEB_AUTO_OPEN=0`).
+The service runs an embedded read-only web server on `127.0.0.1:8787` (auto-increments to 8799 on port conflicts). It auto-opens in your default browser when you call `team_create` (disable with `TEAM_MODE_WEB_AUTO_OPEN=0`).
 
 **Layout**: three panes — left (team / member / filter list), center (group chat timeline), right (session / details / diagnostics tabs).
 
@@ -188,7 +182,7 @@ The daemon runs an embedded read-only web server on `127.0.0.1:8787` (auto-incre
 
 **Human-in-the-loop messaging**: a sticky composer at the bottom lets you, the human, send messages into any team room as `@mention`s — sender name is the reserved `user` handle. Workers reply to you the same way they reply to the lead. The lead also sees these messages (via the lead-observability rule).
 
-For the design rationale and feature roadmap see [`docs/team-mode-web-guide.md`](docs/team-mode-web-guide.md) and [`docs/web-frontend-plan.md`](docs/web-frontend-plan.md).
+For the design rationale and feature roadmap see [`.plans/agent-teams-v2/docs/04-web-ui/team-mode-web-guide.md`](.plans/agent-teams-v2/docs/04-web-ui/team-mode-web-guide.md) and [`.plans/agent-teams-v2/docs/04-web-ui/history/web-frontend-plan.md`](.plans/agent-teams-v2/docs/04-web-ui/history/web-frontend-plan.md).
 
 ---
 
@@ -224,26 +218,71 @@ bash scripts/setup.sh
 
 The setup script:
 1. Verifies prerequisites (cargo 1.85+, node 14+).
-2. Builds both release binaries: `team_mode_mcp` (relay) + `team_mode_daemon` (daemon).
-3. **Generates `.mcp.json` from `.mcp.json.template`** with the absolute path to your just-built binary (forward-slash form, JSON-safe on Windows).
+2. Builds the release binary: `team_mode_service(.exe)`.
+3. **Generates `.mcp.json` from `.mcp.json.template`** pointing at `http://127.0.0.1:8786/mcp` and `scripts/mcp-http-headers.js`.
 4. Runs `cargo test --lib` (300 tests).
 5. Prints next steps.
 
-> **Why a generated `.mcp.json`?** Claude Code does not expand env-var-style placeholders (`${CLAUDE_PROJECT_DIR}`, `${EXE_EXT:-.exe}`) in the `mcpServers.command` field — only inside `hooks`. So we emit a literal absolute path at setup time. `.mcp.json` is gitignored; `.mcp.json.template` is the tracked source. Re-run setup if you move the repo.
+> **Why a generated `.mcp.json`?** `.mcp.json` is machine-local and gitignored. The tracked `.mcp.json.template` points Claude Code at the local HTTP MCP endpoint and uses `scripts/mcp-http-headers.js` to attach the runtime token and owner headers. Re-run setup after moving the repo so the helper path is correct, then fully restart Claude Code.
 
 ### Manual install
 
 ```bash
-cargo build --release --bin team_mode_mcp --bin team_mode_daemon
+cargo build --release --bin team_mode_service
 ```
 
-Then edit `.mcp.json` (or copy `.mcp.json.template`) and set `command` to the absolute path of `target/release/team_mode_mcp(.exe)`.
+Then copy `.mcp.json.template` to `.mcp.json`, start the service, and fully restart Claude Code:
 
-If you want the binaries on `PATH`:
-```bash
-cp target/release/team_mode_mcp target/release/team_mode_daemon /usr/local/bin/
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\team-mode-service.ps1 start
 ```
-Then in `.mcp.json` use `"command": "team_mode_mcp"` and set the `TEAM_MODE_DAEMON_EXE` environment variable to the full path of `team_mode_daemon` so the relay finds the daemon to spawn.
+
+`.mcp.json` should contain the HTTP endpoint:
+
+```json
+{
+  "mcpServers": {
+    "team-mode": {
+      "type": "http",
+      "url": "http://127.0.0.1:8786/mcp",
+      "headersHelper": "node scripts/mcp-http-headers.js"
+    }
+  }
+}
+```
+
+The stdio `team_mode_mcp` + `team_mode_daemon` install path is a legacy rollback / fallback path only; do not use it for the default install.
+
+### Worker cargo commands on Windows MSVC
+
+Codex workers are child processes of `team_mode_service`. On Windows MSVC targets, `rustc` may fail to discover Visual Studio from that child process and can accidentally call Git Bash's `link.exe`, causing errors such as `link.exe was not found` or linker failures from the wrong `link.exe`.
+
+Fix this by sourcing `vcvars64.bat` before starting the service so the service, and therefore its workers, inherit `LIB`, `INCLUDE`, and the MSVC `PATH`.
+
+Use the provided script:
+
+```powershell
+.\scripts\team-mode-service.ps1 start
+```
+
+Or source it manually:
+
+```cmd
+"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cargo run --release --bin team_mode_service
+```
+
+Recommended Codex config for workers:
+
+```toml
+[shell_environment_policy]
+inherit = "all"
+
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+```
+
+Non-Windows users can keep using `cargo run --release --bin team_mode_service` directly, or run the release binary in the background with `--data-dir .agent-teams --project-root .`.
 
 ### Push notifications — already wired
 
@@ -252,13 +291,15 @@ Then in `.mcp.json` use `"command": "team_mode_mcp"` and set the `TEAM_MODE_DAEM
 ### Sanity checklist
 
 1. `bash scripts/setup.sh` (or the PowerShell variant) — succeeds.
-2. `target/release/team_mode_mcp(.exe)` and `team_mode_daemon(.exe)` exist.
-3. `claude` launched from the repo root → `/mcp` shows `team-mode` connected.
-4. `team_create({"name":"smoke"})` succeeds; the web UI auto-opens.
-5. `team_delete({"name":"smoke"})` succeeds.
-6. Read [`docs/usage-tips.md`](docs/usage-tips.md) for the do's and don'ts.
+2. `target/release/team_mode_service(.exe)` exists.
+3. `scripts/team-mode-service.ps1 start` reports `running pid=... url=http://127.0.0.1:8786/mcp`.
+4. `claude` launched from the repo root → `/mcp` shows `team-mode` connected.
+5. `team_create({"name":"smoke"})` succeeds; the web UI auto-opens.
+6. `worker_add({"team":"smoke","name":"alice","adapter":"claude-code"})` succeeds.
+7. `team_delete({"name":"smoke"})` succeeds.
+8. Read [`.plans/agent-teams-v2/docs/03-operations/usage-tips.md`](.plans/agent-teams-v2/docs/03-operations/usage-tips.md) for the do's and don'ts.
 
-If any step fails, see [`docs/open-source-deployment.md`](docs/open-source-deployment.md) — it has a full triage table.
+If any step fails, see [`.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md`](.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md) — it has a full triage table.
 
 ---
 
@@ -267,9 +308,9 @@ If any step fails, see [`docs/open-source-deployment.md`](docs/open-source-deplo
 The single most common issue. Symptoms: `send_message` returns success, but no `<system-reminder>` arrives in your next turn. Triage in this exact order:
 
 1. **Did you restart CC after first clone / after editing `.claude/settings.json`?** Hooks load only at CC startup — `/mcp reconnect` does NOT pick them up. Quit all CC windows, relaunch `claude`, retry.
-2. **Is the worker actually replying?** `tail -f .agent-teams/mcp.log` — you should see `posting reply ... kind=Reply recipients=["lead"]`. If not, the worker is stuck (check that the backend CLI, e.g. `codex`, is installed and on PATH).
-3. **Is the Stop hook firing?** `tail -f .lead-pending-wake.log` — you should see `stop: injected N ...` lines. No entries at all → hook not loaded → see step 1. `cooldown active` or `stop_hook_active=true` → normal loop guard, wait one turn. `injected 0, ancestors=[...]` → message belongs to a different CC; `rm lead_pending.jsonl` to clear stale entries.
-4. **Still nothing?** See [`docs/open-source-deployment.md`](docs/open-source-deployment.md) for the full table (15+ scenarios with fixes).
+2. **Is the worker actually replying?** `tail -f .agent-teams/team-mode-service.log` — you should see the reply being appended for `lead`. If not, the worker is stuck (check that the backend CLI, e.g. `codex`, is installed and on PATH).
+3. **Is the Stop hook firing?** `tail -f .agent-teams/.lead-pending-wake.log` — you should see async-wake injection lines. No entries at all → hook not loaded → see step 1. Service lookup errors → run `scripts/team-mode-service.ps1 status`.
+4. **Still nothing?** See [`.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md`](.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md) for the full table (15+ scenarios with fixes).
 
 The `send_message` tool's response `hint` field is intentionally chatty about this — if you ever see "If reminders never arrive ..." in a tool result, you've already hit the issue and should restart CC.
 
@@ -277,31 +318,29 @@ The `send_message` tool's response `hint` field is intentionally chatty about th
 
 ## Data directory layout
 
-Created by the daemon under the lead's CWD on first tool call:
+Created by the service under the lead's CWD on first tool call:
 
 ```
 .agent-teams/
 ├── README.md                  ← auto-regenerated on each daemon start
 ├── .locks/                    ← file locks (per-team + lead_pending)
 ├── runtime/
-│   ├── daemon.json            ← {pid, host, port, token, base_dir, project_root}
+│   ├── http-mcp.json          ← {pid, url, token_file, base_dir, project_root}
 │   └── workers.json           ← worker runtime sidecar (orphans marked dead on daemon restart)
-├── mcp.log                    ← MCP relay tracing
-├── daemon.log                 ← daemon tracing (tools, lifecycle, web)
+├── team-mode-service.log      ← service stderr/tracing
 └── <team-name>/
     ├── team.json              ← team metadata (incl. owner_cc_pid)
     ├── members.json           ← v=1, unified identity + execution profile
     ├── room.json              ← room metadata
-    └── messages.jsonl         ← append-only message history (source of truth)
+    ├── messages.jsonl         ← append-only message history (source of truth)
+    └── lead_pending.jsonl     ← per-team push queue, atomically drained by hook
 
-# At the project root (NOT inside .agent-teams/):
-lead_pending.jsonl             ← push queue, consumed by Stop hook
-.lead-pending-wake.log         ← hook execution log
-.stop-hook-cooldown            ← session_id cooldown breadcrumb
-.ancestor-cache.json           ← cached ancestor PIDs for routing
+# Hook-side scratch files:
+.agent-teams/.lead-pending-wake.log
+.agent-teams/.cc-identity.<session_id>.json
 ```
 
-`lead_pending.jsonl` lives at the project root because that's the only location the original FileChanged hook matcher could watch by literal name; the position is preserved for backwards compatibility even though the active push path is now the Stop hook.
+Old project-root `lead_pending.jsonl` files are migrated into per-team files by the service at startup.
 
 A legacy `.team-mode-data/` directory triggers a startup warning (not migrated — delete manually).
 
@@ -316,18 +355,19 @@ cargo check --lib
 # Run the 300 unit tests (~1s)
 cargo test --lib
 
-# Build everything
-cargo build --release --bin team_mode_mcp --bin team_mode_daemon
+# Build the default HTTP MCP service
+cargo build --release --bin team_mode_service
 
 # Optional web binary (built into the daemon by default; standalone build for hacking)
 cargo build --release --features team-mode-web --bin team_mode_web
 ```
 
 Useful design specs:
-- [`docs/team-mode-mcp-final.md`](docs/team-mode-mcp-final.md) — MCP runtime + tool surface + storage layout
-- [`docs/worker-detach-refactor.md`](docs/worker-detach-refactor.md) — daemon architecture rationale
-- [`docs/hook-push-design.md`](docs/hook-push-design.md) — Stop hook + JSON block design
-- [`docs/design-decisions.md`](docs/design-decisions.md) — full bug journal + alternatives considered
+- [`.plans/agent-teams-v2/decisions.md`](.plans/agent-teams-v2/decisions.md) — ADR-020/021/022 current HTTP service and async wake decisions
+- [`.plans/agent-teams-v2/docs/05-design-history/legacy/team-mode-mcp-final.md`](.plans/agent-teams-v2/docs/05-design-history/legacy/team-mode-mcp-final.md) — legacy rollback / fallback stdio MCP runtime + tool surface + storage layout
+- [`.plans/agent-teams-v2/docs/02-current-system/worker-detach-refactor.md`](.plans/agent-teams-v2/docs/02-current-system/worker-detach-refactor.md) — legacy rollback / fallback daemon architecture rationale
+- [`.plans/agent-teams-v2/docs/05-design-history/hook-push-design.md`](.plans/agent-teams-v2/docs/05-design-history/hook-push-design.md) — Stop hook + JSON block design
+- [`.plans/agent-teams-v2/docs/05-design-history/design-decisions.md`](.plans/agent-teams-v2/docs/05-design-history/design-decisions.md) — full bug journal + alternatives considered
 - [`.plans/refactor-data-layout/spec.md`](.plans/refactor-data-layout/spec.md) — current data layout spec
 
 Adding a backend? See `src/backend/{claude_code,codex,gemini}.rs` for reference implementations of the `Backend` trait. `AgentLoop` drives all backends uniformly. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for code conventions.
@@ -346,17 +386,17 @@ Codex as a **worker** is fully supported and has full session-transcript parity 
 
 ## Credits
 
-This project is **derived from and builds on** [`github.com/ZhangHanDong/agent-teams-rs`](https://github.com/ZhangHanDong/agent-teams-rs) (MIT, © 2025 Zhang Han Dong), which provides the core runtime, backends, team/task/inbox domain, and CLI. This fork refocuses the project around the `team_mode_mcp` MCP server and adds:
+This project is **derived from and builds on** [`github.com/ZhangHanDong/agent-teams-rs`](https://github.com/ZhangHanDong/agent-teams-rs) (MIT, © 2025 Zhang Han Dong), which provides the core runtime, backends, team/task/inbox domain, and CLI. This fork refocuses the project around the `team_mode_service` HTTP MCP service and adds:
 
 - The Stop-hook + JSON-block + ancestor-routing push architecture
-- A detached `team_mode_daemon` that survives `/mcp reconnect`
+- A durable localhost `team_mode_service` that survives Claude Code reconnects
 - A live web UI on `127.0.0.1:8787` with per-sender colors, full session transcripts (Claude Code + Codex), and human-in-the-loop messaging
 - A unified member file layout (`members.json` v=1 with merged identity + execution)
 - Per-team subdirectory data layout with auto-generated `README.md`
 - `worker_add on_existing`, strict `send_message`, `team_delete shutdown_failures`, `worker_add` ready-check
 - Per-dispatch terminal-message guarantee (silent turn / pipe close → `[SYSTEM]`)
 - Strict slug validation, case-insensitive `@mention`, just-in-time runtime hints
-- Lead-watchdog daemon self-kill, Stop-hook batch-grace coalescing, one-live-team enforcement
+- Service observability watchdog, asyncRewake Stop-hook batching, one-live-team enforcement
 - The `inbox_read` pull-mode tool
 - Hook scripts, setup automation, and end-user documentation
 

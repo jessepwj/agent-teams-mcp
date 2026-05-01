@@ -60,21 +60,25 @@ worker 收到 @ 通知后读文件，按文件干活。
 
 ### 大任务（特性、新模块）—— 发送前 STOP AND CHECK
 
-**给 worker 派大任务前，验证消息含以下 4 项。少任意一项，加上再发。不要省 —— worker 依靠这些才能正确工作。**
+**给 worker 派大任务前，验证消息含以下 6 项。少任意一项，加上再发。不要省 —— worker 依靠这些才能正确工作。**
 
-1. **Scope & 目标**：建什么、验收标准
-2. **文档提醒**："请建 task 子目录 `<prefix>-<task-name>/` 含 task_plan.md + findings.md + progress.md，并在自己根 findings.md 加索引项"
-3. **依赖**：依赖哪个 research/任务，关键文件路径行号
-4. **Review 期望**：完成后是否需要 review
+1. **Scope**：建什么，影响哪些用户路径 / API / 文件范围
+2. **Success criteria**：什么算完成，如何验证
+3. **Non-goals**：明确不做什么，防止顺手扩 scope / 重构
+4. **文档提醒**："请建 task 子目录 `<prefix>-<task-name>/` 含 task_plan.md + findings.md + progress.md，并在自己根 findings.md 加索引项"
+5. **依赖**：依赖哪个 research/任务，关键文件路径行号
+6. **Review 期望**：完成后是否需要 review，review 重点是什么
 
 例：
 ```
 mcp__team-mode__send_message(team="<project>", text=
   "@backend-dev 新任务：实现 auth 模块。
    Scope: JWT 登录 + refresh token + auth middleware。
+   Success criteria: 登录/刷新/鉴权成功路径和错误路径有测试，API docs 同步。
+   Non-goals: 不重写现有用户模型，不引入新认证框架，不改前端 UI。
    依赖：researcher 的 findings 在 .plans/<project>/researcher/research-auth/findings.md
    请建 task-auth/ 子目录并更新自己根 findings.md 索引。
-   这是大特性，完成后 @reviewer 请审。")
+   这是大特性，完成后 @reviewer 请审，重点看 token 过期处理和 doc-code sync。")
 ```
 
 任务子目录前缀：

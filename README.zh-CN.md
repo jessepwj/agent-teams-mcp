@@ -33,7 +33,7 @@ Web UI（自动在 `http://127.0.0.1:8787` 启动）实时渲染 lead 与所有 
 git clone https://github.com/jessepwj/agent-teams-mcp
 cd agent-teams-mcp
 
-# 跨平台初始化脚本：构建两个二进制文件，生成包含绝对路径的 .mcp.json，
+# 跨平台初始化脚本：构建 HTTP service，生成 .mcp.json，
 # 并运行 300 个单元测试。
 bash scripts/setup.sh
 # 或：  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
@@ -52,19 +52,19 @@ claude   # 从仓库根目录启动 Claude Code
 
 Claude Code 暴露了 MCP 工具调用，但根据设计，它不会自动响应 MCP `resources/updated` 通知。因此，一个把 worker 回复放入"resource"的朴素 MCP server 无法向 lead 的终端推送任何内容。官方的 [`Channels` API](https://code.claude.com/docs/en/channels) 可以解决这个问题，但需要 claude.ai OAuth 登录；而很多人使用 API key 来运行 Claude Code。
 
-本项目使用官方文档记载的 **Stop hook + `exit 0` + JSON `{decision: "block"}`** 模式，实现了一套在 API key 认证下可用的 server → client → session 推送机制：
+本项目使用官方文档记载的 **Stop hook + `asyncRewake`** 模式，实现了一套在 API key 认证下可用的 service → client → session 推送机制：
 
 ```
 Worker 回复
     ↓
-Rust daemon 将一条 JSON 行追加到 <repo-root>/lead_pending.jsonl
+team_mode_service 将一条 JSON 行追加到 .agent-teams/<team>/lead_pending.jsonl
     ↓
 Claude Code 的 Stop hook（项目级，.claude/settings.json）在 CC turn 结束时触发
     ↓
-scripts/hooks/lead-pending-wake.js 轮询 lead_pending.jsonl 中的条目
-   通过进程祖先链匹配当前 CC 实例
+scripts/hooks/lead-pending-async-wake.js 向 service 查询当前 CC 的 team
+   并原子化 drain 对应的 per-team pending 文件
     ↓
-命中时：向 stdout 写入 {decision:"block", reason:"<reply contents>"}，退出 0
+命中时：向 stderr 写入回复内容并退出 2
     ↓
 CC 进入一个新 turn，回复内容以 <system-reminder> 的形式注入
     ↓
@@ -73,15 +73,15 @@ Claude 读取该 reminder 并继续工作
 
 无需轮询，无需消耗 token，无需特殊登录。端到端中位延迟：约 50 ms。
 
-> **历史说明：** 本项目早期版本使用 `FileChanged + asyncRewake`。该路径已被放弃，原因是 Anthropic 的 `<system-reminder>` 注入只在 turn 边界触发（issues #17601、#50947），对于回复时间超过单个 turn 的 worker 来说不可靠。Stop hook 看护循环是当前的实现真相——完整的设计理由见 [`docs/hook-push-design.md`](docs/hook-push-design.md)。
+> **历史说明：** 早期版本使用长时间同步 Stop-hook shepherd loop 和 stdio MCP relay。ADR-020 已将默认控制面切到 durable localhost Streamable HTTP service；ADR-022 已将 worker 回复唤醒改为 `asyncRewake` + per-team pending 文件。旧的 stdio `team_mode_mcp` + `team_mode_daemon` 路径仅作为 legacy rollback / fallback 保留。
 
 ---
 
 ## 功能概览
 
 - **精简的 MCP 接口（8 个工具）** — `team_create / team_list / team_delete / worker_add / worker_list / worker_remove / send_message / inbox_read`。就这些。
-- **分离的 daemon 架构** — `team_mode_mcp` 是 Claude Code 启动的一个轻量级 stdio 转发层；`team_mode_daemon` 是一个长期运行、项目级作用域的进程，负责管理所有 worker 子进程。daemon 可以在 `/mcp reconnect` 后继续存活——重连 MCP 不会杀死你的 worker。（见 [`docs/worker-detach-refactor.md`](docs/worker-detach-refactor.md)。）
-- **真正推送到 lead 终端** — Stop hook + JSON block + 祖先链路由，将 worker 回复自动以 `<system-reminder>` 的形式呈现。空闲的 CC 会话会在下一个 turn 边界到来时被唤醒。
+- **Durable HTTP service 架构** — `team_mode_service` 是运行在 `127.0.0.1:8786/mcp` 的长期本地 Streamable HTTP MCP service。Claude Code 通过 `.mcp.json` + `scripts/mcp-http-headers.js` 连接；service 持有 worker 子进程和 Web UI。旧的 stdio `team_mode_mcp` + `team_mode_daemon` 组合仅作为 legacy rollback / fallback 路径保留。
+- **真正推送到 lead 终端** — Stop hook `asyncRewake` + per-team pending 文件路由，将 worker 回复自动以 `<system-reminder>` 的形式呈现。空闲的 CC 会话会在下一个 turn 边界到来时被唤醒。
 - **`127.0.0.1:8787+` 上的实时 Web UI** — 三栏布局（团队列表 / 群组聊天 / 会话详情）。按发送者着色、`@mention` 高亮、点击过滤、完整的 Claude Code 和 Codex JSONL 会话记录，以及一个固定的输入框，允许人类用户以对等身份（包括 lead）向团队发送消息。在 `team_create` 时自动打开。
 - **多后端 worker** — `claude-code`、`codex`、`gemini-cli`。lead 必须使用 Claude Code（见 [Codex 作为 Lead](#codex-as-lead)）。
 - **严格的 `@mention` 路由** — `send_message` 会预先拒绝无法匹配的 handle，并返回当前活跃 worker 列表，方便调用方自我纠正。匹配不区分大小写（`@Alice` 可以找到 worker `alice`）。
@@ -103,19 +103,13 @@ Claude 读取该 reminder 并继续工作
 ┌────────────────────────────────────────────────────────────┐
 │  Claude Code (your CLI session) — the LEAD                 │
 │                                                            │
-│  .mcp.json          ──► spawns team_mode_mcp via stdio ───┐│
-│  .claude/           ──► Stop hook = lead-pending-wake.js  ││
+│  .mcp.json          ──► http://127.0.0.1:8786/mcp        ││
+│  .claude/           ──► Stop hook = asyncRewake script    ││
 │   settings.json                                           ││
 └───────────────────────────────────────────────────────────┘│
-                                                            │ stdio JSON-RPC
-┌──────────────────────────────────────────────────────────▼─┐
-│  team_mode_mcp.exe (THIS REPO — thin relay, no state)     │
-│  └─ forwards every tool call over local TCP to ↓          │
-└────┬───────────────────────────────────────────────────────┘
-     │ length-prefixed JSON over 127.0.0.1, token-authed
-     ▼
+                                                            │ Streamable HTTP MCP
 ┌─────────────────────────────────────────────────────────────┐
-│  team_mode_daemon.exe (THIS REPO — long-lived, detached)   │
+│  team_mode_service(.exe) (THIS REPO — durable localhost)   │
 │   ┌────────────────────────────────────────────────────┐   │
 │   │  MCP runtime — 8 tools                             │   │
 │   ├────────────────────────────────────────────────────┤   │
@@ -130,7 +124,7 @@ Claude 读取该 reminder 并继续工作
 │   │  Storage (.agent-teams/)                           │   │
 │   │   <team>/  team.json members.json(v=1)             │   │
 │   │           room.json messages.jsonl                 │   │
-│   │   runtime/daemon.json runtime/workers.json         │   │
+│   │   runtime/http-mcp.json runtime/workers.json       │   │
 │   │   .locks/ README.md (auto-generated)               │   │
 │   ├────────────────────────────────────────────────────┤   │
 │   │  team_mode_web — read-only web UI on :8787+        │   │
@@ -145,11 +139,11 @@ Claude 读取该 reminder 并继续工作
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**为何需要两个二进制文件？** 轻量级转发层的设计意味着 MCP 可以崩溃、重启或 `/mcp reconnect`，而不会影响你的 worker。daemon 持有所有进程状态；relay 是无状态的。daemon 在最后一个团队被删除后 15 秒自我退出（`lead-watchdog`），并在下一次工具调用时自动重新启动。
+**为什么现在是 service？** ADR-020 退役了旧默认 stdio relay，因为 stdin EOF 与 ESC 行为在 Windows 上会让 MCP 生命周期不可靠。durable HTTP service 跨 Claude Code reconnect 存活并持有 worker 状态。需要退出时显式运行 `scripts/team-mode-service.ps1 stop`。旧的 stdio `team_mode_mcp` + `team_mode_daemon` 实现仅作为 legacy rollback / fallback 路径保留。
 
 **数据流**：
 - Lead → worker：`send_message` 写入 `messages.jsonl`。worker 的 `AgentLoop` 通过 `InboxNotifier` 被唤醒，并将消息注入 worker 的 stdin。
-- Worker → lead：worker 的回复通过 `MessageService::send`（`Kind::Reply`）进入系统，`LeadPendingWriter` 将其追加到 `<repo-root>/lead_pending.jsonl`。Stop hook（在 CC 的下一个 turn）以 `{decision:"block", reason:"<contents>"}` 阻塞。CC 带着该内容作为 `<system-reminder>` 重新进入。
+- Worker → lead：worker 的回复通过 `MessageService::send`（`Kind::Reply`）进入系统，`LeadPendingWriter` 将其追加到 `.agent-teams/<team>/lead_pending.jsonl`。`asyncRewake` Stop hook drain 对应 per-team 文件，并用 `<system-reminder>` 唤醒 Claude Code。
 
 ---
 
@@ -166,13 +160,13 @@ Claude 读取该 reminder 并继续工作
 | `send_message` | `team`, `text` | — | 以 lead 身份发送消息。`text` 必须包含 `@handles`，且所有 handle 必须匹配活跃 worker；未匹配的 handle 会导致调用失败并返回活跃 worker 列表。混合活跃/死亡收件人列表时，返回 `dead_recipients_hint` 并向 lead 的 inbox 发送 `[SYSTEM]` 通知。 |
 | `inbox_read` | `team` | `limit`, `unread_only`, `auto_ack` | lead 的 inbox 拉取模式备用方案。**这不是主要通道**——回复通过 Stop hook 自动到达；`inbox_read` 仅用于历史消息审查。 |
 
-完整 schema 见 [`docs/mcp-tools-reference.md`](docs/mcp-tools-reference.md)。
+完整 schema 见 [`.plans/agent-teams-v2/docs/02-current-system/mcp-tools-reference.md`](.plans/agent-teams-v2/docs/02-current-system/mcp-tools-reference.md)。
 
 ---
 
 ## Web UI
 
-daemon 在 `127.0.0.1:8787` 上运行一个内嵌的只读 Web 服务器（端口冲突时自动递增至 8799）。调用 `team_create` 时自动在默认浏览器中打开（通过 `TEAM_MODE_WEB_AUTO_OPEN=0` 禁用）。
+service 在 `127.0.0.1:8787` 上运行一个内嵌的只读 Web 服务器（端口冲突时自动递增至 8799）。调用 `team_create` 时自动在默认浏览器中打开（通过 `TEAM_MODE_WEB_AUTO_OPEN=0` 禁用）。
 
 **布局**：三栏——左侧（团队 / 成员 / 过滤列表），中间（群组聊天时间线），右侧（会话 / 详情 / 诊断标签页）。
 
@@ -184,7 +178,7 @@ daemon 在 `127.0.0.1:8787` 上运行一个内嵌的只读 Web 服务器（端�
 
 **人在回路消息**：底部固定的输入框允许你作为人类用户，通过 `@mention` 向任意团队房间发送消息——发送者名称为保留的 `user` handle。worker 回复你的方式与回复 lead 完全一致。lead 也能看到这些消息（通过 lead 可见性规则）。
 
-设计理由与功能路线图见 [`docs/team-mode-web-guide.md`](docs/team-mode-web-guide.md) 和 [`docs/web-frontend-plan.md`](docs/web-frontend-plan.md)。
+设计理由与功能路线图见 [`.plans/agent-teams-v2/docs/04-web-ui/team-mode-web-guide.md`](.plans/agent-teams-v2/docs/04-web-ui/team-mode-web-guide.md) 和 [`.plans/agent-teams-v2/docs/04-web-ui/history/web-frontend-plan.md`](.plans/agent-teams-v2/docs/04-web-ui/history/web-frontend-plan.md)。
 
 ---
 
@@ -220,26 +214,71 @@ bash scripts/setup.sh
 
 setup 脚本做了以下事情：
 1. 验证前置条件（cargo 1.85+，node 14+）。
-2. 构建两个 release 二进制文件：`team_mode_mcp`（relay）和 `team_mode_daemon`（daemon）。
-3. **从 `.mcp.json.template` 生成 `.mcp.json`**，写入刚构建的二进制文件的绝对路径（正斜杠形式，在 Windows 上 JSON 安全）。
+2. 构建 release 二进制文件：`team_mode_service(.exe)`。
+3. **从 `.mcp.json.template` 生成 `.mcp.json`**，指向 `http://127.0.0.1:8786/mcp` 和 `scripts/mcp-http-headers.js`。
 4. 运行 `cargo test --lib`（300 个测试）。
 5. 打印后续步骤。
 
-> **为何需要生成 `.mcp.json`？** Claude Code 不会展开 `mcpServers.command` 字段中的环境变量占位符（`${CLAUDE_PROJECT_DIR}`、`${EXE_EXT:-.exe}`）——只有 `hooks` 内部支持。因此我们在 setup 时写入字面绝对路径。`.mcp.json` 已加入 gitignore；`.mcp.json.template` 是版本跟踪的来源文件。移动仓库后需要重新运行 setup。
+> **为何需要生成 `.mcp.json`？** `.mcp.json` 是本机配置且已加入 gitignore。版本跟踪的 `.mcp.json.template` 指向本地 HTTP MCP endpoint，并通过 `scripts/mcp-http-headers.js` 注入 runtime token 与 owner headers。移动仓库后重新运行 setup，并完整重启 Claude Code。
 
 ### 手动安装
 
 ```bash
-cargo build --release --bin team_mode_mcp --bin team_mode_daemon
+cargo build --release --bin team_mode_service
 ```
 
-然后编辑 `.mcp.json`（或复制 `.mcp.json.template`），将 `command` 设置为 `target/release/team_mode_mcp(.exe)` 的绝对路径。
+然后复制 `.mcp.json.template` 为 `.mcp.json`，启动 service，并完整重启 Claude Code：
 
-如果你想把二进制文件加入 `PATH`：
-```bash
-cp target/release/team_mode_mcp target/release/team_mode_daemon /usr/local/bin/
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\team-mode-service.ps1 start
 ```
-然后在 `.mcp.json` 中使用 `"command": "team_mode_mcp"`，并将 `TEAM_MODE_DAEMON_EXE` 环境变量设置为 `team_mode_daemon` 的完整路径，以便 relay 找到要启动的 daemon。
+
+`.mcp.json` 应包含 HTTP endpoint：
+
+```json
+{
+  "mcpServers": {
+    "team-mode": {
+      "type": "http",
+      "url": "http://127.0.0.1:8786/mcp",
+      "headersHelper": "node scripts/mcp-http-headers.js"
+    }
+  }
+}
+```
+
+stdio `team_mode_mcp` + `team_mode_daemon` 安装路径仅是 legacy rollback / fallback 路径，不应作为默认安装方式。
+
+### Worker cargo 命令在 Windows MSVC 上的前置
+
+Codex worker 是 `team_mode_service` 的子进程。在 Windows MSVC target 下，`rustc` 可能无法从这个子进程中探测到 Visual Studio，进而误调用 Git Bash 的 `link.exe`，表现为 `link.exe was not found` 或来自错误 `link.exe` 的链接失败。
+
+修复方式是在启动 service 前先 source `vcvars64.bat`，让 service 及其 worker 继承 `LIB`、`INCLUDE` 和 MSVC `PATH`。
+
+使用项目脚本：
+
+```powershell
+.\scripts\team-mode-service.ps1 start
+```
+
+或手动执行：
+
+```cmd
+"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cargo run --release --bin team_mode_service
+```
+
+推荐的 Codex worker 配置：
+
+```toml
+[shell_environment_policy]
+inherit = "all"
+
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+```
+
+非 Windows 用户可直接运行 `cargo run --release --bin team_mode_service`，或用 release binary 加 `--data-dir .agent-teams --project-root .` 后台启动。
 
 ### 推送通知——已内置
 
@@ -248,13 +287,15 @@ cp target/release/team_mode_mcp target/release/team_mode_daemon /usr/local/bin/
 ### 验证清单
 
 1. `bash scripts/setup.sh`（或 PowerShell 版本）——成功。
-2. `target/release/team_mode_mcp(.exe)` 和 `team_mode_daemon(.exe)` 存在。
-3. 从仓库根目录启动 `claude` → `/mcp` 显示 `team-mode` 已连接。
-4. `team_create({"name":"smoke"})` 成功；Web UI 自动打开。
-5. `team_delete({"name":"smoke"})` 成功。
-6. 阅读 [`docs/usage-tips.md`](docs/usage-tips.md)，了解注意事项。
+2. `target/release/team_mode_service(.exe)` 存在。
+3. `scripts/team-mode-service.ps1 start` 输出 `running pid=... url=http://127.0.0.1:8786/mcp`。
+4. 从仓库根目录启动 `claude` → `/mcp` 显示 `team-mode` 已连接。
+5. `team_create({"name":"smoke"})` 成功；Web UI 自动打开。
+6. `worker_add({"team":"smoke","name":"alice","adapter":"claude-code"})` 成功。
+7. `team_delete({"name":"smoke"})` 成功。
+8. 阅读 [`.plans/agent-teams-v2/docs/03-operations/usage-tips.md`](.plans/agent-teams-v2/docs/03-operations/usage-tips.md)，了解注意事项。
 
-如果任何步骤失败，见 [`docs/open-source-deployment.md`](docs/open-source-deployment.md)——里面有完整的排查表。
+如果任何步骤失败，见 [`.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md`](.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md)——里面有完整的排查表。
 
 ---
 
@@ -263,9 +304,9 @@ cp target/release/team_mode_mcp target/release/team_mode_daemon /usr/local/bin/
 这是最常见的问题。症状：`send_message` 返回成功，但下一个 turn 没有收到 `<system-reminder>`。请按以下顺序逐步排查：
 
 1. **首次克隆后 / 编辑 `.claude/settings.json` 后，你重启 CC 了吗？** Hook 只在 CC 启动时加载——`/mcp reconnect` **不会**重新加载。退出所有 CC 窗口，重新启动 `claude`，然后重试。
-2. **Worker 真的在回复吗？** `tail -f .agent-teams/mcp.log`——你应该看到 `posting reply ... kind=Reply recipients=["lead"]`。如果没有，说明 worker 卡住了（检查后端 CLI，例如 `codex` 是否已安装并在 PATH 中）。
-3. **Stop hook 在触发吗？** `tail -f .lead-pending-wake.log`——你应该看到 `stop: injected N ...` 行。完全没有条目 → hook 未加载 → 见步骤 1。出现 `cooldown active` 或 `stop_hook_active=true` → 这是正常的循环防护，等一个 turn 即可。出现 `injected 0, ancestors=[...]` → 消息属于另一个 CC 实例；`rm lead_pending.jsonl` 清除过期条目。
-4. **仍然没有效果？** 见 [`docs/open-source-deployment.md`](docs/open-source-deployment.md)，其中有完整的排查表（15+ 个场景及修复方案）。
+2. **Worker 真的在回复吗？** `tail -f .agent-teams/team-mode-service.log`——你应该能看到回复被 append 给 `lead`。如果没有，说明 worker 卡住了（检查后端 CLI，例如 `codex` 是否已安装并在 PATH 中）。
+3. **Stop hook 在触发吗？** `tail -f .agent-teams/.lead-pending-wake.log`——你应该看到 async-wake 注入日志。完全没有条目 → hook 未加载 → 见步骤 1。service 查询失败 → 运行 `scripts/team-mode-service.ps1 status`。
+4. **仍然没有效果？** 见 [`.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md`](.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md)，其中有完整的排查表（15+ 个场景及修复方案）。
 
 `send_message` 工具响应的 `hint` 字段对此有意做了详细说明——如果你在工具返回结果中看到 "If reminders never arrive ..."，说明你已经遇到这个问题了，应该重启 CC。
 
@@ -273,31 +314,29 @@ cp target/release/team_mode_mcp target/release/team_mode_daemon /usr/local/bin/
 
 ## 数据目录结构
 
-由 daemon 在首次工具调用时，在 lead 的 cwd 下创建：
+由 service 在首次工具调用时，在 lead 的 cwd 下创建：
 
 ```
 .agent-teams/
-├── README.md                  ← 每次 daemon 启动时自动重新生成
+├── README.md                  ← 每次 service 启动时自动重新生成
 ├── .locks/                    ← 文件锁（按团队 + lead_pending）
 ├── runtime/
-│   ├── daemon.json            ← {pid, host, port, token, base_dir, project_root}
-│   └── workers.json           ← worker 运行时附属文件（daemon 重启时孤儿标记为 dead）
-├── mcp.log                    ← MCP relay 追踪日志
-├── daemon.log                 ← daemon 追踪日志（工具、生命周期、web）
+│   ├── http-mcp.json          ← {pid, url, token_file, base_dir, project_root}
+│   └── workers.json           ← worker 运行时附属文件（service 重启时孤儿标记为 dead）
+├── team-mode-service.log      ← service stderr/tracing
 └── <team-name>/
     ├── team.json              ← 团队元数据（含 owner_cc_pid）
     ├── members.json           ← v=1，统一身份 + 执行配置
     ├── room.json              ← 房间元数据
-    └── messages.jsonl         ← 只追加的消息历史（数据真相来源）
+    ├── messages.jsonl         ← 只追加的消息历史（数据真相来源）
+    └── lead_pending.jsonl     ← per-team 推送队列，由 hook 原子化 drain
 
-# 在项目根目录（不在 .agent-teams/ 内）：
-lead_pending.jsonl             ← 推送队列，由 Stop hook 消费
-.lead-pending-wake.log         ← hook 执行日志
-.stop-hook-cooldown            ← session_id 冷却标记
-.ancestor-cache.json           ← 用于路由的祖先 PID 缓存
+# Hook 侧 scratch 文件：
+.agent-teams/.lead-pending-wake.log
+.agent-teams/.cc-identity.<session_id>.json
 ```
 
-`lead_pending.jsonl` 位于项目根目录，原因是当初 FileChanged hook 匹配器只能通过字面名称监视该位置；即使当前推送路径已改为 Stop hook，这个位置仍保留，以保持向后兼容性。
+旧的项目根 `lead_pending.jsonl` 会在 service 启动时迁移到 per-team 文件。
 
 遗留的 `.team-mode-data/` 目录会触发启动警告（不会自动迁移——请手动删除）。
 
@@ -312,18 +351,19 @@ cargo check --lib
 # 运行 300 个单元测试（约 1 秒）
 cargo test --lib
 
-# 构建全部
-cargo build --release --bin team_mode_mcp --bin team_mode_daemon
+# 构建默认 HTTP MCP service
+cargo build --release --bin team_mode_service
 
-# 可选的 web 二进制文件（默认已内置到 daemon；独立构建供调试用）
+# 可选的 web 二进制文件（默认已内置到 service；独立构建供调试用）
 cargo build --release --features team-mode-web --bin team_mode_web
 ```
 
 相关设计文档：
-- [`docs/team-mode-mcp-final.md`](docs/team-mode-mcp-final.md) — MCP 运行时 + 工具接口 + 存储布局
-- [`docs/worker-detach-refactor.md`](docs/worker-detach-refactor.md) — daemon 架构设计理由
-- [`docs/hook-push-design.md`](docs/hook-push-design.md) — Stop hook + JSON block 设计
-- [`docs/design-decisions.md`](docs/design-decisions.md) — 完整的 bug 记录 + 备选方案讨论
+- [`.plans/agent-teams-v2/decisions.md`](.plans/agent-teams-v2/decisions.md) — ADR-020/021/022 当前 HTTP service 与 async wake 决策
+- [`.plans/agent-teams-v2/docs/05-design-history/legacy/team-mode-mcp-final.md`](.plans/agent-teams-v2/docs/05-design-history/legacy/team-mode-mcp-final.md) — legacy rollback / fallback stdio MCP 运行时 + 工具接口 + 存储布局
+- [`.plans/agent-teams-v2/docs/02-current-system/worker-detach-refactor.md`](.plans/agent-teams-v2/docs/02-current-system/worker-detach-refactor.md) — legacy rollback / fallback daemon 架构设计理由
+- [`.plans/agent-teams-v2/docs/05-design-history/hook-push-design.md`](.plans/agent-teams-v2/docs/05-design-history/hook-push-design.md) — Stop hook + JSON block 设计
+- [`.plans/agent-teams-v2/docs/05-design-history/design-decisions.md`](.plans/agent-teams-v2/docs/05-design-history/design-decisions.md) — 完整的 bug 记录 + 备选方案讨论
 - [`.plans/refactor-data-layout/spec.md`](.plans/refactor-data-layout/spec.md) — 当前数据布局规范
 
 要添加新后端？参见 `src/backend/{claude_code,codex,gemini}.rs` 中 `Backend` trait 的参考实现。`AgentLoop` 以统一方式驱动所有后端。代码规范见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
@@ -342,17 +382,17 @@ Codex 作为 **worker** 则完全支持，在 Web UI 中与 Claude Code 拥有�
 
 ## 致谢
 
-本项目**衍生自并构建于** [`github.com/ZhangHanDong/agent-teams-rs`](https://github.com/ZhangHanDong/agent-teams-rs)（MIT，© 2025 Zhang Han Dong），该项目提供了核心运行时、后端实现、team/task/inbox 领域模型和 CLI。本 fork 将项目重心转移到 `team_mode_mcp` MCP server，并新增了：
+本项目**衍生自并构建于** [`github.com/ZhangHanDong/agent-teams-rs`](https://github.com/ZhangHanDong/agent-teams-rs)（MIT，© 2025 Zhang Han Dong），该项目提供了核心运行时、后端实现、team/task/inbox 领域模型和 CLI。本 fork 将项目重心转移到 `team_mode_service` HTTP MCP service，并新增了：
 
 - Stop hook + JSON block + 祖先链路由推送架构
-- 可在 `/mcp reconnect` 后存活的分离式 `team_mode_daemon`
+- 可跨 Claude Code reconnect 存活的 durable localhost `team_mode_service`
 - `127.0.0.1:8787` 上的实时 Web UI，支持按发送者着色、完整会话记录（Claude Code + Codex）以及人在回路消息
 - 统一成员文件布局（`members.json` v=1，身份与执行配置合并）
 - 含自动生成 `README.md` 的按团队子目录数据布局
 - `worker_add on_existing`、严格的 `send_message`、`team_delete shutdown_failures`、`worker_add` 就绪检查
 - 每次分发的终端消息保证（静默 turn / 管道关闭 → `[SYSTEM]`）
 - 严格的 slug 验证、大小写不敏感的 `@mention`、即时运行时提示
-- Lead watchdog daemon 自我退出、Stop hook 批量合并窗口、单活跃团队强制约束
+- Service observability watchdog、asyncRewake Stop hook 批量合并、单活跃团队强制约束
 - `inbox_read` 拉取模式工具
 - Hook 脚本、安装自动化与终端用户文档
 

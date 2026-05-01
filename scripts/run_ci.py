@@ -6,7 +6,7 @@ Pipeline (fail-fast):
   1. Golden Rules (file size, secrets, console.log, doc freshness, invariant coverage)
   2. cargo fmt --check
   3. cargo clippy --all-targets -- -D warnings
-  4. cargo test (workspace)
+  4. cargo test (workspace default features + team-mode-web feature)
 
 Usage:
   python scripts/run_ci.py
@@ -90,6 +90,11 @@ def main():
     if not args.skip_test:
         if not run(["cargo", "test", "--workspace"], "Step 4: cargo test --workspace"):
             failures.append("cargo test")
+        if not run(
+            ["cargo", "test", "--workspace", "--features", "team-mode-web"],
+            "Step 4b: cargo test --workspace --features team-mode-web",
+        ):
+            failures.append("cargo test --features team-mode-web")
 
     # Summary
     banner("CI Summary")

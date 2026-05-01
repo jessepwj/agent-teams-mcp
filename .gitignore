@@ -63,6 +63,19 @@ docs/中间内容.txt
 # Manual UI verification screenshots — captured ad-hoc during testing,
 # not meant for the repo.
 /webui-*.png
+/dashboard*.png
+/responsive*.png
+/team-mode*.png
+
+# Probe/runtime scratch from local Team Mode diagnostics.
+/.async-wake-probe.log
+/.mid-turn-probe.log
+/.mcp-launcher.log
+/.agent-teams-mcp/
+/%SystemDrive%/
+/docs/备忘.txt
+/dashboard-mock-snap.md
+/.claude/scheduled_tasks.lock
 
 # In-progress lead+team planning workspace. The .plans/ tree is per-CC
 # session scratch (per-worker progress.md / findings.md / task_plan.md);

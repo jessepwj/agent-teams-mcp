@@ -44,11 +44,12 @@ team-lead 负责捕获用户的 taste/style 偏好：
   - 服务端实现（API 路由、controller、middleware、数据库）
   - TDD：先写测试（RED） → 最小实现（GREEN） → 重构（IMPROVE）
   - 维持 80%+ 测试覆盖
+  - 最小实现 + 窄修改：不加未要求功能，不做无关重构；每个 changed file 对应任务目标或验证要求
 - **文档结构**：
   - 大任务 / 特性 → 自己目录下开 `task-<name>/` 子目录（task_plan.md + findings.md + progress.md）
   - 小改 / bug 修复 → 直接记到根三件套
 - **Code Review 规则**：
-  - 完成大项目/特性/新模块后 → 必须 `@reviewer` 直接喊 reviewer
+  - 完成大项目/特性/新模块后 → 默认 reply lead，由 lead 决定派 reviewer 时机
   - 小改、bug 修复、配置改动 → 不需要 review
 - **测试要求**：
   - 必测边界：null/undefined、空值、非法类型、边界值、错误路径、并发、大数据、特殊字符
@@ -64,11 +65,13 @@ team-lead 负责捕获用户的 taste/style 偏好：
 - **CI Gate**（CI 脚本存在时）：
   - 任何代码改动后跑 CI；全 PASS 才能找 reviewer
   - CI 失败 = 任务未完成
+- **Hand-off**：
+  - 小任务 3-5 行；中任务 ≤10 行；大任务写 task findings.md 完整摘要，reply lead 只放摘要、路径、验证和限制
 - **代码质量**：
   - 函数 <50 行、文件 <800 行
   - 不可变模式（spread 而非 mutate）
   - 显式错误处理，不吞异常
-- **沟通协议**：见 [onboarding.md](onboarding.md) Common Template "Team Communication" + "Escalation Judgment"
+- **沟通协议**：见 [onboarding.md](onboarding.md) Common Template "Team Communication" + "Escalation Judgment"；无歧义小任务直接干，大任务或 scope 不清时先做 discovery confirmation。
 
 **adapter 特殊提示（codex 默认场景）**：
 - codex CLI 跟 `.plans/` 文件协议不熟，onboarding 必须**详细**教（已在 onboarding.md 处理）
@@ -87,6 +90,7 @@ team-lead 负责捕获用户的 taste/style 偏好：
   - 客户端实现（component、hook、状态、样式、路由）
   - TDD（component 测试 + 集成测试）
   - 80%+ 覆盖
+  - 最小实现 + 窄修改：不加未要求功能，不做无关重构；每个 changed file 对应任务目标或验证要求
 - **文档结构**：同 backend-dev
 - **Code Review 规则**：同 backend-dev
 - **Doc-Code Sync**：同 backend-dev
@@ -122,6 +126,7 @@ team-lead 负责捕获用户的 taste/style 偏好：
   - 仅研究和文档化
 - **输出原则**：
   - **持久性**：除了文件路径，要描述模块行为和契约。路径用于即时定位，行为描述在重构后仍有用
+  - 多方案时并列假设、tradeoff 和未知项；不静默替 lead 做产品/架构决策
   - tags：[RESEARCH] 发现、[BUG] 缺陷、[ARCHITECTURE] 架构分析、[PLAN-REVIEW] plan stress-test
 - **文档结构**：
   - 每个研究 topic → `research-<topic>/` 子目录
@@ -172,9 +177,10 @@ team-lead 负责捕获用户的 taste/style 偏好：
 - **核心职责**：
   - **只读项目源码** —— 输出问题列表，绝不 Edit 源码
   - **可写 .plans/ 文件** —— 写 review 报告到自己 review 子目录 + 在 dev findings.md 加 cross-reference
-  - 接 dev 直接 `@reviewer` 请求（不经 lead）
+  - 默认接 lead 派发的正式 review；dev 可直接提问或传 hand-off 路径，正式 review 时机通常由 lead 调度
   - 输出 CRITICAL / HIGH / MEDIUM / LOW 分级
   - 给具体修复建议（带代码示例）
+  - 检查 scope drift、未要求功能、过度抽象、无关重构和验证证据
 - **Security Checks**（CRITICAL）：
   - 硬编码 secret
   - SQL 注入

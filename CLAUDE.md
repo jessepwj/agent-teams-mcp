@@ -39,6 +39,24 @@
 
 修改一个必须同步另一个，否则 lead 和 worker 的协议会漂移。custodian 负责检查两者一致性。
 
+## Runtime 约定（项目特定）
+
+- **worker 平台**：codex CLI 子进程（`sandbox_mode=danger-full-access`），由本地 `team_mode_service.exe` 管理；lead 死后 service 的 lead-watchdog 会回收 worker
+- **worker 能跑**（前提：`team_mode_service.exe` 启动前已 source vcvarsall.bat —— 见 C2）：
+  - 全部 cargo 命令（check / clippy / fmt / test / build）
+  - python scripts/run_ci.py
+  - SSH 到任意服务器（实测 codex --yolo 通）
+  - HTTPS / curl 任意公网 API
+  - 写 cwd 内任意文件 + 跨 cwd 写 /tmp 等
+- **lead 替跑**（worker 不擅长的）：
+  - 部署类：vercel deploy / k8s apply / terraform apply / DB migration
+  - 长 dev server（worker 启 dev server 再让 lead 测试 OK；但用户场景倾向 lead 起更稳）
+- **未在 PATH 探测时由用户配置补**：见 §C2
+- **codex worker 默认 reasoning_effort = `high`**：service 在 spawn codex 子进程时若 `worker_add` 没显式传 `effort`，会自动注入 `-c model_reasoning_effort="high"`。该 default 是项目级（针对本仓 Rust + Web + hook 复杂度调高），不是 silent override —— 想降级 worker 算力时显式传 `worker_add(effort="medium")` 或 `"low"` 即可，service 尊重原值不再 override。
+- **MCP transport 默认走 HTTP service**：先启动 `scripts/team-mode-service.ps1 start`（或 release binary 等价命令），`.mcp.json` 指向 `http://127.0.0.1:8786/mcp` 并通过 `scripts/mcp-http-headers.js` 取 token/owner PID；改 `.mcp.json` 或 service binary 后完整重启 Claude Code。
+- Web UI 端口：`http://127.0.0.1:8787`
+- 主 plan：`.plans/<project>/task_plan.md`
+
 ## Task 派发协议（team-mode MCP）
 
 ### 双轨派发
@@ -46,7 +64,7 @@
 team-mode MCP 没有跨 worker 共享 task list（codex/gemini 没 TaskList）。任务通过两条线下发：
 
 1. **文件事实源**：`.plans/agent-teams-v2/<agent>/task_plan.md` —— lead 维护
-2. **触发消息**：`mcp__team-mode__send_message(team="agent-teams-v2", text="@<agent> 你的新任务在 .plans/.../task-X/，请确认。")`
+2. **触发消息**：`mcp__team-mode__send_message(team="agent-teams-v2", text="@<agent> 你的新任务在 .plans/.../task-X/。")`
 
 worker 收到 `@` 通知后读文件，按文件干活。
 
@@ -54,12 +72,14 @@ worker 收到 `@` 通知后读文件，按文件干活。
 
 ### 大任务（特性、新模块）派发前 STOP AND CHECK
 
-每条派单消息至少含 4 项（少任意一项加上再发）：
+每条派单消息至少含 6 项（少任意一项加上再发）：
 
-1. **Scope & 目标**：要做什么 + 验收标准
-2. **文档提醒**："请建 task 子目录 `<prefix>-<task-name>/` 含 task_plan.md + findings.md + progress.md，并在自己根 findings.md 加索引"
-3. **依赖**：依赖哪个 research / 任务，关键文件路径
-4. **Review 期望**：完成后是否需要 review
+1. **Scope**：要做什么，影响哪些用户路径 / API / 文件范围
+2. **Success criteria**：什么算完成，如何验证
+3. **Non-goals**：明确不做什么，防止顺手扩 scope / 重构
+4. **文档提醒**："请建 task 子目录 `<prefix>-<task-name>/` 含 task_plan.md + findings.md + progress.md，并在自己根 findings.md 加索引"
+5. **依赖**：依赖哪个 research / 任务，关键文件路径
+6. **Review 期望**：完成后是否需要 review，review 重点是什么
 
 任务子目录前缀：
 - backend-dev / frontend-dev: `task-<name>/`
@@ -72,13 +92,27 @@ worker 收到 `@` 通知后读文件，按文件干活。
 
 直接消息描述。无需 task 子目录或 review。
 
+### 消息时序（lead 视角）
+
+同一 worker 的消息按 FIFO 串行处理：你发的 N 条消息 worker 按顺序逐条处理。
+
+中途纠正方向：
+- **小调整**：等当前 turn 结束发普通 send_message
+- **大方向变更**：调 `send_message(preempt=true)`，worker 立刻中断当前 turn 处理新消息
+- **取消之前任务**：直接发新消息说"忽略前 N 条 / 改做 X"，AI 按 FIFO 读到这条就重定向（不需要协议层支持）
+
+preempt 限制：
+- 仅 lead 能 preempt（worker 之间不行）
+- worker idle 时 preempt 退化为普通 send_message
+- preempt 不丢消息——即使 turn/interrupt 协议失败，新消息仍正常入 inbox
+
 ## 通讯快查
 
 | 动作 | 命令 |
 |------|------|
 | 派任务给单个 worker | `mcp__team-mode__send_message(team="agent-teams-v2", text="@<name> ...")` |
 | 派多 worker | `text="@<name1> @<name2> ..."` |
-| dev 找 reviewer | dev 在 reply 写 `@reviewer ...`（lead 通过 lead-observability 自动看到） |
+| dev 申请 review | dev reply lead 写变更摘要 + findings 路径，由 lead 决定是否派 reviewer |
 | 看活的 worker | `mcp__team-mode__worker_list(team="agent-teams-v2")` |
 | 复活死 worker | `mcp__team-mode__worker_add(team, name, on_existing="reuse")` |
 | 软删 worker | `mcp__team-mode__worker_remove(team, name)` |
@@ -101,7 +135,8 @@ worker 收到 `@` 通知后读文件，按文件干活。
 
 | 文档 | 位置 | 维护人 |
 |------|------|-------|
-| Navigation Map | .plans/agent-teams-v2/docs/index.md | custodian |
+| Navigation Map / BOOK_INDEX | .plans/agent-teams-v2/docs/index.md | custodian |
+| Decision Log / ADR Index | .plans/agent-teams-v2/decisions.md | team-lead |
 | Architecture | .plans/agent-teams-v2/docs/architecture.md | researcher (P0)、devs |
 | API Contracts | .plans/agent-teams-v2/docs/api-contracts.md | backend-dev（API 改必同步） |
 | Invariants | .plans/agent-teams-v2/docs/invariants.md | team-lead, reviewer |
@@ -146,7 +181,24 @@ team-lead 在 phase 边界 review（不是每个任务）：
 
 > 重复失败模式 append。每条防止再发生。
 
-(初始空)
+- **HTTP service invariants（ADR-020 + ADR-021）** —— 默认控制面是 durable local HTTP service，不是 CC stdio child。**Why**：把 stdio MCP watchdog 的 `process::exit(0)` 搬到 HTTP service 会让 service 在 CC 重启 / Cursor 切项目时因 stale `ownerCcPid` 自杀；同时 axum/tokio handler 直接跑 sync tool dispatch 会触发 `Cannot start a runtime from within a runtime` panic；token 若写进 `.mcp.json` / docs / logs 会泄漏 bearer secret。**How to apply**：(1) `team_mode_service` 的 lead-watchdog 只写 `event=lead_watchdog.observation`，绝不退出；service 退场只走 `team-mode-service.ps1 stop` / 显式 shutdown / OS shutdown。(2) HTTP MCP 的 `handle_payload` 整体放进 `tokio::task::spawn_blocking`，锁移进 blocking closure，避免持锁跨 await。(3) runtime discovery 和 token 只放 `.agent-teams/runtime/http-mcp.json` 与 token file；status/debug 只报告 token_file 路径和 URL，不打印 token 值。
+
+- **Hook delivery invariants（ADR-022）** —— worker reply 自动注入依赖 async hook、per-team pending file、原子 drain 三件事同时成立。**Why**：旧 sync shepherd loop 会阻塞 CC turn，PowerShell ancestor walk 期间可被 CC SIGKILL；单个全局 `lead_pending.jsonl` 迫使 hook 每次 fire 都做慢 routing；read+truncate 在多个 async-wake hook 并发时会双注入。**How to apply**：
+  - `Stop` hook 必须 `asyncRewake: true`，timeout 单位是秒；hook 短命运行，命中后 stderr + exit 2 唤醒 CC。
+  - lead-pending 写入端按 `<base>/<team_id>/lead_pending.jsonl` 分文件；hook 通过 HTTP `/lead-pending/my-teams?pid=<n>&session_id=<sid>` 只 poll 自己 owner 的 team 文件，不在 hook 端 classify。
+  - drain pending file 必须先 `renameSync(path, tmp)` 抢占独占文件，再读 tmp；不能 read+truncate。
+
+- **Owner identity / rebind invariants（ADR-013 + ADR-023）** —— 默认 HTTP 路径下 owner identity 必须来自真实 CC ancestor，并能在 CC 重启后 rebind。**Why**：裸 parent PID 会把 cmd/pwsh/bash wrapper 当 CC，导致 watchdog 误杀、hook 路由失败、pending 被误删、web UI orphan；HTTP service durable 后，已有 `team.json::ownerCcPid` 可能还指旧 CC，Stop hook `/lead-pending/my-teams` 会匹配不到当前会话。**How to apply**：Rust 使用 `crate::util::current_cc_pid()` / `resolve_cc_pid_from()`，Node helper 走同等 ancestor walk 并跳过 `SHELL_WRAPPER_NAMES`；不要写裸 `process.parent()` / `process.ppid` 当 owner。`team_create(name)` 对 id/name 匹配且 active 的既有 team 必须刷新 `ownerCcPid` 为请求方解析出的 PID；同 owner 重连不抖动，不把同名 active team 当 orphan 删除重建。
+
+- **launcher.cmd 必须 CRLF line endings（Windows）** —— `Write` 工具默认 LF，cmd.exe 解析 LF 行尾会把后续命令开头几字符黏到上一行末。**Why**：第一次落地 launcher 时实测出现 `'ere' is not recognized`。**How to apply**：写或改 `.cmd` 文件后立刻转 CRLF。详情：`.plans/agent-teams-v2/docs/05-design-history/refactor/2026-04/refactor-status-2026-04-29.md` §3.1 + D13。
+
+- **Process liveness fallback caveats（ADR-017 + ADR-018, legacy / fallback path）** —— 默认 HTTP service 不再走 stdio MCP relay，但源码里的 stdio MCP sweep/watchdog 仍是紧急回滚与 fallback 的 active 防线。**Why**：Windows stdin EOF 不可靠，旧 `team_mode_mcp.exe` 可 hang 在 `read_json_rpc_message()`；只用 `sys.process(pid).is_some()` 会被 PID 复用骗；不区分 lead MCP 与 worker MCP relay 会误杀活 worker relay。**How to apply**：保留启动 sweep + parent liveness watchdog；判活用 ancestor 链上的 trusted stem 和 `cc_pid_alive` 的进程名验证；`TRUSTED_OWNER_STEMS = {node, claude, team_mode_daemon, codex}` 与 daemon/codex 二进制名同步；lead MCP（无 `TEAM_MODE_TEAM`）跑 sweep/watchdog，worker MCP relay（有 `TEAM_MODE_TEAM`）跳过。
+
+## Archived Pitfalls
+
+> 已被新 ADR / 当前路径取代，但保留供排查历史文档漂移。
+
+- **worker 网络命令受限是过时假设（D16 已废止）** —— 旧文档说 codex daemon 模式下 worker 跑 SSH/curl/DNS 会因 PowerShell SSPI/AppContainer 失败。**Why archived**：2026-04-29 复测含 cmd 包装路径与裸 PowerShell 路径，DNS / curl / SSH 8/8 全通；当前 Runtime 约定已明确 worker 可跑 SSH / HTTPS / 公网 API。**How to apply**：不要因旧 D16 强制 lead 替跑网络任务；若未来 codex 升级或环境变化导致网络失败，再按 `.plans/agent-teams-v2/docs/05-design-history/refactor/2026-04/refactor-status-2026-04-29.md` §3.5 复测。
 
 ## Style Decisions
 
@@ -164,7 +216,7 @@ team-lead 在 phase 边界 review（不是每个任务）：
 | 需求对齐 | 团队建好、dev 开始前 | researcher 探代码库（T1），team-lead 与用户对齐 |
 | Plan stress-test | 架构最终化前 | 派 researcher："stress-test 这个 plan，走每个决策分支" |
 | 3-Strike escalation | worker 报 3 次失败 | 读其 progress.md，给新方向或重派 |
-| Code review | 大特性/模块完成 | dev 在 findings.md 写变更摘要，reply 里 @reviewer |
+| Code review | 大特性/模块完成 | dev 在 findings.md 写变更摘要，reply lead；lead 决定是否派 reviewer |
 | Phase 推进 | phase 完成 | 等 reviewer [OK]/[WARN] 才推 |
 | Context overflow | worker 报 context 长 | 进度已存盘，恢复或 spawn 继任 |
 | CI gate | 任何代码改动 | 跑 `python scripts/run_ci.py`，全 PASS 才送审 |
@@ -197,3 +249,13 @@ team-lead 在 phase 边界 review（不是每个任务）：
     <prefix>-<task>/
       task_plan.md / findings.md / progress.md
 ```
+
+## 协作纪律补丁（2026-04-28 retrospective 落地）
+
+> 来源：`.plans/agent-teams-v2/docs/06-team-workflow/team-collaboration-retrospective-2026-04-28.md`。细则已下沉到 onboarding 核心 10 条；这里仅保留 lead 侧项目约定。
+
+- **中心化派单是默认流程**：dev 完成大特性后 reply lead，由 lead 决定是否派 reviewer；peer 间提问、回答、传 hand-off 路径、紧急 escalation 允许，协议层不硬禁。
+- **无纯确认**：worker 不应发空 ack；小任务直接干，大任务 / scope 不清先做 discovery confirmation（读 task_plan + 相关代码后列现状、slice、不确定点，等 GO）。
+- **Hand-off 分级**：小任务 3-5 行；中任务 ≤10 行；大任务写 findings.md 完整摘要，reply lead 只放摘要、关键路径、验证、限制和 findings 路径。
+- **fix-test 先查根因**：实现 drift 改 src，test 陈旧改期望并写 INVARIANT-AUDIT，fixture 缺数据补 fixture。
+- **方向覆盖**：优先用 `send_message(preempt=true)` 做协议级中断；`[OVERRIDE] 此消息覆盖之前指令 X` 是文本 fallback。
