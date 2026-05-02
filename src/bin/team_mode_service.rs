@@ -54,6 +54,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
+    /// Install global Team Mode config into user scope.
+    InstallGlobal,
+    /// Remove global Team Mode config from user scope.
+    UninstallGlobal,
     /// Scaffold Team Mode config into a project directory.
     Init {
         /// Target project directory. Defaults to the current directory.
@@ -99,6 +103,14 @@ struct RuntimeInfo {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
+        Some(ServiceCommand::InstallGlobal) => {
+            install_global()?;
+            return Ok(());
+        }
+        Some(ServiceCommand::UninstallGlobal) => {
+            uninstall_global()?;
+            return Ok(());
+        }
         Some(ServiceCommand::Init { target_project_dir }) => {
             let target = target_project_dir.unwrap_or(env::current_dir()?);
             init_project(&target)?;
@@ -218,6 +230,75 @@ fn service_args_from_cli(cli: Cli) -> Result<ServiceArgs, Box<dyn std::error::Er
     })
 }
 
+fn global_home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    dirs::home_dir().ok_or_else(|| {
+        std::io::Error::other("could not resolve home directory for global Team Mode install")
+            .into()
+    })
+}
+
+fn global_claude_json_path(home: &Path) -> PathBuf {
+    home.join(".claude.json")
+}
+
+fn global_claude_settings_path(home: &Path) -> PathBuf {
+    home.join(".claude").join("settings.json")
+}
+
+fn install_global() -> Result<(), Box<dyn std::error::Error>> {
+    let home = global_home_dir()?;
+    install_global_at(&home)?;
+    println!("Team Mode global config installed at {}", home.display());
+    println!("Next steps:");
+    println!("  team_mode_service");
+    println!("  claude");
+    Ok(())
+}
+
+fn uninstall_global() -> Result<(), Box<dyn std::error::Error>> {
+    let home = global_home_dir()?;
+    uninstall_global_at(&home)?;
+    println!("Team Mode global config removed from {}", home.display());
+    Ok(())
+}
+
+fn install_global_at(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mcp_path = global_claude_json_path(home);
+    let settings_path = global_claude_settings_path(home);
+    let mcp_json = merged_global_mcp_json(&mcp_path)?;
+    let settings_json = merged_global_claude_settings_json(&settings_path)?;
+    write_json_pretty(&mcp_path, &mcp_json)?;
+    write_json_pretty(&settings_path, &settings_json)?;
+    Ok(())
+}
+
+fn uninstall_global_at(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mcp_path = global_claude_json_path(home);
+    if mcp_path.exists() {
+        let mut mcp_json = read_json_file(&mcp_path)?;
+        remove_global_mcp_server(&mut mcp_json, &mcp_path)?;
+        if global_mcp_json_is_empty_shell(&mcp_json, &mcp_path)? {
+            fs::remove_file(&mcp_path)?;
+        } else {
+            write_json_pretty(&mcp_path, &mcp_json)?;
+        }
+    }
+
+    let settings_path = global_claude_settings_path(home);
+    if settings_path.exists() {
+        let mut settings_json = read_json_file(&settings_path)?;
+        remove_global_hooks(&mut settings_json, &settings_path)?;
+        if global_settings_json_is_empty_shell(&settings_json, &settings_path)? {
+            fs::remove_file(&settings_path)?;
+        } else {
+            write_json_pretty(&settings_path, &settings_json)?;
+        }
+    }
+
+    remove_empty_directory(&home.join(".claude"))?;
+    Ok(())
+}
+
 fn runtime_dir_for_service(args: &ServiceArgs) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if args.data_dir_explicit {
         return Ok(args.data_dir.join("runtime"));
@@ -316,6 +397,89 @@ fn init_project(target: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("  team_mode_service --project-root . --data-dir .agent-teams &");
     println!("  claude");
     Ok(())
+}
+
+fn merged_global_mcp_json(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut value = if path.exists() {
+        read_json_file(path)?
+    } else {
+        json!({
+            "mcpServers": {}
+        })
+    };
+
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?;
+    let servers = ensure_object_field(root, "mcpServers", path)?;
+    if servers.contains_key("team-mode") {
+        return Err(format!(
+            "{} already contains mcpServers.team-mode; merge manually",
+            path.display()
+        )
+        .into());
+    }
+    servers.insert("team-mode".into(), global_team_mode_mcp_server_json());
+    Ok(value)
+}
+
+fn merged_global_claude_settings_json(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut value = if path.exists() {
+        read_json_file(path)?
+    } else {
+        json!({})
+    };
+
+    if settings_has_global_team_mode_hook(&value) {
+        return Err(format!(
+            "{} already contains Team Mode install-global hooks; merge manually",
+            path.display()
+        )
+        .into());
+    }
+
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?;
+    let hooks = ensure_object_field(root, "hooks", path)?;
+    append_hook_entry(hooks, "Stop", global_stop_hook_entry(), path)?;
+    append_hook_entry(
+        hooks,
+        "PostToolUse",
+        global_post_tool_use_hook_entry(),
+        path,
+    )?;
+    Ok(value)
+}
+
+fn global_mcp_json_is_empty_shell(
+    value: &Value,
+    path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?;
+    Ok(root.is_empty()
+        || (root.len() == 1
+            && root
+                .get("mcpServers")
+                .and_then(Value::as_object)
+                .is_some_and(|servers| servers.is_empty())))
+}
+
+fn global_settings_json_is_empty_shell(
+    value: &Value,
+    path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?;
+    Ok(root.is_empty()
+        || (root.len() == 1
+            && root
+                .get("hooks")
+                .and_then(Value::as_object)
+                .is_some_and(|hooks| hooks.is_empty())))
 }
 
 fn embedded_script_targets(target: &Path) -> Vec<(PathBuf, &'static str)> {
@@ -426,6 +590,73 @@ fn settings_has_lead_pending_hook(value: &Value) -> bool {
         || json_contains_command(value, "lead-pending-mid-turn.js")
 }
 
+fn settings_has_global_team_mode_hook(value: &Value) -> bool {
+    json_contains_command(value, "team_mode_service hook async-wake")
+        || json_contains_command(value, "team_mode_service hook mid-turn")
+}
+
+fn remove_global_mcp_server(
+    value: &mut Value,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?;
+    if let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        servers.remove("team-mode");
+    }
+    Ok(())
+}
+
+fn remove_global_hooks(value: &mut Value, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?;
+    let Some(hooks_value) = root.get_mut("hooks") else {
+        return Ok(());
+    };
+    let hooks = hooks_value
+        .as_object_mut()
+        .ok_or_else(|| format!("{}.hooks must be a JSON object", path.display()))?;
+    remove_hook_entry_command(hooks, "Stop", "team_mode_service hook async-wake", path)?;
+    remove_hook_entry_command(
+        hooks,
+        "PostToolUse",
+        "team_mode_service hook mid-turn",
+        path,
+    )?;
+    Ok(())
+}
+
+fn remove_hook_entry_command(
+    hooks: &mut Map<String, Value>,
+    event: &str,
+    command: &str,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(entries_value) = hooks.get_mut(event) else {
+        return Ok(());
+    };
+    let entries = entries_value
+        .as_array_mut()
+        .ok_or_else(|| format!("{}.hooks.{event} must be a JSON array", path.display()))?;
+    entries.retain(|entry| !json_contains_command(entry, command));
+    if entries.is_empty() {
+        hooks.remove(event);
+    }
+    Ok(())
+}
+
+fn remove_empty_directory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+    if fs::read_dir(path)?.next().is_none() {
+        fs::remove_dir(path)?;
+    }
+    Ok(())
+}
+
 fn json_contains_command(value: &Value, needle: &str) -> bool {
     match value {
         Value::String(s) => s.contains(needle),
@@ -444,6 +675,14 @@ fn team_mode_mcp_server_json() -> Value {
         "type": "http",
         "url": format!("http://{DEFAULT_HOST}:{DEFAULT_PORT}/mcp"),
         "headersHelper": format!("node {MCP_HEADERS_HELPER}")
+    })
+}
+
+fn global_team_mode_mcp_server_json() -> Value {
+    json!({
+        "command": "team_mode_service",
+        "args": ["relay"],
+        "env": {}
     })
 }
 
@@ -466,6 +705,30 @@ fn post_tool_use_hook_entry() -> Value {
             {
                 "type": "command",
                 "command": format!("node {POST_TOOL_USE_HOOK_SCRIPT}")
+            }
+        ]
+    })
+}
+
+fn global_stop_hook_entry() -> Value {
+    json!({
+        "hooks": [
+            {
+                "type": "command",
+                "command": "team_mode_service hook async-wake",
+                "asyncRewake": true,
+                "timeout": 7200
+            }
+        ]
+    })
+}
+
+fn global_post_tool_use_hook_entry() -> Value {
+    json!({
+        "hooks": [
+            {
+                "type": "command",
+                "command": "team_mode_service hook mid-turn"
             }
         ]
     })
@@ -685,6 +948,133 @@ mod tests {
 
         assert!(err.contains(".claude/settings.json"), "got: {err}");
         assert!(err.contains("Team Mode lead-pending hooks"), "got: {err}");
+        assert!(err.contains("merge manually"), "got: {err}");
+    }
+
+    #[test]
+    fn install_global_empty_home_writes_expected_config() {
+        let home = tempdir().unwrap();
+
+        install_global_at(home.path()).unwrap();
+
+        let mcp = read_json_file(&home.path().join(".claude.json")).unwrap();
+        assert_eq!(
+            mcp["mcpServers"]["team-mode"]["command"],
+            "team_mode_service"
+        );
+        assert_eq!(mcp["mcpServers"]["team-mode"]["args"], json!(["relay"]));
+
+        let settings = read_json_file(&home.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "team_mode_service hook async-wake"
+        );
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "team_mode_service hook mid-turn"
+        );
+    }
+
+    #[test]
+    fn install_global_merges_existing_user_config_and_uninstall_restores_it() {
+        let home = tempdir().unwrap();
+        let mcp_path = home.path().join(".claude.json");
+        let settings_path = home.path().join(".claude/settings.json");
+        fs::write(
+            &mcp_path,
+            r#"{"mcpServers":{"other":{"command":"x"}},"extra":"keep-me"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo existing"}]}]},"extra":"keep-me"}"#,
+        )
+        .unwrap();
+        let original_mcp = read_json_file(&mcp_path).unwrap();
+        let original_settings = read_json_file(&settings_path).unwrap();
+
+        install_global_at(home.path()).unwrap();
+        let installed_mcp = read_json_file(&mcp_path).unwrap();
+        assert_eq!(installed_mcp["mcpServers"]["other"]["command"], "x");
+        assert_eq!(installed_mcp["extra"], json!("keep-me"));
+        assert_eq!(
+            installed_mcp["mcpServers"]["team-mode"]["command"],
+            "team_mode_service"
+        );
+        assert_eq!(
+            installed_mcp["mcpServers"]["team-mode"]["args"],
+            json!(["relay"])
+        );
+        let installed_settings = read_json_file(&settings_path).unwrap();
+        assert!(json_contains_command(&installed_settings, "echo existing"));
+        assert!(json_contains_command(
+            &installed_settings,
+            "team_mode_service hook async-wake"
+        ));
+        assert!(json_contains_command(
+            &installed_settings,
+            "team_mode_service hook mid-turn"
+        ));
+        assert_eq!(installed_settings["extra"], json!("keep-me"));
+
+        uninstall_global_at(home.path()).unwrap();
+        let restored_mcp = read_json_file(&mcp_path).unwrap();
+        let restored_settings = read_json_file(&settings_path).unwrap();
+        assert_eq!(restored_mcp, original_mcp);
+        assert_eq!(restored_settings, original_settings);
+    }
+
+    #[test]
+    fn install_global_clean_home_round_trip_leaves_no_shells() {
+        let home = tempdir().unwrap();
+
+        install_global_at(home.path()).unwrap();
+        uninstall_global_at(home.path()).unwrap();
+
+        assert!(!home.path().join(".claude.json").exists());
+        assert!(!home.path().join(".claude/settings.json").exists());
+        assert!(!home.path().join(".claude").exists());
+    }
+
+    #[test]
+    fn install_global_errors_when_user_mcp_already_has_team_mode_server() {
+        let home = tempdir().unwrap();
+        let mcp_path = home.path().join(".claude.json");
+        fs::write(
+            &mcp_path,
+            r#"{"mcpServers":{"team-mode":{"command":"team_mode_service","args":["relay"]}}}"#,
+        )
+        .unwrap();
+        let settings_path = home.path().join(".claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(&settings_path, "{}").unwrap();
+
+        let err = install_global_at(home.path()).unwrap_err().to_string();
+
+        assert!(err.contains(".claude.json"), "got: {err}");
+        assert!(err.contains("mcpServers.team-mode"), "got: {err}");
+        assert!(err.contains("merge manually"), "got: {err}");
+    }
+
+    #[test]
+    fn install_global_errors_when_user_settings_already_have_team_mode_hook() {
+        let home = tempdir().unwrap();
+        let mcp_path = home.path().join(".claude.json");
+        fs::write(&mcp_path, r#"{"mcpServers":{}}"#).unwrap();
+        let settings_path = home.path().join(".claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"team_mode_service hook async-wake"}]}]}}"#,
+        )
+        .unwrap();
+
+        let err = install_global_at(home.path()).unwrap_err().to_string();
+        let err = err.replace('\\', "/");
+
+        assert!(err.contains(".claude/settings.json"), "got: {err}");
+        assert!(err.contains("Team Mode install-global hooks"), "got: {err}");
         assert!(err.contains("merge manually"), "got: {err}");
     }
 }
