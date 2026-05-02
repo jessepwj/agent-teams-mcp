@@ -48,6 +48,89 @@ Inside the Claude Code session, run `/mcp` — you should see `team-mode` connec
 
 ---
 
+## Use in any project (AI-assisted install prompt)
+
+Copy the prompt below into Claude Code **in any project directory** — CC will install
+agent-teams-mcp into that project for you. No manual steps required.
+
+<details>
+<summary>📋 Click to expand the install prompt</summary>
+
+```text
+You are an AI assistant that can run shell commands. Help me install
+agent-teams-mcp so I can use team-mode MCP in my current project.
+
+GOAL: from my current working directory, set up team-mode so Claude Code
+can dispatch codex / claude-code workers and receive their replies as
+auto-injected <system-reminder>s.
+
+PREREQUISITES (verify first; stop if missing):
+- Rust 1.85+ (`cargo --version`)
+- Node.js 14+ (`node --version`)
+
+STEPS (run sequentially, stop on any failure — DO NOT silently work around):
+
+1. Clone & install agent-teams-mcp to PATH (one-time per machine):
+     cd /tmp
+     git clone https://github.com/jessepwj/agent-teams-mcp
+     cd agent-teams-mcp
+     cargo install --path .
+   Verify: `team_mode_service --help` works and shows `init` subcommand.
+
+2. Return to MY project root (the place I want team-mode in):
+     cd <my project absolute path — ask me if unclear>
+
+3. Scaffold project-local config:
+     team_mode_service init
+   This embeds helper + hooks into <my project>/.agent-teams/scripts/ and
+   merges minimal entries into .mcp.json + .claude/settings.json. If it
+   reports a CONFLICT (existing team-mode server or lead-pending hook),
+   STOP and tell me — I will merge by hand. DO NOT auto-overwrite.
+
+4. Start the service in the background (keep it running):
+     team_mode_service --project-root . --data-dir .agent-teams &
+   On Windows, prefer `scripts/team-mode-service.ps1 start` if `init`
+   generated it.
+
+5. STOP and tell me: "Please fully restart Claude Code now (close ALL CC
+   windows, then relaunch from this directory)". Wait for me to confirm
+   before continuing — `/mcp reconnect` is NOT enough; hooks only load
+   at CC startup.
+
+   ===== AFTER I RESTART CC =====
+
+6. Verify connection: tell me to run `/mcp`. Expect `team-mode connected`.
+
+7. Bind owner + create team (every CC restart needs this once — it's how
+   the lead claims the team for hook routing):
+     team_create({"name": "<a-team-name>"})
+
+8. Smoke test:
+     worker_add({"team": "<a-team-name>", "name": "alice", "adapter": "codex"})
+     send_message({"team": "<a-team-name>", "text": "@alice say hi + timestamp"})
+
+9. Wait. Within ~10s alice's reply should auto-inject as a <system-reminder>.
+   If after 60s nothing arrives, run diagnostics (do NOT auto-fix):
+     - `tail -10 .async-wake-probe.log` (recent hook fires)
+     - Check `.agent-teams/<team-name>/team.json::ownerCcPid` matches the
+       current CC PID (find CC PID via the parent of your shell).
+     - Report findings to me.
+
+10. If I asked, clean up the test team:
+      team_delete({"name": "<a-team-name>"})
+
+KNOWN TRAPS (do not skip these reminders):
+- Step 5: full CC restart is mandatory; `/mcp reconnect` will NOT load hooks.
+- Step 7: `team_create` on each CC start is required — it rebinds owner PID.
+- Don't commit `.agent-teams/` to git (init adds it to .gitignore — verify).
+
+When done, tell me: "team-mode is ready. You can dispatch workers now."
+```
+
+</details>
+
+---
+
 ## Why this exists
 
 Claude Code exposes MCP tool calls but, by design, does not auto-react to MCP `resources/updated` notifications. So a naive MCP server that puts worker replies in a "resource" gets no push back to the lead's terminal. The official [`Channels` API](https://code.claude.com/docs/en/channels) would solve this but requires claude.ai OAuth login; many people run Claude Code with an API key.
@@ -252,6 +335,18 @@ powershell -ExecutionPolicy Bypass -File scripts\team-mode-service.ps1 start
 ```
 
 The stdio `team_mode_mcp` + `team_mode_daemon` install path is a legacy rollback / fallback path only; do not use it for the default install.
+
+### Use in any project on this machine
+
+```powershell
+cargo install --path .
+cd ~/my-other-project
+team_mode_service init
+team_mode_service --project-root . --data-dir .agent-teams &
+claude
+```
+
+`init` writes the project-local `.mcp.json`, `.claude/settings.json`, and embedded helper/hook scripts under `.agent-teams/scripts/`. If an existing `team-mode` MCP server or lead-pending hook is already present, it stops and asks you to merge manually.
 
 ### Worker cargo commands on Windows MSVC
 

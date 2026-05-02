@@ -48,6 +48,86 @@ claude   # 从仓库根目录启动 Claude Code
 
 ---
 
+## 在任何项目里使用（AI 辅助安装提示词）
+
+把下面这段提示词复制进 Claude Code（在 **任意项目目录**），CC 会自动帮你把
+agent-teams-mcp 装到那个项目里。不需要手动跑命令。
+
+<details>
+<summary>📋 点击展开安装提示词</summary>
+
+```text
+你是一个能跑 shell 命令的 AI 助手。请帮我把 agent-teams-mcp 装到我当前的
+项目里使用。
+
+【目标】在我当前的工作目录下让 Claude Code 能用 team-mode MCP 派发
+codex / claude-code worker，并以自动注入 <system-reminder> 的形式收到
+worker 回复。
+
+【环境要求】（先检查，缺则停止）
+- Rust 1.85+ (`cargo --version`)
+- Node.js 14+ (`node --version`)
+
+【步骤】（逐步执行，任一步失败立即停下，不要"自己想办法绕开"）
+
+1. clone & install agent-teams-mcp 到 PATH（每台机一次性）：
+     cd /tmp
+     git clone https://github.com/jessepwj/agent-teams-mcp
+     cd agent-teams-mcp
+     cargo install --path .
+   验证：`team_mode_service --help` 能跑且显示 `init` 子命令。
+
+2. 回到我的项目根目录：
+     cd <我的项目绝对路径——不清楚就问我>
+
+3. 落项目本地配置：
+     team_mode_service init
+   这会把 helper + hooks 嵌入到 <项目>/.agent-teams/scripts/ ，并最小合并
+   .mcp.json + .claude/settings.json。如果报"已有 team-mode server 或
+   lead-pending hook 冲突"，停下告诉我手动 merge，**不要**自动覆盖。
+
+4. 后台启动 service（保持运行）：
+     team_mode_service --project-root . --data-dir .agent-teams &
+   Windows 优先用 `scripts/team-mode-service.ps1 start`（如果 init
+   生成了它）。
+
+5. 停下，告诉我："请完整重启 Claude Code（关掉所有 CC 窗口再从此目录
+   启动）"。等我确认回来才继续——`/mcp reconnect` **不行**，hook
+   只在 CC 启动时加载。
+
+   ===== 【用户重启 CC 之后】 =====
+
+6. 让我跑 `/mcp` 确认看到 `team-mode connected`。
+
+7. Bind owner + 建团队（每次 CC 重启都要跑一次，这是 lead 认领 team
+   给 hook 路由）：
+     team_create({"name": "<某团队名>"})
+
+8. Smoke 测试：
+     worker_add({"team": "<某团队名>", "name": "alice", "adapter": "codex"})
+     send_message({"team": "<某团队名>", "text": "@alice 报一句你好 + 当前时间戳"})
+
+9. 等 ~10 秒，alice 的回复应自动以 <system-reminder> 注入到我下一个
+   turn。如果 60 秒还没自动回，跑诊断（**不要**自己尝试"修复"）：
+     - `tail -10 .async-wake-probe.log` 看 hook fire 历史
+     - 看 `.agent-teams/<团队名>/team.json::ownerCcPid` 是不是当前 CC PID
+     - 把发现告诉我
+
+10. 我要清理就：
+      team_delete({"name": "<某团队名>"})
+
+【已知陷阱】（不要跳过这些提醒）
+- 步骤 5：完整重启 CC 是**必须**的，`/mcp reconnect` **不会**重载 hook
+- 步骤 7：`team_create` 每次 CC 重启都要跑一次，会触发 owner PID rebind
+- **不要** commit `.agent-teams/` 进 git（init 会加 .gitignore，请确认）
+
+完成后告诉我："team-mode 已就绪，可以用 worker_add / send_message 派任务了"
+```
+
+</details>
+
+---
+
 ## 为何存在
 
 Claude Code 暴露了 MCP 工具调用，但根据设计，它不会自动响应 MCP `resources/updated` 通知。因此，一个把 worker 回复放入"resource"的朴素 MCP server 无法向 lead 的终端推送任何内容。官方的 [`Channels` API](https://code.claude.com/docs/en/channels) 可以解决这个问题，但需要 claude.ai OAuth 登录；而很多人使用 API key 来运行 Claude Code。

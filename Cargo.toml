@@ -33,7 +33,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # CLI
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive"] }
 
 # Local HTTP service / web dashboard
 axum = { version = "0.8" }
@@ -50,7 +50,7 @@ crossterm = { version = "0.28", optional = true }
 
 [features]
 default = []
-cli = ["clap"]
+cli = []
 dashboard = []
 team-mode-web = []
 checkpoint = ["git2", "sha2"]
