@@ -26,11 +26,25 @@
 const fs = require('fs');
 const path = require('path');
 
-const PROBE_LOG = path.resolve(__dirname, '..', '..', '.mid-turn-probe.log');
-const HTTP_RUNTIME_INFO = path.resolve(__dirname, '..', '..', '.agent-teams', 'runtime', 'http-mcp.json');
+const PROJECT_ROOT = resolveProjectRoot();
+const PROBE_LOG = path.join(PROJECT_ROOT, '.agent-teams', '.mid-turn-probe.log');
+const HTTP_RUNTIME_INFO = path.join(PROJECT_ROOT, '.agent-teams', 'runtime', 'http-mcp.json');
 const PROBE_START_MS = Date.now();
-const REPO_ROOT = path.resolve(__dirname, '..', '..');
-const IDENTITY_CACHE_DIR = path.join(REPO_ROOT, '.agent-teams');
+const IDENTITY_CACHE_DIR = path.join(PROJECT_ROOT, '.agent-teams');
+
+function resolveProjectRoot() {
+    const candidates = [
+        process.cwd(),
+        path.resolve(__dirname, '..', '..'),
+        path.resolve(__dirname, '..', '..', '..'),
+    ];
+    for (const candidate of candidates) {
+        if (fs.existsSync(path.join(candidate, '.agent-teams', 'runtime', 'http-mcp.json'))) {
+            return candidate;
+        }
+    }
+    return process.cwd();
+}
 
 function probe(step, extra) {
     try {
@@ -55,7 +69,7 @@ function readEvent() {
 function readRuntimeInfo() {
     const raw = fs.readFileSync(HTTP_RUNTIME_INFO, 'utf8');
     const info = JSON.parse(raw);
-    const tokenFilePath = path.resolve(path.dirname(HTTP_RUNTIME_INFO), '..', '..', info.token_file || info.tokenFile);
+    const tokenFilePath = path.resolve(PROJECT_ROOT, info.token_file || info.tokenFile);
     const token = fs.readFileSync(tokenFilePath, 'utf8').trim();
     return {
         url: info.url || `http://${info.host || '127.0.0.1'}:${info.port || 8786}`,

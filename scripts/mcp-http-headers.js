@@ -9,12 +9,22 @@ const MAX_DEPTH = 40;
 const PROC_QUERY_TIMEOUT_MS = 5000;
 const SHELL_WRAPPER_NAMES = new Set(['cmd', 'sh', 'bash', 'zsh', 'pwsh', 'powershell', 'conhost']);
 
-function repoRoot() {
-  return path.resolve(__dirname, '..');
+function projectRoot() {
+  const candidates = [
+    process.cwd(),
+    path.resolve(__dirname, '..'),
+    path.resolve(__dirname, '..', '..'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(path.join(candidate, '.agent-teams', 'runtime', 'http-mcp.json'))) {
+      return candidate;
+    }
+  }
+  return process.cwd();
 }
 
 function runtimeInfoPath() {
-  return path.join(repoRoot(), '.agent-teams', 'runtime', 'http-mcp.json');
+  return path.join(projectRoot(), '.agent-teams', 'runtime', 'http-mcp.json');
 }
 
 function snapshotProcessTree() {
@@ -87,8 +97,9 @@ function ownerCcPidFromTree(tree, startPid) {
 }
 
 function main() {
+  const root = projectRoot();
   const info = JSON.parse(fs.readFileSync(runtimeInfoPath(), 'utf8'));
-  const tokenFile = path.resolve(repoRoot(), info.token_file || info.tokenFile);
+  const tokenFile = path.resolve(root, info.token_file || info.tokenFile);
   const token = fs.readFileSync(tokenFile, 'utf8').trim();
   const headers = {
     Authorization: `Bearer ${token}`,
