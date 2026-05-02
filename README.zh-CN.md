@@ -48,21 +48,26 @@ claude   # 从仓库根目录启动 Claude Code
 
 ---
 
-## 在任何项目里使用（AI 辅助安装提示词）
+## 在这台机器上全局使用
 
-把下面这段提示词复制进 Claude Code（在 **任意项目目录**），CC 会自动帮你把
-agent-teams-mcp 装到那个项目里。不需要手动跑命令。
+推荐路径：在机器上只安装一次，之后任何项目都能在完整重启 Claude Code 后直接使用 Team Mode。
+
+```bash
+cargo install --path .
+team_mode_service install-global
+# 之后进入任意项目并启动 claude 即可
+```
 
 <details>
-<summary>📋 点击展开安装提示词</summary>
+<summary>📋 点击展开 AI 辅助安装提示词</summary>
 
 ```text
-你是一个能跑 shell 命令的 AI 助手。请帮我把 agent-teams-mcp 装到我当前的
-项目里使用。
+你是一个能跑 shell 命令的 AI 助手。请帮我把 agent-teams-mcp
+全局安装到这台机器上，让我之后在任何项目里都能用 team-mode MCP。
 
-【目标】在我当前的工作目录下让 Claude Code 能用 team-mode MCP 派发
-codex / claude-code worker，并以自动注入 <system-reminder> 的形式收到
-worker 回复。
+【目标】先安装一次二进制，再写入用户级 Claude 配置，这样我只要
+`cd` 到任意项目并启动 Claude Code，就能收到 worker 回复的自动
+<system-reminder> 注入。
 
 【环境要求】（先检查，缺则停止）
 - Rust 1.85+ (`cargo --version`)
@@ -75,56 +80,56 @@ worker 回复。
      git clone https://github.com/jessepwj/agent-teams-mcp
      cd agent-teams-mcp
      cargo install --path .
-   验证：`team_mode_service --help` 能跑且显示 `init` 子命令。
+   验证：`team_mode_service --help` 能跑且显示 `install-global` 子命令。
 
-2. 回到我的项目根目录：
-     cd <我的项目绝对路径——不清楚就问我>
+2. 写入全局 Claude 配置：
+     team_mode_service install-global
+   这会写入用户级 `.claude.json` 和 `.claude/settings.json`，把它们指向
+   `team_mode_service relay` 和 hook 子命令。若提示已有冲突（已有
+   team-mode server 或 hook），停下告诉我，**不要**自动覆盖。
 
-3. 落项目本地配置：
-     team_mode_service init
-   这会把 helper + hooks 嵌入到 <项目>/.agent-teams/scripts/ ，并最小合并
-   .mcp.json + .claude/settings.json。如果报"已有 team-mode server 或
-   lead-pending hook 冲突"，停下告诉我手动 merge，**不要**自动覆盖。
-
-4. 后台启动 service（保持运行）：
-     team_mode_service --project-root . --data-dir .agent-teams &
-   Windows 优先用 `scripts/team-mode-service.ps1 start`（如果 init
-   生成了它）。
-
-5. 停下，告诉我："请完整重启 Claude Code（关掉所有 CC 窗口再从此目录
-   启动）"。等我确认回来才继续——`/mcp reconnect` **不行**，hook
-   只在 CC 启动时加载。
+3. 停下，告诉我："请完整重启 Claude Code（关掉所有 CC 窗口后，再从任意
+   项目目录重新启动）"。等我确认回来才继续——`/mcp reconnect`
+   **不行**，hook 只在 CC 启动时加载。
 
    ===== 【用户重启 CC 之后】 =====
 
-6. 让我跑 `/mcp` 确认看到 `team-mode connected`。
+4. 让我跑 `/mcp` 确认看到 `team-mode connected`。
 
-7. Bind owner + 建团队（每次 CC 重启都要跑一次，这是 lead 认领 team
-   给 hook 路由）：
+5. 之后我可以直接进入任何项目并启动 Claude Code，不需要额外的项目本地
+   初始化。如果我明确想要项目隔离，再告诉我用该项目里的
+   `team_mode_service init`。
+
+6. Smoke 测试：
      team_create({"name": "<某团队名>"})
-
-8. Smoke 测试：
      worker_add({"team": "<某团队名>", "name": "alice", "adapter": "codex"})
      send_message({"team": "<某团队名>", "text": "@alice 报一句你好 + 当前时间戳"})
 
-9. 等 ~10 秒，alice 的回复应自动以 <system-reminder> 注入到我下一个
+7. 等 ~10 秒，alice 的回复应自动以 <system-reminder> 注入到我下一个
    turn。如果 60 秒还没自动回，跑诊断（**不要**自己尝试"修复"）：
      - `tail -10 .async-wake-probe.log` 看 hook fire 历史
-     - 看 `.agent-teams/<团队名>/team.json::ownerCcPid` 是不是当前 CC PID
+     - 看当前 runtime JSON / team 状态里的 owner PID
      - 把发现告诉我
 
-10. 我要清理就：
+8. 我要清理就：
       team_delete({"name": "<某团队名>"})
 
 【已知陷阱】（不要跳过这些提醒）
-- 步骤 5：完整重启 CC 是**必须**的，`/mcp reconnect` **不会**重载 hook
-- 步骤 7：`team_create` 每次 CC 重启都要跑一次，会触发 owner PID rebind
-- **不要** commit `.agent-teams/` 进 git（init 会加 .gitignore，请确认）
+- 步骤 3：完整重启 CC 是**必须**的，`/mcp reconnect` **不会**重载 hook
+- 步骤 6：`team_create` 每次 CC 重启都要跑一次，会触发 hook 路由认领
+- **不要** commit `.agent-teams/` 进 git
 
-完成后告诉我："team-mode 已就绪，可以用 worker_add / send_message 派任务了"
+完成后告诉我："team-mode 已在这台机器上就绪，可以用 worker_add / send_message 派任务了"
 ```
 
 </details>
+
+### 从旧的 init 迁移
+
+如果你之前已经在某个项目里跑过 `team_mode_service init`，那就继续保留现有的
+`.agent-teams/` 目录不动。旧的项目本地 runtime 仍然可用。要把这台机器升级到
+v3 全局路径，就先停掉旧 service，再运行 `team_mode_service install-global`，
+然后完整重启 Claude Code。新用户直接走 `install-global` 即可。
 
 ---
 
@@ -328,6 +333,12 @@ powershell -ExecutionPolicy Bypass -File scripts\team-mode-service.ps1 start
 ```
 
 stdio `team_mode_mcp` + `team_mode_daemon` 安装路径仅是 legacy rollback / fallback 路径，不应作为默认安装方式。
+
+### 在任何项目里使用（alternative: project-local install (advanced)）
+
+只在你想要项目隔离时使用这一条。`init` 会把项目本地 `.mcp.json`、`.claude/settings.json`
+以及嵌入的 helper/hook 脚本写到 `.agent-teams/scripts/`。如果已有 `team-mode`
+MCP server 或 lead-pending hook，它会停下并要求你手动 merge。
 
 ### Worker cargo 命令在 Windows MSVC 上的前置
 

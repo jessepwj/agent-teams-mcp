@@ -194,6 +194,8 @@ team-lead 在 phase 边界 review（不是每个任务）：
 
 - **Process liveness fallback caveats（ADR-017 + ADR-018, legacy / fallback path）** —— 默认 HTTP service 不再走 stdio MCP relay，但源码里的 stdio MCP sweep/watchdog 仍是紧急回滚与 fallback 的 active 防线。**Why**：Windows stdin EOF 不可靠，旧 `team_mode_mcp.exe` 可 hang 在 `read_json_rpc_message()`；只用 `sys.process(pid).is_some()` 会被 PID 复用骗；不区分 lead MCP 与 worker MCP relay 会误杀活 worker relay。**How to apply**：保留启动 sweep + parent liveness watchdog；判活用 ancestor 链上的 trusted stem 和 `cc_pid_alive` 的进程名验证；`TRUSTED_OWNER_STEMS = {node, claude, team_mode_daemon, codex}` 与 daemon/codex 二进制名同步；lead MCP（无 `TEAM_MODE_TEAM`）跑 sweep/watchdog，worker MCP relay（有 `TEAM_MODE_TEAM`）跳过。
 
+- **v3 install-global / uninstall-global 必须走 subcommand** —— 不要手动编辑 `~/.claude.json` 或 `~/.claude/settings.json` 来补 Team Mode 入口。**Why**：手改会绕过 fail-closed merge、空壳清理和冲突检测，容易把已有用户配置或迁移状态改坏。**How to apply**：机器级安装 / 卸载统一用 `team_mode_service install-global` 和 `team_mode_service uninstall-global`，需要项目隔离时才用 `init`。
+
 ## Archived Pitfalls
 
 > 已被新 ADR / 当前路径取代，但保留供排查历史文档漂移。
