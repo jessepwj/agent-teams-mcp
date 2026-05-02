@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_teams::util::file_lock::FileLock;
 use serde::{Deserialize, Serialize};
@@ -12,7 +14,8 @@ use serde_json::{Map, Value, json};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8786;
-const RELAY_PROBE_ID: u64 = 1;
+const RELAY_SPAWN_TIMEOUT_SECS: u64 = 30;
+const RELAY_SPAWN_POLL_MS: u64 = 250;
 const POLL_INTERVAL_MS: u64 = 500;
 const BATCH_GRACE_MS: u64 = 2000;
 const LONG_IDLE_SLEEP_SECS: u64 = 60;
@@ -21,6 +24,7 @@ const SHELL_WRAPPER_NAMES: &[&str] = &["cmd", "sh", "bash", "zsh", "pwsh", "powe
 
 #[derive(Debug, Deserialize)]
 struct RuntimeInfo {
+    pid: u32,
     #[serde(default)]
     host: Option<String>,
     #[serde(default)]
@@ -59,20 +63,52 @@ struct IdentityCache {
     teams: Vec<TeamEntry>,
 }
 
+#[derive(Debug)]
+struct ResolvedRuntime {
+    info: RuntimeInfo,
+}
+
+#[derive(Debug)]
+enum HealthProbeError {
+    Transient(String),
+    IdentityMismatch(String),
+}
+
+impl fmt::Display for HealthProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HealthProbeError::Transient(message) | HealthProbeError::IdentityMismatch(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for HealthProbeError {}
+
+#[derive(Debug, Clone)]
+struct RelaySpawnSpec {
+    service_exe: PathBuf,
+    project_root: PathBuf,
+    data_dir_override: Option<PathBuf>,
+    runtime_dir: PathBuf,
+    port: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessRow {
     ppid: u32,
     name: String,
 }
 
-pub(crate) fn relay_stdio() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn relay_stdio(
+    data_dir_override: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let project_root = project_root()?;
-    let runtime = read_runtime_info(&project_root)?;
-    let headers = build_http_headers(&project_root, &runtime)?;
     let client = http_client()?;
+    let runtime = ensure_runtime_for_relay(&project_root, data_dir_override.as_deref(), &client)?;
+    let headers = build_http_headers(&project_root, &runtime)?;
     let service_url = runtime_url(&runtime);
-
-    probe_http_service(&client, &service_url, &headers)?;
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -91,9 +127,22 @@ pub(crate) fn relay_stdio() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-pub(crate) fn headers_stdout() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn headers_stdout(
+    data_dir_override: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let project_root = project_root()?;
-    let runtime = read_runtime_info(&project_root)?;
+    let client = http_client()?;
+    let runtime = match find_healthy_runtime(&client, &project_root, data_dir_override.as_deref())?
+    {
+        Some(runtime) => runtime.info,
+        None => {
+            return Err(format!(
+                "no healthy Team Mode runtime found for project '{}'",
+                project_root.display()
+            )
+            .into());
+        }
+    };
     let headers = build_http_headers(&project_root, &runtime)?;
     let mut out = io::BufWriter::new(io::stdout().lock());
     write!(
@@ -132,16 +181,23 @@ pub(crate) fn run_async_wake_hook() -> ! {
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let runtime = match read_runtime_info(&project_root) {
-        Ok(runtime) => runtime,
+    let client = match http_client() {
+        Ok(client) => client,
         Err(err) => exit_with_hook_error(err),
+    };
+    let runtime = match find_healthy_runtime(&client, &project_root, None) {
+        Ok(Some(runtime)) => runtime.info,
+        Ok(None) => exit_hook_error(
+            1,
+            &format!(
+                "lead-pending-async-wake: no healthy Team Mode runtime found in {} or legacy fallback",
+                project_root.display()
+            ),
+        ),
+        Err(err) => exit_hook_error(1, &format!("lead-pending-async-wake: {err}")),
     };
     let headers = match build_http_headers(&project_root, &runtime) {
         Ok(headers) => headers,
-        Err(err) => exit_with_hook_error(err),
-    };
-    let client = match http_client() {
-        Ok(client) => client,
         Err(err) => exit_with_hook_error(err),
     };
     let service_url = runtime_url(&runtime);
@@ -199,16 +255,23 @@ pub(crate) fn run_mid_turn_hook() -> ! {
         std::process::exit(0);
     };
 
-    let runtime = match read_runtime_info(&project_root) {
-        Ok(runtime) => runtime,
+    let client = match http_client() {
+        Ok(client) => client,
         Err(err) => exit_with_hook_error(err),
+    };
+    let runtime = match find_healthy_runtime(&client, &project_root, None) {
+        Ok(Some(runtime)) => runtime.info,
+        Ok(None) => exit_hook_error(
+            1,
+            &format!(
+                "lead-pending-mid-turn: no healthy Team Mode runtime found in {} or legacy fallback",
+                project_root.display()
+            ),
+        ),
+        Err(err) => exit_hook_error(1, &format!("lead-pending-mid-turn: {err}")),
     };
     let headers = match build_http_headers(&project_root, &runtime) {
         Ok(headers) => headers,
-        Err(err) => exit_with_hook_error(err),
-    };
-    let client = match http_client() {
-        Ok(client) => client,
         Err(err) => exit_with_hook_error(err),
     };
     let service_url = runtime_url(&runtime);
@@ -262,11 +325,40 @@ pub(crate) fn project_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(env::current_dir()?)
 }
 
-fn runtime_info_path(project_root: &Path) -> PathBuf {
+fn legacy_runtime_info_path(project_root: &Path) -> PathBuf {
     project_root
         .join(".agent-teams")
         .join("runtime")
         .join("http-mcp.json")
+}
+
+fn global_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        "could not resolve home directory for global Team Mode runtime".to_string()
+    })?;
+    Ok(home.join(".team-mode").join("runtime"))
+}
+
+fn runtime_info_path_candidates(
+    project_root: &Path,
+    data_dir_override: Option<&Path>,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut candidates = Vec::new();
+    if let Some(data_dir) = data_dir_override.filter(|path| !path.as_os_str().is_empty()) {
+        candidates.push(data_dir.join("runtime").join("http-mcp.json"));
+    }
+    if let Ok(global_runtime_dir) = global_runtime_dir() {
+        candidates.push(global_runtime_dir.join("http-mcp.json"));
+    }
+    candidates.push(legacy_runtime_info_path(project_root));
+    Ok(candidates)
+}
+
+fn service_exe_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = env::var_os("TEAM_MODE_SERVICE_EXE").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(env::current_exe()?)
 }
 
 fn project_has_team_registration(project_root: &Path) -> Result<bool, Box<dyn std::error::Error>> {
@@ -310,9 +402,8 @@ fn settings_has_team_mode_hooks(value: &Value) -> bool {
         || json_contains_string(value, "team_mode_service hook mid-turn")
 }
 
-fn read_runtime_info(project_root: &Path) -> Result<RuntimeInfo, Box<dyn std::error::Error>> {
-    let path = runtime_info_path(project_root);
-    let content = fs::read_to_string(&path)?;
+fn read_runtime_info_from_path(path: &Path) -> Result<RuntimeInfo, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
     let info: RuntimeInfo = serde_json::from_str(&content).map_err(|err| {
         io::Error::other(format!(
             "failed to parse runtime info '{}': {err}",
@@ -320,6 +411,220 @@ fn read_runtime_info(project_root: &Path) -> Result<RuntimeInfo, Box<dyn std::er
         ))
     })?;
     Ok(info)
+}
+
+fn wait_for_runtime_info(path: &Path) -> Result<RuntimeInfo, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(RELAY_SPAWN_TIMEOUT_SECS);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match read_runtime_info_from_path(path) {
+            Ok(info) => return Ok(info),
+            Err(err) => last_error = Some(err.to_string()),
+        }
+        thread::sleep(Duration::from_millis(RELAY_SPAWN_POLL_MS));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "service spawn failed: {}",
+            last_error.unwrap_or_else(|| "runtime info file timed out".into())
+        ),
+    )
+    .into())
+}
+
+fn discover_runtime_candidate(
+    project_root: &Path,
+    data_dir_override: Option<&Path>,
+) -> Result<Option<ResolvedRuntime>, Box<dyn std::error::Error>> {
+    for path in runtime_info_path_candidates(project_root, data_dir_override)? {
+        if !path.exists() {
+            continue;
+        }
+        if let Ok(info) = read_runtime_info_from_path(&path) {
+            return Ok(Some(ResolvedRuntime { info }));
+        }
+    }
+    Ok(None)
+}
+
+fn runtime_base_url(info: &RuntimeInfo) -> String {
+    runtime_url(info)
+        .trim_end_matches("/mcp")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn probe_healthz(
+    client: &reqwest::blocking::Client,
+    info: &RuntimeInfo,
+    expected_runtime_dir: &Path,
+) -> Result<(), HealthProbeError> {
+    let url = format!("{}/healthz", runtime_base_url(info));
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|err| HealthProbeError::Transient(err.to_string()))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|err| HealthProbeError::Transient(err.to_string()))?;
+    if !status.is_success() {
+        return Err(HealthProbeError::Transient(format!(
+            "HTTP {}: {text}",
+            status
+        )));
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|err| HealthProbeError::Transient(err.to_string()))?;
+    if value.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err(HealthProbeError::Transient(
+            "healthz response missing ok status".into(),
+        ));
+    }
+    let actual_runtime_dir = value
+        .get("runtime_dir")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HealthProbeError::IdentityMismatch(
+                "service identity mismatch: healthz response missing runtime_dir".into(),
+            )
+        })?;
+    if Path::new(actual_runtime_dir) != expected_runtime_dir {
+        return Err(HealthProbeError::IdentityMismatch(format!(
+            "service identity mismatch: expected runtime_dir '{}' but healthz reported '{}'",
+            expected_runtime_dir.display(),
+            actual_runtime_dir
+        )));
+    }
+    let actual_lock_holder_pid = value
+        .get("lock_holder_pid")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            HealthProbeError::IdentityMismatch(
+                "service identity mismatch: healthz response missing lock_holder_pid".into(),
+            )
+        })?;
+    if actual_lock_holder_pid != u64::from(info.pid) {
+        return Err(HealthProbeError::IdentityMismatch(format!(
+            "service identity mismatch: expected lock_holder_pid {} but healthz reported {}",
+            info.pid, actual_lock_holder_pid
+        )));
+    }
+    Ok(())
+}
+
+fn wait_for_healthz(
+    client: &reqwest::blocking::Client,
+    info: &RuntimeInfo,
+    expected_runtime_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(RELAY_SPAWN_TIMEOUT_SECS);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match probe_healthz(client, info, expected_runtime_dir) {
+            Ok(()) => return Ok(()),
+            Err(HealthProbeError::Transient(err)) => last_error = Some(err),
+            Err(HealthProbeError::IdentityMismatch(err)) => {
+                return Err(io::Error::other(err).into());
+            }
+        }
+        thread::sleep(Duration::from_millis(RELAY_SPAWN_POLL_MS));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "service spawn failed: {}",
+            last_error.unwrap_or_else(|| "healthz probe timed out".into())
+        ),
+    )
+    .into())
+}
+
+fn find_healthy_runtime(
+    client: &reqwest::blocking::Client,
+    project_root: &Path,
+    data_dir_override: Option<&Path>,
+) -> Result<Option<ResolvedRuntime>, Box<dyn std::error::Error>> {
+    for path in runtime_info_path_candidates(project_root, data_dir_override)? {
+        if !path.exists() {
+            continue;
+        }
+        let Ok(info) = read_runtime_info_from_path(&path) else {
+            continue;
+        };
+        let Some(runtime_dir) = path.parent() else {
+            continue;
+        };
+        match probe_healthz(client, &info, runtime_dir) {
+            Ok(()) => return Ok(Some(ResolvedRuntime { info })),
+            Err(HealthProbeError::Transient(_)) => continue,
+            Err(HealthProbeError::IdentityMismatch(err)) => {
+                return Err(io::Error::other(err).into());
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn runtime_port_hint(candidate: Option<&ResolvedRuntime>, default_port: u16) -> u16 {
+    candidate
+        .and_then(|runtime| runtime.info.port)
+        .unwrap_or(default_port)
+}
+
+fn build_relay_spawn_spec(
+    project_root: &Path,
+    data_dir_override: Option<&Path>,
+    port: u16,
+) -> Result<RelaySpawnSpec, Box<dyn std::error::Error>> {
+    let runtime_dir = if let Some(data_dir) = data_dir_override {
+        data_dir.join("runtime")
+    } else {
+        global_runtime_dir()?
+    };
+    Ok(RelaySpawnSpec {
+        service_exe: service_exe_path()?,
+        project_root: project_root.to_path_buf(),
+        data_dir_override: data_dir_override.map(Path::to_path_buf),
+        runtime_dir,
+        port,
+    })
+}
+
+fn ensure_runtime_for_relay(
+    project_root: &Path,
+    data_dir_override: Option<&Path>,
+    client: &reqwest::blocking::Client,
+) -> Result<RuntimeInfo, Box<dyn std::error::Error>> {
+    ensure_runtime_for_relay_with_spawn(
+        project_root,
+        data_dir_override,
+        client,
+        spawn_service_detached,
+    )
+}
+
+fn ensure_runtime_for_relay_with_spawn<F>(
+    project_root: &Path,
+    data_dir_override: Option<&Path>,
+    client: &reqwest::blocking::Client,
+    spawn_service: F,
+) -> Result<RuntimeInfo, Box<dyn std::error::Error>>
+where
+    F: Fn(&RelaySpawnSpec) -> Result<(), Box<dyn std::error::Error>>,
+{
+    if let Some(runtime) = find_healthy_runtime(client, project_root, data_dir_override)? {
+        return Ok(runtime.info);
+    }
+
+    let discovered = discover_runtime_candidate(project_root, data_dir_override)?;
+    let port = runtime_port_hint(discovered.as_ref(), DEFAULT_PORT);
+    let spawn_spec = build_relay_spawn_spec(project_root, data_dir_override, port)?;
+    spawn_service(&spawn_spec)?;
+    let spawned_runtime = wait_for_runtime_info(&spawn_spec.runtime_dir.join("http-mcp.json"))?;
+    wait_for_healthz(client, &spawned_runtime, &spawn_spec.runtime_dir)?;
+    Ok(spawned_runtime)
 }
 
 fn runtime_url(info: &RuntimeInfo) -> String {
@@ -372,19 +677,64 @@ fn http_client() -> Result<reqwest::blocking::Client, Box<dyn std::error::Error>
         .build()?)
 }
 
-fn probe_http_service(
-    client: &reqwest::blocking::Client,
-    service_url: &str,
-    headers: &HttpHeaders,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let payload = json!({
-        "jsonrpc": "2.0",
-        "id": RELAY_PROBE_ID,
-        "method": "initialize",
-        "params": {},
-    });
-    let _ = forward_json_rpc_message(client, service_url, headers, payload)?;
-    Ok(())
+fn spawn_service_detached(spec: &RelaySpawnSpec) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new(&spec.service_exe);
+    command
+        .arg("--project-root")
+        .arg(&spec.project_root)
+        .arg("--port")
+        .arg(spec.port.to_string())
+        .current_dir(&spec.project_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(data_dir) = &spec.data_dir_override {
+        command.arg("--data-dir").arg(data_dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        command.creation_flags(
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+        );
+    }
+
+    match command.spawn() {
+        Ok(_child) => Ok(()),
+        #[cfg(target_os = "windows")]
+        Err(err) if err.raw_os_error() == Some(5) => {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            tracing::warn!(
+                "relay spawn with CREATE_BREAKAWAY_FROM_JOB denied; retrying without it"
+            );
+            let mut retry = Command::new(&spec.service_exe);
+            retry
+                .arg("--project-root")
+                .arg(&spec.project_root)
+                .arg("--port")
+                .arg(spec.port.to_string())
+                .current_dir(&spec.project_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(data_dir) = &spec.data_dir_override {
+                retry.arg("--data-dir").arg(data_dir);
+            }
+            retry.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            retry.spawn().map(|_child| ()).map_err(|err| {
+                io::Error::other(format!("failed to spawn team_mode_service: {err}")).into()
+            })
+        }
+        Err(err) => {
+            Err(io::Error::other(format!("failed to spawn team_mode_service: {err}")).into())
+        }
+    }
 }
 
 fn forward_json_rpc_message(

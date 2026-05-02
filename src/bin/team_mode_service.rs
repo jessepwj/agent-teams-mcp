@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use agent_teams::team_mode::data_dir;
 use agent_teams::team_mode::mcp::http_transport::{HttpMcpState, router as http_mcp_router};
@@ -78,6 +79,7 @@ enum HookCommand {
 #[derive(Debug)]
 struct ServiceArgs {
     data_dir: PathBuf,
+    data_dir_explicit: bool,
     project_root: PathBuf,
     host: String,
     port: u16,
@@ -103,14 +105,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Some(ServiceCommand::Relay) => {
-            return team_mode_service_shell::relay_stdio();
+            return team_mode_service_shell::relay_stdio(cli.data_dir.clone());
         }
         Some(ServiceCommand::Hook { command }) => match command {
             HookCommand::AsyncWake => team_mode_service_shell::run_async_wake_hook(),
             HookCommand::MidTurn => team_mode_service_shell::run_mid_turn_hook(),
         },
         Some(ServiceCommand::Headers) => {
-            return team_mode_service_shell::headers_stdout();
+            return team_mode_service_shell::headers_stdout(cli.data_dir.clone());
         }
         None => {}
     }
@@ -128,7 +130,7 @@ async fn run_service(args: ServiceArgs) -> Result<(), Box<dyn std::error::Error>
         return Err("team_mode_service only binds 127.0.0.1".into());
     }
     data_dir::ensure_scaffold(&args.data_dir)?;
-    let runtime_dir = args.data_dir.join("runtime");
+    let runtime_dir = runtime_dir_for_service(&args)?;
     std::fs::create_dir_all(&runtime_dir)?;
     let _service_lock = match team_mode_service_shell::try_acquire_service_lock(&runtime_dir)? {
         Some(lock) => lock,
@@ -172,10 +174,14 @@ async fn run_service(args: ServiceArgs) -> Result<(), Box<dyn std::error::Error>
         args.data_dir.clone(),
         Box::new(Arc::clone(&toolset)),
     );
+    let lock_holder_pid = std::process::id();
     let app = Router::new().merge(http_mcp_router(HttpMcpState::new(
         runtime,
         token,
         args.data_dir.clone(),
+        runtime_dir.clone(),
+        lock_holder_pid,
+        Instant::now(),
     )));
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -198,16 +204,28 @@ fn init_tracing() {
 
 fn service_args_from_cli(cli: Cli) -> Result<ServiceArgs, Box<dyn std::error::Error>> {
     let project_root = cli.project_root.unwrap_or(env::current_dir()?);
+    let data_dir_explicit = cli.data_dir.is_some();
     let data_dir = cli
         .data_dir
         .unwrap_or_else(|| data_dir::resolve_default_base_dir(&project_root));
     Ok(ServiceArgs {
         data_dir,
+        data_dir_explicit,
         project_root,
         host: cli.host,
         port: cli.port,
         token_file: cli.token_file,
     })
+}
+
+fn runtime_dir_for_service(args: &ServiceArgs) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if args.data_dir_explicit {
+        return Ok(args.data_dir.join("runtime"));
+    }
+    let home = dirs::home_dir().ok_or_else(|| {
+        "could not resolve home directory for global Team Mode runtime".to_string()
+    })?;
+    Ok(home.join(".team-mode").join("runtime"))
 }
 
 fn read_or_create_token(path: &Path) -> Result<String, Box<dyn std::error::Error>> {

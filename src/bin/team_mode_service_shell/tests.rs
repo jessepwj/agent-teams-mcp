@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
 
 use axum::Router;
 use axum::extract::Json;
@@ -86,6 +87,356 @@ fn identity_cache_round_trip() {
     assert_eq!(loaded.teams.len(), 1);
 }
 
+#[test]
+fn runtime_info_candidates_prioritize_global_then_project_local() {
+    let dir = tempdir().unwrap();
+    let data_dir = tempdir().unwrap();
+    let candidates = runtime_info_path_candidates(dir.path(), Some(data_dir.path())).unwrap();
+    assert_eq!(
+        candidates[0],
+        data_dir.path().join("runtime").join("http-mcp.json")
+    );
+    assert!(candidates[1].ends_with(".team-mode/runtime/http-mcp.json"));
+    assert_eq!(
+        candidates[2],
+        dir.path()
+            .join(".agent-teams")
+            .join("runtime")
+            .join("http-mcp.json")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_lazy_spawn_polls_healthz_and_forwards_rpc() {
+    let project_root = tempdir().unwrap();
+    let data_dir = tempdir().unwrap();
+    let runtime_dir = data_dir.path().join("runtime");
+    let service_pid = std::process::id();
+
+    let port_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    port_listener.set_nonblocking(true).unwrap();
+    let port = port_listener.local_addr().unwrap().port();
+    let legacy_runtime_dir = project_root.path().join(".agent-teams/runtime");
+    fs::create_dir_all(&legacy_runtime_dir).unwrap();
+    fs::write(
+        legacy_runtime_dir.join("http-mcp.json"),
+        serde_json::to_string_pretty(&json!({
+            "pid": service_pid,
+            "host": "127.0.0.1",
+            "port": port,
+            "url": format!("http://127.0.0.1:{port}/mcp"),
+            "token_file": legacy_runtime_dir.join("http-mcp.token"),
+            "started_at": "2026-05-02T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let health_hits = Arc::new(AtomicUsize::new(0));
+    let mcp_hits = Arc::new(AtomicUsize::new(0));
+    let spawn_count = Arc::new(AtomicUsize::new(0));
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    let start_tx = Arc::new(Mutex::new(Some(start_tx)));
+    let health_hits_clone = Arc::clone(&health_hits);
+    let mcp_hits_clone = Arc::clone(&mcp_hits);
+    let spawn_count_clone = Arc::clone(&spawn_count);
+    let health_hits_for_server = Arc::clone(&health_hits_clone);
+    let mcp_hits_for_server = Arc::clone(&mcp_hits_clone);
+    let runtime_dir_for_server = runtime_dir.clone();
+    let server = tokio::spawn(async move {
+        let app = Router::new()
+            .route(
+                "/healthz",
+                get(move || {
+                    let health_hits = Arc::clone(&health_hits_for_server);
+                    async move {
+                        health_hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "status": "ok",
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "uptime_seconds": 1,
+                            "runtime_dir": runtime_dir_for_server.display().to_string(),
+                            "lock_holder_pid": service_pid,
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/mcp",
+                post(move |Json(payload): Json<Value>| {
+                    let mcp_hits = Arc::clone(&mcp_hits_for_server);
+                    async move {
+                        mcp_hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": payload["id"].clone(),
+                            "result": {"ok": true}
+                        }))
+                    }
+                }),
+            );
+        start_rx.await.unwrap();
+        let listener = tokio::net::TcpListener::from_std(port_listener).unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let runtime = tokio::task::spawn_blocking(move || {
+        let client = Box::leak(Box::new(http_client().unwrap()));
+        ensure_runtime_for_relay_with_spawn(
+            project_root.path(),
+            Some(data_dir.path()),
+            client,
+            move |spec| {
+                spawn_count_clone.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(spec.runtime_dir, runtime_dir);
+                assert_eq!(spec.port, port);
+                let runtime_dir = spec.runtime_dir.clone();
+                let start_tx = Arc::clone(&start_tx);
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(200));
+                    fs::create_dir_all(&runtime_dir).unwrap();
+                    fs::write(runtime_dir.join("http-mcp.token"), "relay-test-token").unwrap();
+                    fs::write(
+                        runtime_dir.join("http-mcp.json"),
+                        serde_json::to_string_pretty(&json!({
+                            "pid": service_pid,
+                            "host": "127.0.0.1",
+                            "port": port,
+                            "url": format!("http://127.0.0.1:{port}/mcp"),
+                            "token_file": runtime_dir.join("http-mcp.token"),
+                            "started_at": "2026-05-02T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    start_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                });
+
+                Ok(())
+            },
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+    assert!(health_hits.load(Ordering::SeqCst) > 0);
+    assert_eq!(runtime.pid, service_pid);
+
+    let headers = HttpHeaders {
+        authorization: "Bearer relay-test-token".into(),
+        owner_cc_pid: Some(4321),
+    };
+    let response = tokio::task::spawn_blocking(move || {
+        let client = Box::leak(Box::new(http_client().unwrap()));
+        forward_json_rpc_message(
+            client,
+            &runtime_url(&runtime),
+            &headers,
+            json!({"jsonrpc":"2.0","id":7,"method":"ping"}),
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.unwrap()["result"]["ok"], json!(true));
+    assert_eq!(mcp_hits.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_double_cc_race_survives_single_service_instance() {
+    let project_root = tempdir().unwrap();
+    let data_dir = tempdir().unwrap();
+    let runtime_dir = data_dir.path().join("runtime");
+    let service_pid = std::process::id();
+
+    let port_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    port_listener.set_nonblocking(true).unwrap();
+    let port = port_listener.local_addr().unwrap().port();
+    let legacy_runtime_dir = project_root.path().join(".agent-teams/runtime");
+    fs::create_dir_all(&legacy_runtime_dir).unwrap();
+    fs::write(
+        legacy_runtime_dir.join("http-mcp.json"),
+        serde_json::to_string_pretty(&json!({
+            "pid": service_pid,
+            "host": "127.0.0.1",
+            "port": port,
+            "url": format!("http://127.0.0.1:{port}/mcp"),
+            "token_file": legacy_runtime_dir.join("http-mcp.token"),
+            "started_at": "2026-05-02T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let health_hits = Arc::new(AtomicUsize::new(0));
+    let spawn_attempts = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(2));
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    let start_tx = Arc::new(Mutex::new(Some(start_tx)));
+    let health_hits_for_server = Arc::clone(&health_hits);
+    let runtime_dir_for_server = runtime_dir.clone();
+    let server = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/healthz",
+            get(move || {
+                let health_hits = Arc::clone(&health_hits_for_server);
+                async move {
+                    health_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "uptime_seconds": 1,
+                        "runtime_dir": runtime_dir_for_server.display().to_string(),
+                        "lock_holder_pid": service_pid,
+                    }))
+                }
+            }),
+        );
+        start_rx.await.unwrap();
+        let listener = tokio::net::TcpListener::from_std(port_listener).unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let run_relay = |barrier: Arc<Barrier>, spawn_attempts: Arc<AtomicUsize>| {
+        let project_root = project_root.path().to_path_buf();
+        let data_dir = data_dir.path().to_path_buf();
+        let start_tx = Arc::clone(&start_tx);
+        tokio::task::spawn_blocking(move || {
+            let client = Box::leak(Box::new(http_client().unwrap()));
+            ensure_runtime_for_relay_with_spawn(
+                &project_root,
+                Some(&data_dir),
+                client,
+                move |spec| {
+                    let attempt = spawn_attempts.fetch_add(1, Ordering::SeqCst);
+                    let runtime_dir = spec.runtime_dir.clone();
+                    let start_tx = Arc::clone(&start_tx);
+                    barrier.wait();
+                    if attempt == 0 {
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_millis(200));
+                            fs::create_dir_all(&runtime_dir).unwrap();
+                            fs::write(runtime_dir.join("http-mcp.token"), "relay-test-token")
+                                .unwrap();
+                            fs::write(
+                                runtime_dir.join("http-mcp.json"),
+                                serde_json::to_string_pretty(&json!({
+                                    "pid": service_pid,
+                                    "host": "127.0.0.1",
+                                    "port": port,
+                                    "url": format!("http://127.0.0.1:{port}/mcp"),
+                                    "token_file": runtime_dir.join("http-mcp.token"),
+                                    "started_at": "2026-05-02T00:00:00Z"
+                                }))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            start_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                        });
+                    }
+
+                    Ok(())
+                },
+            )
+            .unwrap()
+        })
+    };
+
+    let first = run_relay(Arc::clone(&barrier), Arc::clone(&spawn_attempts));
+    let second = run_relay(Arc::clone(&barrier), Arc::clone(&spawn_attempts));
+
+    let (first_runtime, second_runtime) = tokio::join!(first, second);
+    let first_runtime = first_runtime.unwrap();
+    let second_runtime = second_runtime.unwrap();
+    assert_eq!(first_runtime.pid, service_pid);
+    assert_eq!(second_runtime.pid, service_pid);
+    assert_eq!(first_runtime.pid, second_runtime.pid);
+    assert_eq!(spawn_attempts.load(Ordering::SeqCst), 2);
+    assert!(health_hits.load(Ordering::SeqCst) > 0);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_identity_mismatch_fails_friendly() {
+    let project_root = tempdir().unwrap();
+    let data_dir = tempdir().unwrap();
+    let runtime_dir = data_dir.path().join("runtime");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    let service_pid = std::process::id();
+
+    let port_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = port_listener.local_addr().unwrap().port();
+    drop(port_listener);
+
+    let token_path = runtime_dir.join("http-mcp.token");
+    fs::write(&token_path, "relay-test-token").unwrap();
+
+    let wrong_runtime_dir = tempdir().unwrap();
+    let server = tokio::spawn({
+        let wrong_runtime_dir = wrong_runtime_dir.path().to_path_buf();
+        async move {
+            let app = Router::new().route(
+                "/healthz",
+                get(move || {
+                    let wrong_runtime_dir = wrong_runtime_dir.clone();
+                    async move {
+                        Json(json!({
+                            "status": "ok",
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "uptime_seconds": 1,
+                            "runtime_dir": wrong_runtime_dir.display().to_string(),
+                            "lock_holder_pid": service_pid + 1,
+                        }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            axum::serve(listener, app).await.unwrap();
+        }
+    });
+
+    let err = thread::spawn(move || {
+        let client = Box::leak(Box::new(http_client().unwrap()));
+        let err = ensure_runtime_for_relay_with_spawn(
+            project_root.path(),
+            Some(data_dir.path()),
+            client,
+            move |spec| {
+                assert_eq!(spec.runtime_dir, runtime_dir);
+                fs::create_dir_all(&runtime_dir).unwrap();
+                fs::write(runtime_dir.join("http-mcp.token"), "relay-test-token").unwrap();
+                fs::write(
+                    runtime_dir.join("http-mcp.json"),
+                    serde_json::to_string_pretty(&json!({
+                        "pid": service_pid,
+                        "host": "127.0.0.1",
+                        "port": port,
+                        "url": format!("http://127.0.0.1:{port}/mcp"),
+                        "token_file": runtime_dir.join("http-mcp.token"),
+                        "started_at": "2026-05-02T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        err.to_string()
+    })
+    .join()
+    .unwrap();
+
+    let err = err.to_string();
+    assert!(err.contains("service identity mismatch"), "{err}");
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mid_turn_corrupt_identity_cache_falls_through_to_my_teams() {
     let dir = tempdir().unwrap();
@@ -123,7 +474,7 @@ async fn mid_turn_corrupt_identity_cache_falls_through_to_my_teams() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let identity = tokio::task::spawn_blocking({
+    let identity = thread::spawn({
         let project_root = project_root.clone();
         let service_url = format!("http://{addr}");
         move || {
@@ -136,7 +487,7 @@ async fn mid_turn_corrupt_identity_cache_falls_through_to_my_teams() {
                 .unwrap()
         }
     })
-    .await
+    .join()
     .unwrap();
 
     assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -167,7 +518,7 @@ async fn my_teams_failure_exits_one_for_mid_turn_and_async_wake() {
     });
 
     let service_url = format!("http://{addr}");
-    let (mid_turn, async_wake) = tokio::task::spawn_blocking(move || {
+    let (mid_turn, async_wake) = thread::spawn(move || {
         let client = http_client().unwrap();
         let headers = HttpHeaders {
             authorization: "Bearer test-token".into(),
@@ -191,7 +542,7 @@ async fn my_teams_failure_exits_one_for_mid_turn_and_async_wake() {
         .unwrap_err();
         (mid_turn, async_wake)
     })
-    .await
+    .join()
     .unwrap();
 
     assert_eq!(hits.load(Ordering::SeqCst), 2);
@@ -227,7 +578,7 @@ async fn relay_forwards_json_rpc_payloads() {
     });
 
     let url = format!("http://{addr}/mcp");
-    let response = tokio::task::spawn_blocking(move || -> Result<Option<Value>, String> {
+    let response = thread::spawn(move || -> Result<Option<Value>, String> {
         let client = http_client().map_err(|err| err.to_string())?;
         let headers = HttpHeaders {
             authorization: "Bearer test-token".into(),
@@ -241,7 +592,7 @@ async fn relay_forwards_json_rpc_payloads() {
         )
         .map_err(|err| err.to_string())
     })
-    .await
+    .join()
     .unwrap()
     .unwrap();
     assert_eq!(response.unwrap()["result"]["ok"], json!(true));

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -28,6 +29,9 @@ pub struct HttpMcpState {
     /// `/lead-pending/my-teams` endpoint to enumerate teams and resolve
     /// pending file paths the hook should watch.
     base_dir: Arc<PathBuf>,
+    runtime_dir: Arc<PathBuf>,
+    lock_holder_pid: u32,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -42,11 +46,17 @@ impl HttpMcpState {
         runtime: TeamModeMcpRuntime,
         token: impl Into<String>,
         base_dir: impl Into<PathBuf>,
+        runtime_dir: impl Into<PathBuf>,
+        lock_holder_pid: u32,
+        started_at: Instant,
     ) -> Self {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
             token: Arc::from(token.into()),
             base_dir: Arc::new(base_dir.into()),
+            runtime_dir: Arc::new(runtime_dir.into()),
+            lock_holder_pid,
+            started_at,
         }
     }
 }
@@ -55,6 +65,7 @@ pub fn router(state: HttpMcpState) -> Router {
     Router::new()
         .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
         .route("/lead-pending/my-teams", get(get_my_teams))
+        .route("/healthz", get(get_healthz))
         .with_state(state)
 }
 
@@ -120,6 +131,20 @@ pub async fn delete_mcp(State(state): State<HttpMcpState>, headers: HeaderMap) -
         return status.into_response();
     }
     StatusCode::ACCEPTED.into_response()
+}
+
+pub async fn get_healthz(State(state): State<HttpMcpState>) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_seconds": state.started_at.elapsed().as_secs(),
+            "runtime_dir": state.runtime_dir.display().to_string(),
+            "lock_holder_pid": state.lock_holder_pid,
+        })),
+    )
+        .into_response()
 }
 
 fn validate_headers(headers: &HeaderMap, token: &str) -> Result<(), StatusCode> {
@@ -368,6 +393,11 @@ fn json_rpc_error(id: Value, code: i32, message: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TeamModeToolset;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use futures::executor::block_on;
+    use tower::util::ServiceExt;
 
     #[test]
     fn injects_owner_and_worker_context_into_tools_call() {
@@ -402,5 +432,45 @@ mod tests {
             "https://example.com".parse().unwrap(),
         );
         assert_eq!(validate_origin(&headers), Err(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn healthz_returns_expected_json_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let toolset =
+            TeamModeToolset::new_with_project_root(dir.path(), Some(dir.path().to_path_buf()));
+        let runtime = TeamModeMcpRuntime::with_tool_executor(dir.path(), Box::new(toolset));
+        let app = router(HttpMcpState::new(
+            runtime,
+            "test-token",
+            dir.path().to_path_buf(),
+            dir.path().join("runtime"),
+            std::process::id(),
+            Instant::now(),
+        ));
+
+        block_on(async {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/healthz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["status"], json!("ok"));
+            assert_eq!(json["version"], json!(env!("CARGO_PKG_VERSION")));
+            assert_eq!(
+                json["runtime_dir"],
+                json!(dir.path().join("runtime").display().to_string())
+            );
+            assert_eq!(json["lock_holder_pid"], json!(std::process::id()));
+            assert!(json["uptime_seconds"].as_u64().unwrap() <= 1);
+        });
     }
 }

@@ -5,13 +5,21 @@ use agent_teams::{TeamModeMcpRuntime, TeamModeToolset, util};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
+use std::time::Instant;
 use tempfile::tempdir;
 use tower::ServiceExt;
 
 fn app(base: &std::path::Path) -> axum::Router {
     let toolset = TeamModeToolset::new_with_project_root(base, Some(base.to_path_buf()));
     let runtime = TeamModeMcpRuntime::with_tool_executor(base, Box::new(toolset));
-    http_mcp_router(HttpMcpState::new(runtime, "test-token", base.to_path_buf()))
+    http_mcp_router(HttpMcpState::new(
+        runtime,
+        "test-token",
+        base.to_path_buf(),
+        base.join("runtime"),
+        std::process::id(),
+        Instant::now(),
+    ))
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -78,6 +86,14 @@ fn get_my_teams_with_token(pid: u32, token: Option<&str>) -> Request<Body> {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
     builder.body(Body::empty()).unwrap()
+}
+
+fn get_healthz() -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn create_team_with_owner(base: &std::path::Path, id: &str, owner_cc_pid: u32) {
@@ -232,6 +248,26 @@ fn http_initialize_then_tools_list_matches_runtime_schema() {
         assert_eq!(tools.status(), StatusCode::OK);
         let tools = response_json(tools).await;
         assert!(tools["result"]["tools"].as_array().unwrap().len() >= 7);
+    });
+}
+
+#[test]
+fn healthz_returns_expected_shape() {
+    let dir = tempdir().unwrap();
+    let app = app(dir.path());
+
+    block_on(async {
+        let response = app.clone().oneshot(get_healthz()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(body["lock_holder_pid"], json!(std::process::id()));
+        assert!(body["uptime_seconds"].as_u64().unwrap() <= 1);
+        assert_eq!(
+            body["runtime_dir"],
+            json!(dir.path().join("runtime").display().to_string())
+        );
     });
 }
 
