@@ -39,6 +39,7 @@ clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8" }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 # Optional: checkpoint (git notes-based agent session audit trail)
 git2 = { version = "0.19", optional = true }

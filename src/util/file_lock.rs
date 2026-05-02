@@ -78,11 +78,11 @@ impl FileLock {
                 path: path.to_path_buf(),
             })),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            // fs2 on macOS returns EAGAIN as ErrorKind::Other instead of WouldBlock.
-            // EAGAIN = 35 on macOS, 11 on Linux (same as EWOULDBLOCK on both).
+            // fs2 can surface platform lock contention as raw OS errors:
+            // EAGAIN = 35 on macOS, 11 on Linux; Windows ERROR_LOCK_VIOLATION = 33.
             Err(ref e)
                 if e.raw_os_error()
-                    .is_some_and(|code| code == 11 || code == 35) =>
+                    .is_some_and(|code| code == 11 || code == 35 || code == 33) =>
             {
                 Ok(None)
             }

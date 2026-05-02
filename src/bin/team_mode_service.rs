@@ -17,6 +17,8 @@ use serde_json::{Map, Value, json};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+mod team_mode_service_shell;
+
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8786;
 const LEAD_WATCH_INTERVAL: Duration = Duration::from_secs(5);
@@ -56,6 +58,21 @@ enum ServiceCommand {
         /// Target project directory. Defaults to the current directory.
         target_project_dir: Option<PathBuf>,
     },
+    /// Proxy stdio JSON-RPC to the HTTP service.
+    Relay,
+    /// Rewrite of the Stop hook.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
+    /// Rewrite of the headers helper.
+    Headers,
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    AsyncWake,
+    MidTurn,
 }
 
 #[derive(Debug)]
@@ -77,18 +94,33 @@ struct RuntimeInfo {
     started_at: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if let Some(ServiceCommand::Init { target_project_dir }) = cli.command {
-        let target = target_project_dir.unwrap_or(env::current_dir()?);
-        init_project(&target)?;
-        return Ok(());
+    match cli.command {
+        Some(ServiceCommand::Init { target_project_dir }) => {
+            let target = target_project_dir.unwrap_or(env::current_dir()?);
+            init_project(&target)?;
+            return Ok(());
+        }
+        Some(ServiceCommand::Relay) => {
+            return team_mode_service_shell::relay_stdio();
+        }
+        Some(ServiceCommand::Hook { command }) => match command {
+            HookCommand::AsyncWake => team_mode_service_shell::run_async_wake_hook(),
+            HookCommand::MidTurn => team_mode_service_shell::run_mid_turn_hook(),
+        },
+        Some(ServiceCommand::Headers) => {
+            return team_mode_service_shell::headers_stdout();
+        }
+        None => {}
     }
 
     init_tracing();
     let args = service_args_from_cli(cli)?;
-    run_service(args).await
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_service(args))
 }
 
 async fn run_service(args: ServiceArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -98,6 +130,16 @@ async fn run_service(args: ServiceArgs) -> Result<(), Box<dyn std::error::Error>
     data_dir::ensure_scaffold(&args.data_dir)?;
     let runtime_dir = args.data_dir.join("runtime");
     std::fs::create_dir_all(&runtime_dir)?;
+    let _service_lock = match team_mode_service_shell::try_acquire_service_lock(&runtime_dir)? {
+        Some(lock) => lock,
+        None => {
+            tracing::info!(
+                lock_path = %team_mode_service_shell::service_lock_path(&runtime_dir).display(),
+                "team_mode_service already holds runtime lock; exiting idempotently"
+            );
+            return Ok(());
+        }
+    };
 
     let token_file = args
         .token_file
