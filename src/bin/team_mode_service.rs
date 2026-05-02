@@ -589,6 +589,26 @@ mod tests {
     }
 
     #[test]
+    fn merged_claude_settings_errors_when_existing_lead_pending_hook_conflicts() {
+        let dir = tempdir().unwrap();
+        let settings_path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{"hooks":{"PostToolUse":[{"hooks":[{"type":"command","command":"node .agent-teams/scripts/hooks/lead-pending-mid-turn.js"}]}]}}"#,
+        )
+        .unwrap();
+
+        let err = merged_claude_settings_json(&settings_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(".claude/settings.json"), "got: {err}");
+        assert!(err.contains("Team Mode lead-pending hooks"), "got: {err}");
+        assert!(err.contains("merge manually"), "got: {err}");
+    }
+
+    #[test]
     fn init_errors_when_claude_settings_already_has_lead_pending_hook() {
         let dir = tempdir().unwrap();
         let settings_path = dir.path().join(".claude/settings.json");

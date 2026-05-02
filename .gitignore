@@ -77,6 +77,10 @@ docs/中间内容.txt
 /dashboard-mock-snap.md
 /.claude/scheduled_tasks.lock
 
+# E2E test artifacts (e2e-tester repro runs); should live under .plans/ but
+# fallback path keeps them out of the repo if they land at root.
+/test-codex-worker-death-repro/
+
 # In-progress lead+team planning workspace. The .plans/ tree is per-CC
 # session scratch (per-worker progress.md / findings.md / task_plan.md);
 # committed to share across sessions in one CC, but kept out of the

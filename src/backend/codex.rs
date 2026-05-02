@@ -12,15 +12,17 @@
 //! 5. Emit a synthetic [`AgentOutput::Idle`] so the AgentLoop's ready-check
 //!    completes without consuming an LLM turn — Codex has no `--system-prompt`
 //!    flag, so any system instruction must ride on the first real user message.
-//! 6. A background task reads stdout line-by-line, parsing messages
-//!    and forwarding them as [`AgentOutput`] events through an mpsc channel.
+//! 6. Background tasks read stdout/stderr line-by-line, parsing stdout
+//!    messages into [`AgentOutput`] events while retaining stderr for
+//!    diagnostics.
 //! 7. The first `send_input` call prepends the stashed system prompt as
 //!    `[System instructions]\n...\n\n---\n\n<user input>`, then dispatches
 //!    `turn/start`. Subsequent inputs go through unchanged.
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -30,6 +32,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::codex_protocol::*;
+use super::codex_stderr::{
+    CODEX_STDERR_LOG_ENV, CodexStderrRing, STDERR_TAIL_LINES, open_stderr_log, redact_stderr_line,
+};
 use super::{AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig, send_agent_output};
 use crate::{Error, Result};
 
@@ -165,10 +170,7 @@ impl CodexBackend {
 
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
-        // Discard stderr to avoid pipe-buffer deadlock: if the child writes
-        // enough to stderr without anyone reading it, the OS buffer fills and
-        // the child blocks, stalling stdout as well.
-        cmd.stderr(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
 
         if let Some(ref cwd) = config.cwd {
             cmd.current_dir(cwd);
@@ -323,7 +325,7 @@ impl AgentBackend for CodexBackend {
 
         let mut child = self.spawn_child(&config)?;
 
-        // Take ownership of stdin/stdout
+        // Take ownership of stdin/stdout/stderr
         let stdin = child.stdin.take().ok_or_else(|| Error::SpawnFailed {
             name: agent_name.clone(),
             reason: "Failed to capture stdin".into(),
@@ -332,11 +334,17 @@ impl AgentBackend for CodexBackend {
             name: agent_name.clone(),
             reason: "Failed to capture stdout".into(),
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| Error::SpawnFailed {
+            name: agent_name.clone(),
+            reason: "Failed to capture stderr".into(),
+        })?;
 
         let stdin_writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
         let mut stdout_reader = BufReader::new(stdout);
         let request_id = Arc::new(AtomicU64::new(1));
         let alive = Arc::new(AtomicBool::new(true));
+        let stderr_log_path = config.env.get(CODEX_STDERR_LOG_ENV).map(PathBuf::from);
+        let stderr_tail = Arc::new(StdMutex::new(CodexStderrRing::new(stderr_log_path.clone())));
 
         // ----- Step 1: Initialize handshake -----
         let init_id = next_id(&request_id);
@@ -440,6 +448,67 @@ impl AgentBackend for CodexBackend {
         // whether to issue a protocol-level interrupt or report "idle".
         let active_turn_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let reader_active_turn_id = active_turn_id.clone();
+
+        let stderr_tail_reader = Arc::clone(&stderr_tail);
+        let stderr_name = agent_name.clone();
+        let stderr_handle = tokio::spawn(async move {
+            debug!(agent = %stderr_name, "Background Codex stderr reader started");
+            let mut stderr_reader = BufReader::new(stderr);
+            let mut stderr_log = open_stderr_log(stderr_log_path.as_ref(), &stderr_name);
+            let mut line_buf = String::new();
+
+            loop {
+                line_buf.clear();
+                match stderr_reader.read_line(&mut line_buf).await {
+                    Ok(0) => {
+                        debug!(agent = %stderr_name, "Codex stderr EOF");
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line_buf.trim_end_matches(&['\n', '\r'][..]);
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let timestamp = chrono::Utc::now().to_rfc3339();
+                        let sequence = {
+                            match stderr_tail_reader.lock() {
+                                Ok(mut guard) => {
+                                    guard.push_line(timestamp.clone(), trimmed.to_string())
+                                }
+                                Err(_) => {
+                                    error!(
+                                        agent = %stderr_name,
+                                        "codex stderr ring buffer poisoned"
+                                    );
+                                    0
+                                }
+                            }
+                        };
+                        if let Some(log) = stderr_log.as_mut() {
+                            let _ = writeln!(log, "[{timestamp} #{sequence}] {trimmed}");
+                            let _ = log.flush();
+                        }
+                        debug!(
+                            event = "codex_worker.stderr",
+                            worker_name = %stderr_name,
+                            line = %redact_stderr_line(trimmed),
+                            timestamp = %timestamp,
+                            sequence,
+                            "codex worker stderr"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            agent = %stderr_name,
+                            error = %e,
+                            "Error reading Codex stderr"
+                        );
+                        break;
+                    }
+                }
+            }
+            debug!(agent = %stderr_name, "Background Codex stderr reader stopped");
+        });
 
         let reader_handle = tokio::spawn(async move {
             debug!(agent = %reader_name, "Background Codex reader started");
@@ -568,6 +637,8 @@ impl AgentBackend for CodexBackend {
             output_rx: Some(output_rx),
             alive,
             reader_handle: Some(reader_handle),
+            stderr_handle: Some(stderr_handle),
+            stderr_tail,
             pending_system_prompt: Arc::new(Mutex::new(pending_system_prompt)),
             active_turn_id,
         };
@@ -593,6 +664,8 @@ struct CodexSession {
     output_rx: Option<tokio::sync::mpsc::Receiver<AgentOutput>>,
     alive: Arc<AtomicBool>,
     reader_handle: Option<JoinHandle<()>>,
+    stderr_handle: Option<JoinHandle<()>>,
+    stderr_tail: Arc<StdMutex<CodexStderrRing>>,
     /// System instructions captured at spawn that have not yet been delivered
     /// to the model. Consumed (set to `None`) on the first `send_input` so it
     /// rides along with the user's first real message instead of burning a
@@ -681,6 +754,20 @@ impl AgentSession for CodexSession {
         Some(self.thread_id.clone())
     }
 
+    fn stderr_tail(&self) -> Option<String> {
+        self.stderr_tail
+            .lock()
+            .ok()
+            .and_then(|ring| ring.snapshot_tail(STDERR_TAIL_LINES))
+    }
+
+    fn stderr_log_hint(&self) -> Option<String> {
+        self.stderr_tail
+            .lock()
+            .ok()
+            .and_then(|ring| ring.log_hint(STDERR_TAIL_LINES))
+    }
+
     /// Issue a `turn/interrupt` JSON-RPC if the worker is currently
     /// processing a turn; no-op if idle. Used by `send_message(preempt=true)`
     /// to abort an in-flight turn so a follow-up message can be processed
@@ -726,6 +813,10 @@ impl AgentSession for CodexSession {
             handle.abort();
             let _ = handle.await;
         }
+        if let Some(handle) = self.stderr_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         // Close stdin to signal the child to exit
         {
@@ -756,6 +847,10 @@ impl AgentSession for CodexSession {
             handle.abort();
             let _ = handle.await;
         }
+        if let Some(handle) = self.stderr_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         if let Some(ref mut child) = self.child {
             child.kill().await.map_err(|e| Error::CodexProtocol {
@@ -772,6 +867,9 @@ impl Drop for CodexSession {
         // Abort the reader task if it was not already taken by shutdown/force_kill.
         // The child process is handled by kill_on_drop(true).
         if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.stderr_handle.take() {
             handle.abort();
         }
     }

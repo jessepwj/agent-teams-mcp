@@ -224,6 +224,12 @@ impl TeamModeToolset {
         if let Ok(token) = std::env::var("TEAM_MODE_HTTP_MCP_TOKEN") {
             config.env.insert("TEAM_MODE_HTTP_MCP_TOKEN".into(), token);
         }
+        let stderr_log = crate::team_mode_daemon::runtime_dir(&self.base_dir)
+            .join(format!("codex-stderr-{team_name}__{worker_name}.log"));
+        config.env.insert(
+            "TEAM_MODE_CODEX_STDERR_LOG".into(),
+            stderr_log.display().to_string(),
+        );
         // Pass through whatever the caller stored — `None` means the
         // backend CLI consults its own config (e.g. `~/.codex/config.toml`).
         // No project-level hardcoding: a user who set `model_reasoning_effort

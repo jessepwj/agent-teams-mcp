@@ -195,12 +195,30 @@ impl TeamModeToolset {
             }
             let key = worker.spawn_key.clone();
             let orch = Arc::clone(&self.runtime_orchestrator);
-            let alive = self
-                .async_runtime
-                .block_on(async move { orch.lock().await.is_alive(&key).await.unwrap_or(false) });
+            let (alive, stderr_log_hint) = self.async_runtime.block_on(async move {
+                let guard = orch.lock().await;
+                let alive = guard.is_alive(&key).await.unwrap_or(false);
+                let stderr_log_hint = guard.stderr_log_hint_of(&key);
+                (alive, stderr_log_hint)
+            });
             if alive {
                 continue;
             }
+            let note = match stderr_log_hint {
+                Some(ref hint) if !hint.is_empty() => {
+                    tracing::warn!(
+                        event = "codex_worker.stderr_tail",
+                        team = %worker.team,
+                        name = %worker.name,
+                        stderr_log = %hint,
+                        "worker-liveness watchdog: stderr captured locally before marking DEAD"
+                    );
+                    format!(
+                        "liveness watchdog: orchestrator reported process gone (stderr captured locally at {hint})"
+                    )
+                }
+                _ => "liveness watchdog: orchestrator reported process gone".into(),
+            };
             // Process is gone — flip the sidecar. We deliberately keep the
             // member-store record (worker_remove handles full removal); this
             // is purely the runtime liveness sidecar.
@@ -210,7 +228,7 @@ impl TeamModeToolset {
                 &worker.spawn_key,
                 worker.adapter.clone(),
                 crate::team_mode::runtime_workers::STATE_DEAD,
-                Some("liveness watchdog: orchestrator reported process gone".into()),
+                Some(note),
             ) {
                 tracing::warn!(
                     team = %worker.team,

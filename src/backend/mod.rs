@@ -6,6 +6,7 @@
 pub mod claude_code;
 pub mod codex;
 pub mod codex_protocol;
+pub mod codex_stderr;
 pub mod delegation;
 pub mod gemini;
 pub mod router;
@@ -333,6 +334,18 @@ pub trait AgentSession: Send + Sync {
     /// Default `None` covers backends that don't expose a session id (codex
     /// and gemini-cli). Implementations should return promptly with no I/O.
     fn session_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Recent stderr tail for diagnostics, if the backend captures stderr.
+    /// Must return promptly with no I/O.
+    fn stderr_tail(&self) -> Option<String> {
+        None
+    }
+
+    /// Local stderr log location and captured line range, if available.
+    /// Must return promptly with no I/O.
+    fn stderr_log_hint(&self) -> Option<String> {
         None
     }
 

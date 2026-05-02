@@ -1,6 +1,14 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use async_trait::async_trait;
 use tempfile::tempdir;
+use tokio::sync::mpsc;
 
 use super::*;
+use crate::backend::{AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig};
+use crate::team_mode::tracing_capture::capture_events;
+use crate::team_mode_web::{TeamModeWebState, read_model::read_events};
 
 const TEST_OWNER_CC_PID: u32 = u32::MAX;
 
@@ -262,4 +270,163 @@ fn inbox_read_rejects_unknown_team() {
         .call_tool("inbox_read", Some(json!({"team": "no-such"})))
         .unwrap_err();
     assert!(matches!(&err, Error::TeamNotFound { name } if name == "no-such"));
+}
+
+struct FakeCodexBackend {
+    stderr_tail: String,
+    stderr_log_hint: String,
+}
+
+#[async_trait]
+impl AgentBackend for FakeCodexBackend {
+    fn backend_type(&self) -> BackendType {
+        BackendType::Codex
+    }
+
+    async fn spawn(&self, config: SpawnConfig) -> Result<Box<dyn AgentSession>> {
+        Ok(Box::new(FakeCodexSession {
+            name: config.name,
+            alive: Arc::new(AtomicBool::new(false)),
+            stderr_tail: self.stderr_tail.clone(),
+            stderr_log_hint: self.stderr_log_hint.clone(),
+        }))
+    }
+}
+
+struct FakeCodexSession {
+    name: String,
+    alive: Arc<AtomicBool>,
+    stderr_tail: String,
+    stderr_log_hint: String,
+}
+
+#[async_trait]
+impl AgentSession for FakeCodexSession {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn send_input(&mut self, _input: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn output_receiver(&mut self) -> Option<mpsc::Receiver<AgentOutput>> {
+        None
+    }
+
+    async fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        self.alive.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn force_kill(&mut self) -> Result<()> {
+        self.alive.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn stderr_tail(&self) -> Option<String> {
+        Some(self.stderr_tail.clone())
+    }
+
+    fn stderr_log_hint(&self) -> Option<String> {
+        Some(self.stderr_log_hint.clone())
+    }
+}
+
+#[test]
+fn worker_liveness_dead_note_keeps_stderr_local_and_redacts_events() {
+    let dir = tempdir().unwrap();
+    let tools = TeamModeToolset::new_for_test(dir.path());
+    create_demo_team_for_tool_test(&tools);
+
+    let stderr_tail = "Authorization: Bearer sk-secret-123\napi_key=abc123\n";
+    let stderr_log_path =
+        crate::team_mode_daemon::runtime_dir(dir.path()).join("codex-stderr-demo__worker.log");
+    let stderr_log_hint = format!("{}:lines 7-9", stderr_log_path.display());
+
+    tools.async_runtime.block_on({
+        let orch = Arc::clone(&tools.runtime_orchestrator);
+        let stderr_tail = stderr_tail.to_string();
+        let stderr_log_hint = stderr_log_hint.clone();
+        async move {
+            orch.lock().await.register_backend(FakeCodexBackend {
+                stderr_tail,
+                stderr_log_hint,
+            });
+        }
+    });
+
+    tools
+        .call_tool(
+            "worker_add",
+            Some(json!({
+                "team": "demo",
+                "name": "worker",
+                "adapter": "codex",
+            })),
+        )
+        .unwrap();
+
+    let (flipped, events) = capture_events(|| tools.worker_liveness_tick());
+    assert_eq!(flipped, 1);
+
+    let workers = tools.runtime_workers.list_all().unwrap();
+    let worker = workers
+        .iter()
+        .find(|worker| worker.team == "demo" && worker.name == "worker")
+        .expect("worker record missing");
+    let note = worker.note.as_deref().expect("dead worker note missing");
+    assert!(note.contains("stderr captured locally at"), "note: {note}");
+    assert!(
+        note.contains("codex-stderr-demo__worker.log"),
+        "note should reference the local log path: {note}"
+    );
+    assert!(
+        !note.contains("sk-secret-123"),
+        "note leaked secret: {note}"
+    );
+    assert!(
+        !note.contains("Authorization"),
+        "note leaked stderr: {note}"
+    );
+    assert!(!note.contains("api_key"), "note leaked stderr: {note}");
+
+    let state_change = events
+        .iter()
+        .find(|event| event.field("event") == Some("runtime_worker.state_change"))
+        .expect("missing runtime_worker.state_change event");
+    assert_eq!(state_change.field("reason"), Some(note));
+    assert!(
+        !state_change
+            .field("reason")
+            .unwrap_or_default()
+            .contains("sk-secret-123"),
+        "state change reason leaked secret"
+    );
+
+    let stderr_tail_event = events
+        .iter()
+        .find(|event| event.field("event") == Some("codex_worker.stderr_tail"))
+        .expect("missing stderr tail warning event");
+    assert_eq!(
+        stderr_tail_event.field("stderr_log"),
+        Some(stderr_log_hint.as_str())
+    );
+
+    let web_state = TeamModeWebState::new(dir.path());
+    let events_resp = read_events(&web_state, "demo", Some("7b7d"), None).unwrap();
+    let worker_event = events_resp
+        .events
+        .iter()
+        .find(|event| event.event_type == "workerStatusChanged")
+        .expect("missing workerStatusChanged event");
+    let payload_note = worker_event.payload["note"].as_str().unwrap();
+    assert!(payload_note.contains("stderr captured locally at"));
+    assert!(!payload_note.contains("sk-secret-123"));
+    assert!(!payload_note.contains("Authorization"));
+    assert!(!payload_note.contains("api_key"));
 }

@@ -11,7 +11,7 @@ use agent_teams::team_mode::domain::{
     DeliveryStatus, ExecutionMode, ExecutionProfile, MemberKind, Message, MessageKind,
     VisibilityRule,
 };
-use agent_teams::team_mode::runtime_workers::{RuntimeWorkerStore, STATE_RUNNING};
+use agent_teams::team_mode::runtime_workers::{RuntimeWorkerStore, STATE_DEAD, STATE_RUNNING};
 use agent_teams::team_mode::service::member_service::AddMemberRequest;
 use agent_teams::team_mode::service::{
     CreateTeamRequest, InboxService, MessageService, TeamService,
@@ -510,6 +510,44 @@ fn events_returns_worker_status_changed_for_runtime_worker() {
     assert_eq!(items[0]["payload"]["workerName"], "bob");
     assert_eq!(items[0]["payload"]["sessionState"], STATE_RUNNING);
     assert_eq!(items[0]["payload"]["lifecycleEvent"], "alive");
+}
+
+#[test]
+fn worker_status_event_redacts_legacy_raw_stderr_note() {
+    let dir = tempdir().unwrap();
+    seed_data(dir.path());
+    let app = router(dir.path());
+    let cursor = next_events_cursor(&app);
+
+    RuntimeWorkerStore::new(dir.path())
+        .upsert_state(
+            "demo",
+            "bob",
+            "demo__bob",
+            Some("codex".into()),
+            STATE_DEAD,
+            Some(
+                "liveness watchdog: orchestrator reported process gone; stderr tail:\n\
+                 Authorization: Bearer sk-secret\napi_key=top-secret"
+                    .into(),
+            ),
+        )
+        .unwrap();
+
+    let response = app.handle_request("GET", &format!("/api/teams/demo/events?cursor={cursor}"));
+    assert_eq!(response.status as u16, 200);
+    let events = json(&response);
+    let note = events["events"][0]["payload"]["note"].as_str().unwrap();
+    assert!(note.contains("local-only"));
+    assert!(!note.contains("sk-secret"), "event leaked secret: {note}");
+    assert!(
+        !note.contains("Authorization"),
+        "event leaked stderr content: {note}"
+    );
+    assert!(
+        !note.contains("api_key"),
+        "event leaked stderr content: {note}"
+    );
 }
 
 #[test]

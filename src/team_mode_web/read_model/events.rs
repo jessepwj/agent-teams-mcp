@@ -261,6 +261,7 @@ fn worker_events(
             continue;
         }
         let worker_name = worker.name.clone();
+        let note = worker_event_note(worker.note.clone());
         events.push(PendingEvent {
             event: EventView {
                 id: format!(
@@ -282,7 +283,7 @@ fn worker_events(
                     "adapter": worker.adapter,
                     "model": Value::Null,
                     "cwd": Value::Null,
-                    "note": worker.note,
+                    "note": note,
                 }),
             },
             cursor_after: EventCursor {
@@ -293,6 +294,16 @@ fn worker_events(
         });
     }
     Ok(events)
+}
+
+fn worker_event_note(note: Option<String>) -> Option<String> {
+    let note = note?;
+    let lower = note.to_ascii_lowercase();
+    if lower.contains("stderr tail:\n") || (lower.contains("stderr") && note.contains('\n')) {
+        Some("stderr diagnostics are local-only; see runtime stderr log on the host".into())
+    } else {
+        Some(note)
+    }
 }
 
 fn worker_after_cursor(
