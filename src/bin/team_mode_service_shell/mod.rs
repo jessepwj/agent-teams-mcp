@@ -804,7 +804,16 @@ fn fetch_my_teams(
     headers: &HttpHeaders,
     session_id: Option<&str>,
 ) -> Result<MyTeamsResponse, Box<dyn std::error::Error>> {
-    let url = format!("{service_url}/lead-pending/my-teams");
+    // `service_url` is the MCP endpoint (e.g. `http://127.0.0.1:8786/mcp`)
+    // stored in runtime JSON for stdio relay forwarding. The /lead-pending
+    // routes hang off the service base, NOT under /mcp, so strip any /mcp
+    // suffix before appending. Without this the request 404s and async-wake
+    // exits before draining any pending replies.
+    let base = service_url
+        .trim_end_matches('/')
+        .strip_suffix("/mcp")
+        .unwrap_or_else(|| service_url.trim_end_matches('/'));
+    let url = format!("{base}/lead-pending/my-teams");
     let mut request = client
         .get(url)
         .query(&[("pid", std::process::id().to_string())]);

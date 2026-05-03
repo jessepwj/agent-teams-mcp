@@ -554,6 +554,87 @@ async fn my_teams_failure_exits_one_for_mid_turn_and_async_wake() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_my_teams_strips_mcp_suffix_from_service_url() {
+    // Regression for hook 100% non-fire bug: runtime JSON stores
+    // url = "http://host:port/mcp" for stdio relay forwarding, but
+    // /lead-pending/my-teams hangs off the service base, NOT under /mcp.
+    // The hook used to call <url>/lead-pending/my-teams, hitting
+    // /mcp/lead-pending/my-teams (404) and exiting before draining any
+    // pending replies. Verify the strip suffix happens correctly.
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = Arc::clone(&hits);
+    let mcp_hits = Arc::new(AtomicUsize::new(0));
+    let mcp_hits_clone = Arc::clone(&mcp_hits);
+    let app = Router::new()
+        .route(
+            "/lead-pending/my-teams",
+            get(move || {
+                let hits = Arc::clone(&hits_clone);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "cc_pid": 4321,
+                        "session_id": "s",
+                        "teams": [],
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/mcp/lead-pending/my-teams",
+            get(move || {
+                let mcp_hits = Arc::clone(&mcp_hits_clone);
+                async move {
+                    mcp_hits.fetch_add(1, Ordering::SeqCst);
+                    (axum::http::StatusCode::NOT_FOUND, "wrong path")
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Caller passes the relay/MCP URL (with /mcp suffix), as runtime JSON
+    // stores it. fetch_my_teams must strip /mcp before appending the
+    // /lead-pending/my-teams path.
+    let mcp_url = format!("http://{addr}/mcp");
+    let result = thread::spawn(move || {
+        let client = http_client().unwrap();
+        let headers = HttpHeaders {
+            authorization: "Bearer test-token".into(),
+            owner_cc_pid: Some(4321),
+        };
+        fetch_my_teams_checked(
+            &client,
+            &mcp_url,
+            &headers,
+            Some("s"),
+            "lead-pending-async-wake",
+        )
+    })
+    .join()
+    .unwrap();
+
+    assert!(
+        result.is_ok(),
+        "fetch_my_teams must succeed with /mcp-suffixed url, got: {result:?}"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the correct base /lead-pending/my-teams handler must be hit"
+    );
+    assert_eq!(
+        mcp_hits.load(Ordering::SeqCst),
+        0,
+        "the wrong /mcp/lead-pending/my-teams handler must NOT be hit"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_forwards_json_rpc_payloads() {
     let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
     let seen_clone = Arc::clone(&seen);

@@ -198,6 +198,8 @@ team-lead 在 phase 边界 review（不是每个任务）：
 
 - **`/lead-pending/my-teams` 不能再做第二次 ancestor walk（ADR-028）** —— Service handler 拿到 hook/relay 传来的 `pid` 时，必须直接用它匹配 `team.owner_cc_pid`，不能再调 `resolve_cc_pid_from`。**Why**：v3 在 Cursor / VS Code 等 IDE 终端启动 CC 时，IDE 进程是 `node.exe` (CC) 的真实父进程，re-walk 会跨过 CC 走到 IDE host（如 `Cursor.exe`），让 owner 匹配永远 mismatch、hook 路由全失效。team_create 端已经只信 HTTP header `X-Team-Mode-Owner-CC-Pid`（relay 端 walked），两侧必须用同一个 reference point。**How to apply**：(1) 任何新读取 owner 的 service handler 都 trust caller PID + 用 `SHELL_WRAPPER_NAMES` sanity check 拒绝明显 wrapper PID，不要新增 walk 调用。(2) `SHELL_WRAPPER_NAMES` 走 `pub const` 公开给 service 复用，不要在 handler 里新增白名单常量。(3) Caller 端（relay / hook）继续用 `current_cc_pid()` 自己 walk past wrappers，service 不替它兜底。
 
+- **hook `fetch_my_teams` 必须 strip runtime URL 的 `/mcp` 后缀（ADR-029）** —— `runtime.url` 字段是给 stdio relay forwarding 用的 MCP endpoint（`http://host:port/mcp`），但 `/lead-pending/my-teams` 等非-MCP 端点挂在 service base 上，不在 `/mcp` 子树里。**Why**：直接 `format!("{service_url}/lead-pending/my-teams")` 会拼出 `/mcp/lead-pending/my-teams`，service router 无此路径返 404，hook 立即 exit 1，pending file 永远没被 drain，端到端 100% 失效。这是 ADR-028 在端到端层面没显形的真正堵点。**How to apply**：(1) 任何调 service 非-MCP 端点的 hook / 工具都先 `service_url.trim_end_matches('/').strip_suffix("/mcp").unwrap_or(...)` 再拼路径，不要假设 url 是 base。(2) 未来新加 service endpoint 默认挂 base，不挂 /mcp 子树；MCP 子树只服务 JSON-RPC。(3) Regression test 必须同时注册正确路径和 `/mcp/...` 错路径，断言 caller hit 正确路径不 hit 错路径。
+
 ## Archived Pitfalls
 
 > 已被新 ADR / 当前路径取代，但保留供排查历史文档漂移。
