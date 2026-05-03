@@ -333,13 +333,20 @@ impl TeamModeToolset {
             ),
             tool(
                 "send_message",
-                "Send a message as team lead. `text` must contain at least one \
-                 @handle that matches an active worker (e.g. `@alice please review`). \
-                 Replies arrive automatically as a system-reminder when your \
-                 next turn starts — do not poll or sleep waiting for them. \
-                 Set `preempt=true` to abort the recipient's in-flight turn so the \
-                 new message is processed immediately (lead-only; no-op if recipient \
-                 is idle; messages are always enqueued regardless of interrupt outcome).",
+                "Send a message into the team room. `text` must contain at least one \
+                 @handle naming the recipient(s) (e.g. `@alice please review`, `@lead done`). \
+                 \n\nWORKER USAGE — IMPORTANT: if you are a worker (e.g. alice, backend-dev, \
+                 probe), this is the ONLY way to reply to lead or any other teammate. \
+                 Ending your turn without calling send_message means NO reply is delivered — \
+                 the lead's next turn will see only an `[INFO] worker completed turn without \
+                 a routed team message` status, never your actual answer. Even if you wrote \
+                 your reply as plain text in your turn output, lead cannot see it; you must \
+                 call send_message with text=`@lead <your reply>` before ending the turn. \
+                 \n\nLEAD USAGE: dispatch tasks to workers; replies arrive automatically as a \
+                 system-reminder when your next turn starts — do not poll or sleep waiting for \
+                 them. Set `preempt=true` to abort the recipient's in-flight turn so the new \
+                 message is processed immediately (lead-only; no-op if recipient is idle; \
+                 messages are always enqueued regardless of interrupt outcome).",
                 json_schema(
                     &[
                         ("team", json!({"type":"string"})),
