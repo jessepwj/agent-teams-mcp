@@ -116,23 +116,26 @@ async fn response_json(response: axum::response::Response) -> Value {
 
 #[test]
 fn lead_pending_my_teams_returns_only_teams_owned_by_resolved_cc_pid() {
+    // The hook caller is responsible for walking past shell wrappers and
+    // passing the real CC PID; the service trusts that PID directly.
+    // Use std::process::id() to model that already-resolved CC PID — the
+    // test harness process IS the "CC" from the service's perspective.
     let dir = tempdir().unwrap();
     let app = app(dir.path());
-    let caller_pid = std::process::id();
-    let resolved_cc_pid = util::current_cc_pid().expect("test process should have an ancestor");
-    create_team_with_owner(dir.path(), "mine-a", resolved_cc_pid);
-    create_team_with_owner(dir.path(), "mine-b", resolved_cc_pid);
-    create_team_with_owner(dir.path(), "not-mine", resolved_cc_pid.saturating_add(1));
+    let cc_pid = std::process::id();
+    create_team_with_owner(dir.path(), "mine-a", cc_pid);
+    create_team_with_owner(dir.path(), "mine-b", cc_pid);
+    create_team_with_owner(dir.path(), "not-mine", cc_pid.saturating_add(1));
 
     block_on(async {
         let response = app
             .clone()
-            .oneshot(get_my_teams(caller_pid, Some("session-1")))
+            .oneshot(get_my_teams(cc_pid, Some("session-1")))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["cc_pid"], json!(resolved_cc_pid));
+        assert_eq!(body["cc_pid"], json!(cc_pid));
         assert_eq!(body["session_id"], json!("session-1"));
         let teams = body["teams"].as_array().unwrap();
         assert_eq!(teams.len(), 2);
@@ -161,19 +164,18 @@ fn lead_pending_my_teams_returns_only_teams_owned_by_resolved_cc_pid() {
 fn lead_pending_my_teams_returns_zero_teams_when_owner_does_not_match() {
     let dir = tempdir().unwrap();
     let app = app(dir.path());
-    let caller_pid = std::process::id();
-    let resolved_cc_pid = util::current_cc_pid().expect("test process should have an ancestor");
-    create_team_with_owner(dir.path(), "not-mine", resolved_cc_pid.saturating_add(1));
+    let cc_pid = std::process::id();
+    create_team_with_owner(dir.path(), "not-mine", cc_pid.saturating_add(1));
 
     block_on(async {
         let response = app
             .clone()
-            .oneshot(get_my_teams(caller_pid, None))
+            .oneshot(get_my_teams(cc_pid, None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["cc_pid"], json!(resolved_cc_pid));
+        assert_eq!(body["cc_pid"], json!(cc_pid));
         assert!(body["session_id"].is_null());
         assert!(body["teams"].as_array().unwrap().is_empty());
     });
@@ -183,15 +185,14 @@ fn lead_pending_my_teams_returns_zero_teams_when_owner_does_not_match() {
 fn lead_pending_my_teams_uses_query_pid_not_owner_header() {
     let dir = tempdir().unwrap();
     let app = app(dir.path());
-    let caller_pid = std::process::id();
-    let resolved_cc_pid = util::current_cc_pid().expect("test process should have an ancestor");
-    create_team_with_owner(dir.path(), "mine", resolved_cc_pid);
+    let cc_pid = std::process::id();
+    create_team_with_owner(dir.path(), "mine", cc_pid);
     create_team_with_owner(dir.path(), "header-owner", 999_999);
 
     block_on(async {
         let response = app
             .clone()
-            .oneshot(get_my_teams_with_owner_header(caller_pid, 999_999))
+            .oneshot(get_my_teams_with_owner_header(cc_pid, 999_999))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -200,6 +201,49 @@ fn lead_pending_my_teams_uses_query_pid_not_owner_header() {
         assert_eq!(teams.len(), 1);
         assert_eq!(teams[0]["id"], json!("mine"));
     });
+}
+
+#[test]
+fn lead_pending_my_teams_does_not_climb_past_caller_pid() {
+    // Regression for owner-identity ancestor-walk bug: with v3 install-global
+    // running inside Cursor.exe, the service used to re-walk q.pid (the CC
+    // node.exe PID) and climb up to Cursor.exe, so my-teams returned empty.
+    // The fix is that the service trusts the caller's resolved CC PID
+    // verbatim and does NOT call resolve_cc_pid_from on it. We verify by
+    // creating a team owned by std::process::id() (the test harness, which
+    // always has a real ancestor) and asserting cc_pid in the response is
+    // exactly that PID — never an ancestor.
+    let dir = tempdir().unwrap();
+    let app = app(dir.path());
+    let cc_pid = std::process::id();
+    create_team_with_owner(dir.path(), "anchored", cc_pid);
+
+    block_on(async {
+        let response = app
+            .clone()
+            .oneshot(get_my_teams(cc_pid, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["cc_pid"],
+            json!(cc_pid),
+            "service must trust caller PID, not climb to ancestor"
+        );
+        let teams = body["teams"].as_array().unwrap();
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0]["id"], json!("anchored"));
+    });
+
+    // Sanity: util::current_cc_pid() (the relay/hook walker) DOES climb,
+    // and the climbed PID would NOT match the team's owner — proving the
+    // service's old behavior of re-walking would have broken routing.
+    let walked = util::current_cc_pid().expect("test process should have an ancestor");
+    assert_ne!(
+        walked, cc_pid,
+        "test invariant: cargo test runner has a real ancestor different from itself"
+    );
 }
 
 #[test]

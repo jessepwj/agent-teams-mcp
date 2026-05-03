@@ -15,7 +15,7 @@ use crate::team_mode::mcp::runtime::TeamModeMcpRuntime;
 use crate::team_mode::mcp::schemas::{JsonRpcErrorResponse, JsonRpcRequest};
 use crate::team_mode::service::lead_pending::PENDING_FILENAME;
 use crate::team_mode::storage::TeamStore;
-use crate::util::resolve_cc_pid_from;
+use crate::util::SHELL_WRAPPER_NAMES;
 
 const ERR_PARSE: i32 = -32700;
 const ERR_INVALID_REQUEST: i32 = -32600;
@@ -315,7 +315,7 @@ pub async fn get_my_teams(
 
     let base_dir = state.base_dir.clone();
     let result: Result<Value, String> = tokio::task::spawn_blocking(move || {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
         let mut sys = System::new_with_specifics(
             RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
         );
@@ -324,12 +324,24 @@ pub async fn get_my_teams(
             true,
             ProcessRefreshKind::nothing(),
         );
-        let cc_pid = resolve_cc_pid_from(q.pid, &sys).ok_or_else(|| {
-            format!(
-                "could not resolve CC PID from caller pid={}: process not found or no CC ancestor",
-                q.pid
-            )
-        })?;
+        // Trust the caller's already-resolved CC PID. Hook/relay run the same
+        // ancestor walk before calling us; re-walking from `q.pid` would
+        // climb past the CC into IDE/terminal hosts (e.g. `Cursor.exe` above
+        // `node.exe`), breaking owner matching. Sanity-check it isn't an
+        // obvious shell wrapper to catch buggy callers loudly instead of
+        // silently mis-routing.
+        let cc_pid = q.pid;
+        let proc = sys
+            .process(Pid::from_u32(cc_pid))
+            .ok_or_else(|| format!("caller-supplied cc_pid={cc_pid} not found in process list"))?;
+        let name_lc = proc.name().to_string_lossy().to_lowercase();
+        let stem = name_lc.trim_end_matches(".exe");
+        if SHELL_WRAPPER_NAMES.contains(&stem) {
+            return Err(format!(
+                "caller-supplied cc_pid={cc_pid} is a shell wrapper ({stem}); \
+                 caller must walk past wrappers before calling /my-teams"
+            ));
+        }
 
         let store = TeamStore::new((*base_dir).clone());
         let teams = store

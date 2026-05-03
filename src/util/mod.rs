@@ -104,7 +104,8 @@ pub fn validate_slug_name(name: &str) -> crate::error::Result<()> {
 ///     branch under the same root)
 ///
 /// We must walk past these wrappers to find the real CC.
-const SHELL_WRAPPER_NAMES: &[&str] = &["cmd", "sh", "bash", "zsh", "pwsh", "powershell", "conhost"];
+pub const SHELL_WRAPPER_NAMES: &[&str] =
+    &["cmd", "sh", "bash", "zsh", "pwsh", "powershell", "conhost"];
 
 /// Maximum ancestors to walk when resolving the CC PID. A small bound
 /// guards against pathological process trees (cycles shouldn't happen on
