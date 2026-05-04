@@ -51,6 +51,29 @@ impl TeamService {
     }
 
     pub fn create_with_outcome(&self, request: CreateTeamRequest) -> Result<CreateTeamOutcome> {
+        self.create_with_outcome_impl(request, None::<fn()>)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_with_outcome_with_hook<F>(
+        &self,
+        request: CreateTeamRequest,
+        overwrite_hook: F,
+    ) -> Result<CreateTeamOutcome>
+    where
+        F: FnOnce(),
+    {
+        self.create_with_outcome_impl(request, Some(overwrite_hook))
+    }
+
+    fn create_with_outcome_impl<F>(
+        &self,
+        request: CreateTeamRequest,
+        overwrite_hook: Option<F>,
+    ) -> Result<CreateTeamOutcome>
+    where
+        F: FnOnce(),
+    {
         if request.name.trim().is_empty() {
             return Err(Error::InvalidName {
                 name: request.name,
@@ -58,21 +81,61 @@ impl TeamService {
             });
         }
 
-        let mut existing = self.team_store.list()?;
         let request_id = request.id.as_deref();
         if let Some(id) = request_id {
             validate_name(id)?;
         }
 
-        let mut discarded_teams = Vec::new();
         if request.overwrite {
-            for team in &existing {
-                self.team_store
-                    .delete(&team.id, TeamDeleteMode::Permanent)?;
-                discarded_teams.push(team.id.clone());
-            }
-            existing.clear();
+            let request_id = request.id.clone();
+            let request_name = request.name.clone();
+            let request_description = request.description.clone();
+            let request_cwd = request.cwd.clone();
+            let request_lead_member_id = request.lead_member_id.clone();
+            let request_owner_cc_pid = request.owner_cc_pid;
+            return self.team_store.with_teams_lock(|store| {
+                let existing = store.list_unlocked()?;
+                let mut discarded_teams = Vec::new();
+                for team in &existing {
+                    store.delete_unlocked(&team.id, TeamDeleteMode::Permanent)?;
+                    discarded_teams.push(team.id.clone());
+                }
+                if let Some(hook) = overwrite_hook {
+                    hook();
+                }
+                let team_id = match request_id.clone() {
+                    Some(id) => id,
+                    None => loop {
+                        let candidate = Uuid::new_v4().to_string();
+                        if !existing.iter().any(|team| team.id == candidate) {
+                            break candidate;
+                        }
+                    },
+                };
+                let now = Utc::now();
+                let team = Team {
+                    id: team_id,
+                    name: request_name,
+                    description: request_description,
+                    cwd: request_cwd,
+                    status: TeamStatus::Active,
+                    lead_member_id: request_lead_member_id,
+                    owner_cc_pid: request_owner_cc_pid,
+                    created_at: now,
+                    updated_at: now,
+                };
+                store.save_unlocked(&team)?;
+                Ok(CreateTeamOutcome {
+                    team,
+                    revived: false,
+                    restored_from: None,
+                    discarded_teams,
+                })
+            });
         }
+
+        let existing = self.team_store.list()?;
+        let discarded_teams = Vec::new();
 
         let same_name = existing.iter().find(|team| team.name == request.name);
         let same_id = request_id.and_then(|id| existing.iter().find(|team| team.id == id));
@@ -481,6 +544,93 @@ mod tests {
         let teams = service.list().unwrap();
         assert_eq!(teams.len(), 1);
         assert_eq!(teams[0].name, "Fresh");
+    }
+
+    #[test]
+    fn overwrite_holds_project_scope_lock_across_snapshot_delete_and_create() {
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let service = TeamService::new(TeamStore::new(dir.path()));
+
+        service
+            .create(CreateTeamRequest {
+                id: Some("stale".into()),
+                name: "Stale".into(),
+                description: None,
+                cwd: None,
+                lead_member_id: None,
+                owner_cc_pid: None,
+                overwrite: false,
+            })
+            .unwrap();
+
+        let overwrite_service = service.clone();
+        let create_service = service.clone();
+        let listed = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let overwrite_handle = {
+            let listed = Arc::clone(&listed);
+            let release = Arc::clone(&release);
+            thread::spawn(move || {
+                overwrite_service
+                    .create_with_outcome_with_hook(
+                        CreateTeamRequest {
+                            id: Some("fresh".into()),
+                            name: "Fresh".into(),
+                            description: None,
+                            cwd: None,
+                            lead_member_id: None,
+                            owner_cc_pid: None,
+                            overwrite: true,
+                        },
+                        move || {
+                            listed.wait();
+                            release.wait();
+                        },
+                    )
+                    .unwrap()
+            })
+        };
+
+        listed.wait();
+        let create_handle = thread::spawn(move || {
+            let outcome = create_service
+                .create(CreateTeamRequest {
+                    id: Some("late".into()),
+                    name: "Late".into(),
+                    description: None,
+                    cwd: None,
+                    lead_member_id: None,
+                    owner_cc_pid: None,
+                    overwrite: false,
+                })
+                .unwrap();
+            done_tx.send(outcome.id.clone()).unwrap();
+            outcome
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "concurrent create finished before overwrite released the project-scope lock"
+        );
+
+        release.wait();
+        let overwrite_outcome = overwrite_handle.join().unwrap();
+        let create_outcome = create_handle.join().unwrap();
+
+        assert_eq!(overwrite_outcome.discarded_teams, vec!["stale".to_string()]);
+        assert_eq!(overwrite_outcome.team.name, "Fresh");
+        assert_eq!(create_outcome.name, "Late");
+
+        let teams = service.list().unwrap();
+        assert!(!teams.iter().any(|team| team.name == "Stale"));
+        assert!(teams.iter().any(|team| team.name == "Fresh"));
+        assert!(teams.iter().any(|team| team.name == "Late"));
     }
 
     #[test]

@@ -39,12 +39,20 @@ impl TeamStore {
         data_dir::lock_path(&self.base_dir, "teams")
     }
 
+    pub(crate) fn with_teams_lock<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        ensure_dir(&self.base_dir.join(data_dir::DIR_LOCKS))?;
+        let _lock = acquire_lock_path(&self.lock_for_teams())?;
+        f(self)
+    }
+
     pub fn save(&self, team: &Team) -> Result<()> {
+        self.with_teams_lock(|store| store.save_unlocked(team))
+    }
+
+    pub(crate) fn save_unlocked(&self, team: &Team) -> Result<()> {
         validate_storage_name(&team.id)?;
         let team_dir = data_dir::team_dir(&self.base_dir, &team.id);
         ensure_dir(&team_dir)?;
-        ensure_dir(&self.base_dir.join(data_dir::DIR_LOCKS))?;
-        let _lock = acquire_lock_path(&self.lock_for_teams())?;
         atomic_write_json(&self.team_file(&team.id), team)
     }
 
@@ -55,6 +63,10 @@ impl TeamStore {
     }
 
     pub fn list(&self) -> Result<Vec<Team>> {
+        self.with_teams_lock(|store| store.list_unlocked())
+    }
+
+    pub(crate) fn list_unlocked(&self) -> Result<Vec<Team>> {
         let mut teams = Vec::new();
         if !self.base_dir.exists() {
             return Ok(teams);
@@ -83,10 +95,12 @@ impl TeamStore {
     }
 
     pub fn delete(&self, team_id: impl AsRef<str>, mode: TeamDeleteMode) -> Result<()> {
-        let team_id = team_id.as_ref();
+        let team_id = team_id.as_ref().to_string();
+        self.with_teams_lock(|store| store.delete_unlocked(&team_id, mode))
+    }
+
+    pub(crate) fn delete_unlocked(&self, team_id: &str, mode: TeamDeleteMode) -> Result<()> {
         validate_storage_name(team_id)?;
-        ensure_dir(&self.base_dir.join(data_dir::DIR_LOCKS))?;
-        let _lock = acquire_lock_path(&self.lock_for_teams())?;
         let team_dir = data_dir::team_dir(&self.base_dir, team_id);
         match mode {
             TeamDeleteMode::Permanent => {
