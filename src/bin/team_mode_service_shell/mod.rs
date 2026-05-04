@@ -112,8 +112,9 @@ pub(crate) fn relay_stdio(
     data_dir_override: Option<PathBuf>,
     cli_project_root: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let project_root = project_root(cli_project_root.as_deref())?;
-    log_relay_startup_diagnostic(&project_root, cli_project_root.as_deref());
+    let cc_pid = owner_cc_pid();
+    let project_root = project_root(cli_project_root.as_deref(), cc_pid)?;
+    log_relay_startup_diagnostic(&project_root, cli_project_root.as_deref(), cc_pid);
     let client = http_client_for_relay_forward()?;
     let runtime = ensure_runtime_for_relay(&project_root, data_dir_override.as_deref(), &client)?;
     // Token is read from disk once: it doesn't change for the lifetime of
@@ -154,7 +155,7 @@ pub(crate) fn relay_stdio(
 pub(crate) fn headers_stdout(
     data_dir_override: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let project_root = project_root(None)?;
+    let project_root = project_root(None, owner_cc_pid())?;
     let client = http_client()?;
     let runtime = match find_healthy_runtime(&client, &project_root, data_dir_override.as_deref())?
     {
@@ -179,7 +180,7 @@ pub(crate) fn headers_stdout(
 }
 
 pub(crate) fn run_async_wake_hook() -> ! {
-    let project_root = match project_root(None) {
+    let project_root = match project_root(None, owner_cc_pid()) {
         Ok(root) => root,
         Err(err) => exit_with_error(err),
     };
@@ -258,7 +259,7 @@ pub(crate) fn run_async_wake_hook() -> ! {
 }
 
 pub(crate) fn run_mid_turn_hook() -> ! {
-    let project_root = match project_root(None) {
+    let project_root = match project_root(None, owner_cc_pid()) {
         Ok(root) => root,
         Err(err) => exit_with_error(err),
     };
@@ -344,6 +345,7 @@ pub(crate) fn try_acquire_service_lock(
 
 pub(crate) fn project_root(
     cli_project_root: Option<&Path>,
+    cc_pid: Option<u32>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(root) = cli_project_root.filter(|root| !root.as_os_str().is_empty()) {
         return Ok(root.to_path_buf());
@@ -351,13 +353,53 @@ pub(crate) fn project_root(
     if let Some(root) = env::var_os("CLAUDE_PROJECT_DIR").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(root));
     }
+    // Read the CC session file as the authoritative source of the project
+    // root. The relay subprocess can be spawned by Claude Code from a cwd
+    // unrelated to the user's actual workspace (observed on Windows: a CC
+    // launched in `E:\aigc...\opencode` produced a relay whose
+    // `env::current_dir()` reported `E:\aigc...\agent-teams-rs-team-mode`,
+    // which is BUG-1 from the 2026-05-04 cross-project test). The session
+    // file is written by Claude Code at startup and pins the workspace cwd
+    // for the lifetime of that CC instance, so it stays correct even when
+    // process inheritance does not.
+    if let Some(pid) = cc_pid {
+        if let Some(cwd) = read_cc_session_cwd(pid) {
+            return Ok(cwd);
+        }
+    }
     Ok(env::current_dir()?)
 }
 
+/// Read `~/.claude/sessions/<pid>.json` and return its `cwd` field.
+/// Returns None on any error (file missing, parse failure, field missing) so
+/// callers can fall back gracefully.
+fn read_cc_session_cwd(pid: u32) -> Option<PathBuf> {
+    read_cc_session_cwd_at(dirs::home_dir()?.as_path(), pid)
+}
+
+fn read_cc_session_cwd_at(home: &Path, pid: u32) -> Option<PathBuf> {
+    let session_path = home
+        .join(".claude")
+        .join("sessions")
+        .join(format!("{pid}.json"));
+    let content = fs::read_to_string(&session_path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    value
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|s| PathBuf::from(s.to_string()))
+}
+
 /// Emit a one-shot diagnostic line so post-mortems can tell whether a relay
-/// instance picked the correct project_root. Goes to stderr (Claude Code
-/// captures MCP server stderr into its logs). Single line, easy to grep.
-fn log_relay_startup_diagnostic(resolved: &Path, cli_project_root: Option<&Path>) {
+/// instance picked the correct project_root. Goes to stderr AND a known log
+/// file at `~/.team-mode/runtime/relay-startup.log`. Claude Code does not
+/// reliably capture MCP subprocess stderr to disk, so the file path is the
+/// post-mortem source. Single line, easy to grep.
+fn log_relay_startup_diagnostic(
+    resolved: &Path,
+    cli_project_root: Option<&Path>,
+    cc_pid: Option<u32>,
+) {
     let cli_arg = cli_project_root
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<none>".to_string());
@@ -365,9 +407,15 @@ fn log_relay_startup_diagnostic(resolved: &Path, cli_project_root: Option<&Path>
     let cwd = env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unavailable>".to_string());
-    eprintln!(
-        "[team_mode_service relay] startup pid={} resolved_project_root={} cwd={} cli_arg={} env_CLAUDE_PROJECT_DIR={}",
+    let cc_session_cwd = cc_pid
+        .and_then(read_cc_session_cwd)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    let line = format!(
+        "[{}] [team_mode_service relay] startup pid={} cc_pid={:?} resolved_project_root={} cwd={} cli_arg={} env_CLAUDE_PROJECT_DIR={} cc_session_cwd={}",
+        chrono::Utc::now().to_rfc3339(),
         std::process::id(),
+        cc_pid,
         resolved.display(),
         cwd,
         cli_arg,
@@ -375,8 +423,23 @@ fn log_relay_startup_diagnostic(resolved: &Path, cli_project_root: Option<&Path>
             "<unset>".to_string()
         } else {
             env_claude_project_dir
-        }
+        },
+        cc_session_cwd,
     );
+    eprintln!("{line}");
+    if let Some(home) = dirs::home_dir() {
+        let runtime_dir = home.join(".team-mode").join("runtime");
+        let _ = fs::create_dir_all(&runtime_dir);
+        let log_path = runtime_dir.join("relay-startup.log");
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{line}");
+        }
+    }
 }
 
 fn legacy_runtime_info_path(project_root: &Path) -> PathBuf {

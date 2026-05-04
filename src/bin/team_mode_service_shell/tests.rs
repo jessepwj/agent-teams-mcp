@@ -102,6 +102,40 @@ fn project_registration_detection_accepts_global_hook_install() {
 }
 
 #[test]
+fn read_cc_session_cwd_returns_cwd_field_from_session_file() {
+    // BUG-1 fix: relay must trust the CC session file's `cwd` over its own
+    // process cwd, because Claude Code on Windows can spawn MCP subprocesses
+    // with cwd unrelated to the user's actual workspace.
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".claude/sessions")).unwrap();
+    fs::write(
+        home.path().join(".claude/sessions/12345.json"),
+        r#"{"pid":12345,"sessionId":"abc","cwd":"E:\\projects\\foo","startedAt":1,"kind":"interactive","entrypoint":"cli"}"#,
+    )
+    .unwrap();
+    let cwd = read_cc_session_cwd_at(home.path(), 12345).unwrap();
+    assert_eq!(cwd, PathBuf::from("E:\\projects\\foo"));
+}
+
+#[test]
+fn read_cc_session_cwd_returns_none_when_session_missing() {
+    let home = tempdir().unwrap();
+    assert!(read_cc_session_cwd_at(home.path(), 99999).is_none());
+}
+
+#[test]
+fn read_cc_session_cwd_returns_none_when_cwd_field_missing() {
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".claude/sessions")).unwrap();
+    fs::write(
+        home.path().join(".claude/sessions/12345.json"),
+        r#"{"pid":12345,"sessionId":"abc"}"#,
+    )
+    .unwrap();
+    assert!(read_cc_session_cwd_at(home.path(), 12345).is_none());
+}
+
+#[test]
 fn project_registration_detection_ignores_unrelated_global_config() {
     // Defensive: a global ~/.claude.json that has no team-mode entry must
     // still resolve to "not registered" — don't accidentally match unrelated
