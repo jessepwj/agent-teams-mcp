@@ -182,6 +182,23 @@ fn validate_origin(headers: &HeaderMap) -> Result<(), StatusCode> {
 }
 
 fn call_context_from_headers(headers: &HeaderMap) -> HttpCallContext {
+    let raw_project_root = header_str(headers, "x-team-mode-project-root");
+    let project_root_present = headers.contains_key("x-team-mode-project-root");
+    let project_root = raw_project_root.map(percent_decode_lossy).map(PathBuf::from);
+    // BUG-11 deep-debug: log per-call routing input. The client (codex /
+    // claude-code MCP) may silently strip headers with non-ASCII bytes
+    // (RFC 7230 forbids them in field-content), and the user observed
+    // "team not found" failures that lined up with the service falling
+    // back to its `--project-root` whenever the resolution path missed.
+    // Persisting one INFO line per call gives a paper trail to diagnose
+    // future routing surprises without a debugger.
+    tracing::info!(
+        event = "http_call_context",
+        project_root_header_present = project_root_present,
+        project_root_header_raw_len = raw_project_root.map(|s| s.len()).unwrap_or(0),
+        project_root_resolved = ?project_root.as_ref().map(|p| p.display().to_string()),
+        "received MCP call routing context"
+    );
     HttpCallContext {
         owner_cc_pid: header_str(headers, "x-team-mode-owner-cc-pid")
             .and_then(|value| value.parse::<u32>().ok()),
@@ -189,7 +206,45 @@ fn call_context_from_headers(headers: &HeaderMap) -> HttpCallContext {
         caller_member: header_str(headers, "x-team-mode-worker-id")
             .or_else(|| header_str(headers, "x-team-mode-member"))
             .map(str::to_string),
-        project_root: header_str(headers, "x-team-mode-project-root").map(PathBuf::from),
+        project_root,
+    }
+}
+
+/// Decode percent-encoded bytes (RFC 3986) plus pass through any UTF-8
+/// already in the header. Codex / claude-code may send the project_root
+/// either as raw chinese characters (rejected by strict HTTP/1.1
+/// validators) or percent-encoded ASCII, depending on the client. Try
+/// to recover both. Falls through unchanged on decode failure so the
+/// caller can still see whatever the client transmitted.
+fn percent_decode_lossy(input: &str) -> String {
+    if !input.contains('%') {
+        return input.to_string();
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = decode_hex_digit(bytes[i + 1]);
+            let lo = decode_hex_digit(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn decode_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 

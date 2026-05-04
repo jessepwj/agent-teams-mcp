@@ -3,6 +3,27 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Percent-encode a Windows / Unix path so it survives transit through
+/// strict HTTP/1.1 header validators (e.g. hyper's `HeaderValue::from_str`,
+/// which rejects bytes >= 0x80). Reserved chars and bytes above ASCII are
+/// `%XX`-encoded; unreserved chars from RFC 3986 (alpha / digit / `-_.~`)
+/// pass through unchanged. Backslashes, colons, spaces, and CJK characters
+/// (the typical Windows-path danger zone) all get encoded.
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
 use crate::ExecutionSessionState;
 use crate::backend::{AgentOutput, BackendType, SpawnConfig};
 use crate::runtime::AgentLoop;
@@ -273,9 +294,22 @@ impl TeamModeToolset {
             .parent()
             .map(|path| path.to_path_buf())
             .unwrap_or_else(|| self.base_dir.clone());
+        // Percent-encode the project_root before handing it to codex /
+        // claude-code via env. Both clients pipe the env value straight
+        // into an HTTP header (`X-Team-Mode-Project-Root`); strict
+        // HTTP/1.1 validators in their hyper-based stacks reject bytes
+        // >= 0x80, so a Windows path with CJK characters
+        // (`E:\aigc内容整理\opencode`) was being silently dropped from
+        // the request. Service then fell back to its `--project-root`
+        // value — which is whichever project lazy-spawned the daemon —
+        // and a worker spawned for projectB ended up routing every MCP
+        // call to projectA. That mis-route is the deep root cause of
+        // BUG-11's "team not found" → self-recovery → second browser
+        // popup chain. The service-side `percent_decode_lossy` reverses
+        // this on receive.
         config.env.insert(
             "TEAM_MODE_PROJECT_ROOT".into(),
-            project_root.display().to_string(),
+            percent_encode_path(&project_root.display().to_string()),
         );
         if let Ok(url) = std::env::var("TEAM_MODE_HTTP_MCP_URL") {
             config.env.insert("TEAM_MODE_HTTP_MCP_URL".into(), url);

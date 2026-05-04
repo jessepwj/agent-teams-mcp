@@ -206,15 +206,41 @@ async fn run_service(args: ServiceArgs) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("RUST_LOG")
-                .unwrap_or_else(|_| EnvFilter::new("info,agent_teams=debug")),
-        )
-        .with_writer(std::io::stderr)
-        .with_target(true)
-        .with_thread_ids(false)
-        .init();
+    // Write tracing to a persistent log file under
+    // `~/.team-mode/runtime/service.log` so diagnostics survive the
+    // detached lazy-spawn flow (the relay closes its stderr handle and
+    // every INFO/DEBUG line otherwise vanishes — making it impossible
+    // to inspect routing decisions like `event=http_call_context` after
+    // the fact). When the file can't be opened, fall back to stderr.
+    let env_filter = EnvFilter::try_from_env("RUST_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("info,agent_teams=debug"));
+    let log_file = dirs::home_dir()
+        .map(|home| home.join(".team-mode").join("runtime").join("service.log"))
+        .and_then(|path| {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        });
+    if let Some(file) = log_file {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_target(true)
+            .with_thread_ids(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .with_thread_ids(false)
+            .init();
+    }
 }
 
 fn service_args_from_cli(cli: Cli) -> Result<ServiceArgs, Box<dyn std::error::Error>> {
