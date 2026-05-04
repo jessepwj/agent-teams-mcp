@@ -828,9 +828,16 @@ fn fetch_my_teams(
         .strip_suffix("/mcp")
         .unwrap_or_else(|| service_url.trim_end_matches('/'));
     let url = format!("{base}/lead-pending/my-teams");
-    let mut request = client
-        .get(url)
-        .query(&[("pid", std::process::id().to_string())]);
+    // Use the already-walked CC PID from headers (or walk fresh as fallback).
+    // ADR-028: service trusts caller-supplied PID without re-walking, so
+    // sending raw `std::process::id()` (the hook's own PID, not CC's) makes
+    // service look up owner=hook_pid, never match real owner=cc_pid, and
+    // return teams=[]. Hook then enters LONG_IDLE_SLEEP and never drains.
+    let cc_pid = headers
+        .owner_cc_pid
+        .or_else(owner_cc_pid)
+        .unwrap_or_else(std::process::id);
+    let mut request = client.get(url).query(&[("pid", cc_pid.to_string())]);
     if let Some(session_id) = session_id {
         request = request.query(&[("session_id", session_id)]);
     }
