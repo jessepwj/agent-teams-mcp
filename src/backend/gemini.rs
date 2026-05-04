@@ -60,7 +60,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::{AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig, send_agent_output};
+use super::{
+    AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig, apply_hide_window,
+    send_agent_output,
+};
 use crate::{Error, Result};
 
 /// Channel buffer size for agent output events.
@@ -426,6 +429,7 @@ async fn spawn_gemini_process(
         cmd.env(k, v);
     }
 
+    apply_hide_window(&mut cmd);
     cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| Error::SpawnFailed {

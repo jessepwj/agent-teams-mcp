@@ -21,6 +21,26 @@ use tracing::{debug, warn};
 
 use crate::Result;
 
+/// Hide the console window that Windows would otherwise allocate when a
+/// detached service (no inherited console) spawns a `.cmd` / `.bat` shim.
+///
+/// Why: `which::which("codex")` on Windows resolves to the npm batch shim
+/// (`~/AppData/Roaming/npm/codex.cmd`). Spawning a `.cmd` from a process
+/// without a console makes Windows attach a fresh console to `cmd.exe`,
+/// which the user sees as an empty black `cmd.exe` window per worker.
+/// Worker stdio is piped to the daemon for protocol use, so the window has
+/// nothing to display anyway. Setting `CREATE_NO_WINDOW` (0x08000000)
+/// suppresses the console allocation entirely.
+///
+/// No-op on non-Windows platforms.
+pub(crate) fn apply_hide_window(_cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        _cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BackendType
 // ---------------------------------------------------------------------------

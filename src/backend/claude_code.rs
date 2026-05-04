@@ -63,7 +63,10 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use super::{AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig, send_agent_output};
+use super::{
+    AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig, apply_hide_window,
+    send_agent_output,
+};
 use crate::{Error, Result};
 
 /// Channel buffer size for agent output events.
@@ -222,6 +225,7 @@ impl ClaudeCodeBackend {
         // event and starving the agent_loop.
         cmd.env("TEAM_MODE_WORKER", "1");
 
+        apply_hide_window(&mut cmd);
         cmd.kill_on_drop(true);
 
         let child = cmd.spawn().map_err(|e| Error::SpawnFailed {

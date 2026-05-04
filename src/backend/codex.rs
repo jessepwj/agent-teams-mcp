@@ -35,7 +35,10 @@ use super::codex_protocol::*;
 use super::codex_stderr::{
     CODEX_STDERR_LOG_ENV, CodexStderrRing, STDERR_TAIL_LINES, open_stderr_log, redact_stderr_line,
 };
-use super::{AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig, send_agent_output};
+use super::{
+    AgentBackend, AgentOutput, AgentSession, BackendType, SpawnConfig, apply_hide_window,
+    send_agent_output,
+};
 use crate::{Error, Result};
 
 /// Channel buffer size for agent output events.
@@ -180,6 +183,7 @@ impl CodexBackend {
             cmd.env(k, v);
         }
 
+        apply_hide_window(&mut cmd);
         cmd.kill_on_drop(true);
         let child = cmd.spawn().map_err(|e| Error::SpawnFailed {
             name: config.name.clone(),
