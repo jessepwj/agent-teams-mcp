@@ -272,10 +272,12 @@ fn uninstall_global() -> Result<(), Box<dyn std::error::Error>> {
 fn install_global_at(home: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mcp_path = global_claude_json_path(home);
     let settings_path = global_claude_settings_path(home);
-    let mcp_json = merged_global_mcp_json(&mcp_path)?;
-    let settings_json = merged_global_claude_settings_json(&settings_path)?;
-    write_json_pretty(&mcp_path, &mcp_json)?;
-    write_json_pretty(&settings_path, &settings_json)?;
+    if let Some(mcp_json) = merged_global_mcp_json(&mcp_path)? {
+        write_json_pretty(&mcp_path, &mcp_json)?;
+    }
+    if let Some(settings_json) = merged_global_claude_settings_json(&settings_path)? {
+        write_json_pretty(&settings_path, &settings_json)?;
+    }
     legacy_v2_hook_warning_section(home)
 }
 
@@ -406,7 +408,7 @@ fn init_project(target: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn merged_global_mcp_json(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
+fn merged_global_mcp_json(path: &Path) -> Result<Option<Value>, Box<dyn std::error::Error>> {
     let mut value = if path.exists() {
         read_json_file(path)?
     } else {
@@ -419,44 +421,56 @@ fn merged_global_mcp_json(path: &Path) -> Result<Value, Box<dyn std::error::Erro
         .as_object_mut()
         .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?;
     let servers = ensure_object_field(root, "mcpServers", path)?;
-    if servers.contains_key("team-mode") {
+    let expected = global_team_mode_mcp_server_json();
+    if let Some(existing) = servers.get("team-mode") {
+        if *existing == expected {
+            return Ok(None);
+        }
         return Err(format!(
-            "{} already contains mcpServers.team-mode; merge manually",
+            "{} already contains mcpServers.team-mode with different config; merge manually",
             path.display()
         )
         .into());
     }
-    servers.insert("team-mode".into(), global_team_mode_mcp_server_json());
-    Ok(value)
+    servers.insert("team-mode".into(), expected);
+    Ok(Some(value))
 }
 
-fn merged_global_claude_settings_json(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
+fn merged_global_claude_settings_json(
+    path: &Path,
+) -> Result<Option<Value>, Box<dyn std::error::Error>> {
     let mut value = if path.exists() {
         read_json_file(path)?
     } else {
         json!({})
     };
 
-    if settings_has_global_team_mode_hook(&value) {
-        return Err(format!(
-            "{} already contains Team Mode install-global hooks; merge manually",
-            path.display()
-        )
-        .into());
-    }
-
     let root = value
         .as_object_mut()
         .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?;
     let hooks = ensure_object_field(root, "hooks", path)?;
-    append_hook_entry(hooks, "Stop", global_stop_hook_entry(), path)?;
-    append_hook_entry(
-        hooks,
-        "PostToolUse",
-        global_post_tool_use_hook_entry(),
-        path,
-    )?;
-    Ok(value)
+    let mut changed = false;
+    if !hook_event_has_command(hooks, "Stop", "team_mode_service hook async-wake") {
+        append_hook_entry(hooks, "Stop", global_stop_hook_entry(), path)?;
+        changed = true;
+    }
+    if !hook_event_has_command(hooks, "PostToolUse", "team_mode_service hook mid-turn") {
+        append_hook_entry(
+            hooks,
+            "PostToolUse",
+            global_post_tool_use_hook_entry(),
+            path,
+        )?;
+        changed = true;
+    }
+    if changed { Ok(Some(value)) } else { Ok(None) }
+}
+
+fn hook_event_has_command(hooks: &Map<String, Value>, event: &str, needle: &str) -> bool {
+    hooks
+        .get(event)
+        .map(|v| json_contains_command(v, needle))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -808,11 +822,6 @@ fn append_hook_entry(
 fn settings_has_lead_pending_hook(value: &Value) -> bool {
     json_contains_command(value, "lead-pending-async-wake.js")
         || json_contains_command(value, "lead-pending-mid-turn.js")
-}
-
-fn settings_has_global_team_mode_hook(value: &Value) -> bool {
-    json_contains_command(value, "team_mode_service hook async-wake")
-        || json_contains_command(value, "team_mode_service hook mid-turn")
 }
 
 fn remove_global_mcp_server(
@@ -1217,12 +1226,14 @@ mod tests {
     }
 
     #[test]
-    fn install_global_errors_when_user_mcp_already_has_team_mode_server() {
+    fn install_global_errors_when_user_mcp_team_mode_entry_differs() {
+        // If user's ~/.claude.json has a `team-mode` entry with a different value
+        // than what install-global would write, refuse to clobber.
         let home = tempdir().unwrap();
         let mcp_path = home.path().join(".claude.json");
         fs::write(
             &mcp_path,
-            r#"{"mcpServers":{"team-mode":{"command":"team_mode_service","args":["relay"]}}}"#,
+            r#"{"mcpServers":{"team-mode":{"command":"some_other_binary","args":["relay"]}}}"#,
         )
         .unwrap();
         let settings_path = home.path().join(".claude/settings.json");
@@ -1233,28 +1244,60 @@ mod tests {
 
         assert!(err.contains(".claude.json"), "got: {err}");
         assert!(err.contains("mcpServers.team-mode"), "got: {err}");
-        assert!(err.contains("merge manually"), "got: {err}");
+        assert!(err.contains("different config"), "got: {err}");
     }
 
     #[test]
-    fn install_global_errors_when_user_settings_already_have_team_mode_hook() {
+    fn install_global_is_idempotent_when_already_installed() {
+        // Re-running install-global on an already-installed home succeeds as a no-op
+        // and leaves the files byte-identical (no spurious rewrites).
         let home = tempdir().unwrap();
-        let mcp_path = home.path().join(".claude.json");
-        fs::write(&mcp_path, r#"{"mcpServers":{}}"#).unwrap();
-        let settings_path = home.path().join(".claude/settings.json");
-        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+        install_global_at(home.path()).unwrap();
+        let mcp_after_first = fs::read_to_string(home.path().join(".claude.json")).unwrap();
+        let settings_after_first =
+            fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+
+        // Second invocation must not error and must not change file contents.
+        let warning = install_global_at(home.path()).unwrap();
+        assert!(warning.is_none());
+        let mcp_after_second = fs::read_to_string(home.path().join(".claude.json")).unwrap();
+        let settings_after_second =
+            fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(mcp_after_first, mcp_after_second);
+        assert_eq!(settings_after_first, settings_after_second);
+    }
+
+    #[test]
+    fn install_global_repairs_partial_install_when_hook_was_removed() {
+        // Real-world scenario: user ran install-global once (mcp + hooks both written).
+        // Later something cleared `~/.claude/settings.json` hooks. Re-running
+        // install-global must add the missing hook without erroring on the
+        // already-present mcp entry.
+        let home = tempdir().unwrap();
+        install_global_at(home.path()).unwrap();
+        // Simulate hook loss while mcp entry remains.
         fs::write(
-            &settings_path,
-            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"team_mode_service hook async-wake"}]}]}}"#,
+            home.path().join(".claude/settings.json"),
+            r#"{"effortLevel":"high"}"#,
         )
         .unwrap();
 
-        let err = install_global_at(home.path()).unwrap_err().to_string();
-        let err = err.replace('\\', "/");
+        let warning = install_global_at(home.path()).unwrap();
+        assert!(warning.is_none());
 
-        assert!(err.contains(".claude/settings.json"), "got: {err}");
-        assert!(err.contains("Team Mode install-global hooks"), "got: {err}");
-        assert!(err.contains("merge manually"), "got: {err}");
+        let settings = read_json_file(&home.path().join(".claude/settings.json")).unwrap();
+        // Pre-existing user fields must survive.
+        assert_eq!(settings["effortLevel"], "high");
+        // Hooks must be re-added.
+        assert!(json_contains_command(
+            &settings,
+            "team_mode_service hook async-wake"
+        ));
+        assert!(json_contains_command(
+            &settings,
+            "team_mode_service hook mid-turn"
+        ));
     }
 
     #[test]

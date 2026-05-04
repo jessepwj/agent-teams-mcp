@@ -113,6 +113,7 @@ pub(crate) fn relay_stdio(
     cli_project_root: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let project_root = project_root(cli_project_root.as_deref())?;
+    log_relay_startup_diagnostic(&project_root, cli_project_root.as_deref());
     let client = http_client()?;
     let runtime = ensure_runtime_for_relay(&project_root, data_dir_override.as_deref(), &client)?;
     // Token is read from disk once: it doesn't change for the lifetime of
@@ -353,6 +354,31 @@ pub(crate) fn project_root(
     Ok(env::current_dir()?)
 }
 
+/// Emit a one-shot diagnostic line so post-mortems can tell whether a relay
+/// instance picked the correct project_root. Goes to stderr (Claude Code
+/// captures MCP server stderr into its logs). Single line, easy to grep.
+fn log_relay_startup_diagnostic(resolved: &Path, cli_project_root: Option<&Path>) {
+    let cli_arg = cli_project_root
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    let env_claude_project_dir = env::var("CLAUDE_PROJECT_DIR").unwrap_or_else(|_| String::new());
+    let cwd = env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unavailable>".to_string());
+    eprintln!(
+        "[team_mode_service relay] startup pid={} resolved_project_root={} cwd={} cli_arg={} env_CLAUDE_PROJECT_DIR={}",
+        std::process::id(),
+        resolved.display(),
+        cwd,
+        cli_arg,
+        if env_claude_project_dir.is_empty() {
+            "<unset>".to_string()
+        } else {
+            env_claude_project_dir
+        }
+    );
+}
+
 fn legacy_runtime_info_path(project_root: &Path) -> PathBuf {
     project_root
         .join(".agent-teams")
@@ -389,6 +415,13 @@ fn service_exe_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn project_has_team_registration(project_root: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    project_has_team_registration_with_home(project_root, dirs::home_dir().as_deref())
+}
+
+fn project_has_team_registration_with_home(
+    project_root: &Path,
+    home: Option<&Path>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mcp = project_root.join(".mcp.json");
     if mcp.exists() {
         if let Ok(value) = read_json_file(&mcp) {
@@ -404,6 +437,30 @@ fn project_has_team_registration(project_root: &Path) -> Result<bool, Box<dyn st
     ] {
         if path.exists() {
             if let Ok(value) = read_json_file(&path) {
+                if settings_has_team_mode_hooks(&value) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    // Fallback: if Team Mode is installed at user scope (~/.claude.json mcpServers
+    // or ~/.claude/settings.json hooks), every project participates by default.
+    // Without this, projects that never ran `team_mode_service init` would have
+    // their Stop hook silently exit — exactly the BUG-3 scenario from the
+    // 2026-05-04 cross-project test handoff.
+    if let Some(home) = home {
+        let global_mcp = home.join(".claude.json");
+        if global_mcp.exists() {
+            if let Ok(value) = read_json_file(&global_mcp) {
+                if mcp_json_has_team_mode(&value) {
+                    return Ok(true);
+                }
+            }
+        }
+        let global_settings = home.join(".claude").join("settings.json");
+        if global_settings.exists() {
+            if let Ok(value) = read_json_file(&global_settings) {
                 if settings_has_team_mode_hooks(&value) {
                     return Ok(true);
                 }

@@ -66,7 +66,54 @@ fn service_lock_is_idempotent() {
 #[test]
 fn project_registration_detection_ignores_empty_project() {
     let dir = tempdir().unwrap();
-    assert!(!project_has_team_registration(dir.path()).unwrap());
+    // Pass home=None to isolate from the developer's actual ~/.claude.json so
+    // the test is hermetic regardless of whether Team Mode is install-global'd.
+    assert!(!project_has_team_registration_with_home(dir.path(), None).unwrap());
+}
+
+#[test]
+fn project_registration_detection_accepts_global_mcp_install() {
+    // BUG-3 regression: a project with no local .mcp.json / .claude config
+    // should still trigger the Stop hook when the user has install-global'd
+    // team-mode at user scope (~/.claude.json mcpServers.team-mode).
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join(".claude.json"),
+        r#"{"mcpServers":{"team-mode":{"command":"team_mode_service","args":["relay"],"env":{}}}}"#,
+    )
+    .unwrap();
+    assert!(project_has_team_registration_with_home(project.path(), Some(home.path())).unwrap());
+}
+
+#[test]
+fn project_registration_detection_accepts_global_hook_install() {
+    // BUG-3 regression: a project with no local config but global Stop hook
+    // installed should also be considered registered.
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".claude")).unwrap();
+    fs::write(
+        home.path().join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"team_mode_service hook async-wake"}]}]}}"#,
+    )
+    .unwrap();
+    assert!(project_has_team_registration_with_home(project.path(), Some(home.path())).unwrap());
+}
+
+#[test]
+fn project_registration_detection_ignores_unrelated_global_config() {
+    // Defensive: a global ~/.claude.json that has no team-mode entry must
+    // still resolve to "not registered" — don't accidentally match unrelated
+    // mcpServers entries.
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join(".claude.json"),
+        r#"{"mcpServers":{"some-other-server":{"command":"x"}}}"#,
+    )
+    .unwrap();
+    assert!(!project_has_team_registration_with_home(project.path(), Some(home.path())).unwrap());
 }
 
 #[test]
