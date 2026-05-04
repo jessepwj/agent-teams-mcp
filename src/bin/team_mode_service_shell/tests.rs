@@ -102,6 +102,59 @@ fn project_registration_detection_accepts_global_hook_install() {
 }
 
 #[test]
+fn persist_lead_session_id_writes_pid_to_session_id_map() {
+    // BUG-10 regression: every Stop hook fire must record the calling CC's
+    // {pid → session_id} into the project's .lead-sessions.json so the
+    // web UI's `lookup_lead_session_id` can pick the right Claude Code
+    // JSONL when multiple CCs share the same cwd.
+    let project = tempdir().unwrap();
+    persist_lead_session_id(project.path(), Some(12345), "abc-session-id").unwrap();
+    let path = project.path().join(".lead-sessions.json");
+    assert!(path.is_file(), "sidecar must be created at project root");
+    let content = fs::read_to_string(&path).unwrap();
+    let parsed: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(parsed["12345"]["session_id"], "abc-session-id");
+    assert!(parsed["12345"]["updated_at"].is_string());
+}
+
+#[test]
+fn persist_lead_session_id_merges_multiple_cc_pids_without_clobber() {
+    // Two different CCs in the same cwd — the second hook fire must add
+    // its entry without removing the first. (Multi-CC-same-cwd is the
+    // exact scenario where BUG-10 manifests.)
+    let project = tempdir().unwrap();
+    persist_lead_session_id(project.path(), Some(111), "session-a").unwrap();
+    persist_lead_session_id(project.path(), Some(222), "session-b").unwrap();
+    let content = fs::read_to_string(project.path().join(".lead-sessions.json")).unwrap();
+    let parsed: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(parsed["111"]["session_id"], "session-a");
+    assert_eq!(parsed["222"]["session_id"], "session-b");
+}
+
+#[test]
+fn persist_lead_session_id_overwrites_same_pid_with_latest_session() {
+    // A single CC restarts with the same PID (rare but possible after a
+    // PID reuse). The newer session_id must replace the older one so the
+    // web UI never points the lead pane at a stale JSONL.
+    let project = tempdir().unwrap();
+    persist_lead_session_id(project.path(), Some(555), "old-session").unwrap();
+    persist_lead_session_id(project.path(), Some(555), "new-session").unwrap();
+    let content = fs::read_to_string(project.path().join(".lead-sessions.json")).unwrap();
+    let parsed: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(parsed["555"]["session_id"], "new-session");
+}
+
+#[test]
+fn persist_lead_session_id_noop_when_pid_missing() {
+    // owner_cc_pid() can return None on a wrapper-walk failure; in that
+    // case skip the write rather than poisoning the file with a "null"
+    // key entry that the web UI couldn't disambiguate against.
+    let project = tempdir().unwrap();
+    persist_lead_session_id(project.path(), None, "any").unwrap();
+    assert!(!project.path().join(".lead-sessions.json").exists());
+}
+
+#[test]
 fn read_cc_session_cwd_returns_cwd_field_from_session_file() {
     // BUG-1 fix: relay must trust the CC session file's `cwd` over its own
     // process cwd, because Claude Code on Windows can spawn MCP subprocesses

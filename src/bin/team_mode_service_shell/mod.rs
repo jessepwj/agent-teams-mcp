@@ -206,6 +206,16 @@ pub(crate) fn run_async_wake_hook() -> ! {
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    // BUG-10: persist a {cc_pid → claude_session_id} map at the project
+    // root so the web UI can disambiguate which CC instance owns each
+    // team's lead conversation. Multiple CCs in the same cwd otherwise
+    // cause the lead pane to render the most-recently-active CC's
+    // JSONL (mtime-fallback inside `lookup_lead_session_id`), which is
+    // exactly the cross-CC bleed the user reported on 2026-05-04.
+    if let Some(ref sid) = session_id {
+        let _ = persist_lead_session_id(&project_root, owner_cc_pid(), sid);
+    }
+
     let client = match http_client() {
         Ok(client) => client,
         Err(err) => exit_with_hook_error(err),
@@ -368,6 +378,44 @@ pub(crate) fn project_root(
         }
     }
     Ok(env::current_dir()?)
+}
+
+/// Persist a {cc_pid → claude_session_id} entry into the project's
+/// `.lead-sessions.json` sidecar so the web UI can pick the right CC's
+/// JSONL when several CCs share the same cwd. Atomic write via tmp +
+/// rename so a concurrent hook fire never reads a half-written file.
+///
+/// On any error (missing PID, I/O failure, JSON corruption) we silently
+/// give up — the web UI then falls back to mtime-based session picking,
+/// which is the legacy behavior. This sidecar is purely a hint.
+fn persist_lead_session_id(project_root: &Path, cc_pid: Option<u32>, session_id: &str) -> io::Result<()> {
+    let Some(pid) = cc_pid else {
+        return Ok(());
+    };
+    let path = project_root.join(".lead-sessions.json");
+    let mut map = match fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str::<Value>(&content).unwrap_or(Value::Object(Default::default())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Value::Object(Default::default()),
+        Err(err) => return Err(err),
+    };
+    if !map.is_object() {
+        map = Value::Object(Default::default());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(obj) = map.as_object_mut() {
+        obj.insert(
+            pid.to_string(),
+            serde_json::json!({
+                "session_id": session_id,
+                "updated_at": now,
+            }),
+        );
+    }
+    let serialized = serde_json::to_vec_pretty(&map).map_err(io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &serialized)?;
+    fs::rename(tmp, &path)?;
+    Ok(())
 }
 
 /// Read `~/.claude/sessions/<pid>.json` and return its `cwd` field.

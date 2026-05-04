@@ -185,10 +185,35 @@ impl TeamModeToolset {
             execution: Some(execution.clone()),
         };
         self.member_store.upsert(record.clone())?;
-        let prompt = execution
+        // BUG-8 root cause was here: the prior default system_prompt was
+        // literally `"You are alice"`. Codex / Claude saw that thin framing
+        // plus a tool list and defaulted to chat-style text output — the
+        // lead saw nothing because plain text never traverses the
+        // send_message route. Even when the user message explicitly told
+        // alice to "use send_message", the worker often ignored it.
+        // Always prepend a Team Mode Protocol header so the worker's first
+        // tokens reinforce that replies are tool calls, not chat. The
+        // user-supplied system_prompt (when present) is preserved verbatim
+        // under a "## Your role" section.
+        let user_role = execution
             .system_prompt
             .clone()
-            .unwrap_or_else(|| format!("You are {}", worker_name));
+            .unwrap_or_else(|| format!("You are {worker_name}, a worker in team `{team_name}`."));
+        let prompt = format!(
+            "## Team Mode Protocol (auto-injected, DO NOT ignore)\n\
+             You are `{worker_name}`, a worker in team `{team_name}` led by `lead`.\n\n\
+             **You communicate ONLY via the `mcp__team-mode__send_message` tool.**\n\
+             Plain text in your turn output is INVISIBLE to the lead — the lead sees \
+             ONLY messages you route through `send_message`. Every reply intended for \
+             the lead MUST be a tool call: `send_message(team=\"{team_name}\", \
+             text=\"@lead <your reply>\")`.\n\n\
+             Ending your turn without calling `send_message` is a silent failure: the \
+             lead receives no answer, only an `[INFO] worker completed turn without a \
+             routed team message` status notice. Do not finish a turn that was meant \
+             as a reply without first calling `send_message`.\n\n\
+             ## Your role\n\
+             {user_role}",
+        );
         let mut config = SpawnConfig::new(
             execution
                 .agent_name
