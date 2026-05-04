@@ -181,6 +181,30 @@ impl TeamService {
             )));
         }
 
+        // Per-CC-per-project ownership cap: a single CC instance can own at
+        // most one active team in a given project. Without this, a CC that
+        // calls team_create twice with different names ends up owning two
+        // active teams, which makes /lead-pending/my-teams ambiguous and
+        // leaves Stop hook routing nondeterministic. The limit is keyed on
+        // owner_cc_pid, so a CC restart (new PID) starts fresh; if the old
+        // team's owner is dead, lead-watchdog archives it within 15s and the
+        // check below stops matching.
+        if let Some(owner_pid) = request.owner_cc_pid {
+            if let Some(existing_team) = existing.iter().find(|t| {
+                t.status == TeamStatus::Active
+                    && t.name != request.name
+                    && t.owner_cc_pid == Some(owner_pid)
+            }) {
+                return Err(Error::Other(format!(
+                    "your CC (pid={}) already owns active team '{}' in this project. \
+                     A single CC may own only one active team per project — \
+                     archive or delete '{}' first (e.g. team_delete({{name:'{}'}})), \
+                     or pass overwrite=true to wipe everything.",
+                    owner_pid, existing_team.name, existing_team.name, existing_team.name
+                )));
+            }
+        }
+
         let team_id = match request.id {
             Some(id) => id,
             None => loop {
@@ -457,6 +481,100 @@ mod tests {
             overwrite: false,
         });
         assert!(matches!(&err, Err(Error::Other(msg)) if msg.contains("another live lead PID")));
+    }
+
+    #[test]
+    fn create_rejects_when_same_cc_already_owns_a_different_active_team() {
+        // Per-CC-per-project ownership cap: a single CC may own at most one
+        // active team in a given project. Without this guard, a CC that
+        // calls team_create twice with different names ends up owning two
+        // active teams, which makes /lead-pending/my-teams ambiguous and
+        // leaves Stop hook routing nondeterministic.
+        let dir = tempdir().unwrap();
+        let service = TeamService::new(TeamStore::new(dir.path()));
+
+        service
+            .create(CreateTeamRequest {
+                id: Some("team-a".into()),
+                name: "Alpha".into(),
+                description: None,
+                cwd: None,
+                lead_member_id: None,
+                owner_cc_pid: Some(424242),
+                overwrite: false,
+            })
+            .unwrap();
+
+        let err = service.create(CreateTeamRequest {
+            id: Some("team-b".into()),
+            name: "Beta".into(),
+            description: None,
+            cwd: None,
+            lead_member_id: None,
+            owner_cc_pid: Some(424242),
+            overwrite: false,
+        });
+        let msg = match err {
+            Err(Error::Other(msg)) => msg,
+            other => panic!("expected Error::Other, got {other:?}"),
+        };
+        assert!(msg.contains("already owns active team 'Alpha'"), "got: {msg}");
+        assert!(msg.contains("424242"), "got: {msg}");
+    }
+
+    #[test]
+    fn create_allows_different_owners_to_have_separate_teams() {
+        // The cap is per-CC, not per-project. Two distinct CCs (different
+        // owner_cc_pid) can still create their own teams in the same
+        // project. This is the multi-team-per-project use case and must
+        // keep working.
+        let dir = tempdir().unwrap();
+        let service = TeamService::new(TeamStore::new(dir.path()));
+        service
+            .create(CreateTeamRequest {
+                id: Some("team-a".into()),
+                name: "Alpha".into(),
+                description: None,
+                cwd: None,
+                lead_member_id: None,
+                owner_cc_pid: Some(111),
+                overwrite: false,
+            })
+            .unwrap();
+        service
+            .create(CreateTeamRequest {
+                id: Some("team-b".into()),
+                name: "Beta".into(),
+                description: None,
+                cwd: None,
+                lead_member_id: None,
+                owner_cc_pid: Some(222),
+                overwrite: false,
+            })
+            .unwrap();
+        assert_eq!(service.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn create_allows_anonymous_owner_to_create_unlimited_teams() {
+        // When owner_cc_pid is None (legacy / non-CC callers), the cap is
+        // skipped — there's no PID to bucket against.
+        let dir = tempdir().unwrap();
+        let service = TeamService::new(TeamStore::new(dir.path()));
+        for (id, name) in [("a", "Alpha"), ("b", "Beta"), ("c", "Gamma")] {
+            service
+                .create(CreateTeamRequest {
+                    id: Some(id.into()),
+                    name: name.into(),
+                    description: None,
+                    cwd: None,
+                    lead_member_id: None,
+                    owner_cc_pid: None,
+                    overwrite: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(service.list().unwrap().len(), 3);
     }
 
     #[test]
