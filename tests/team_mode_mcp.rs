@@ -258,13 +258,15 @@ fn team_create_sets_up_lead_and_supports_worker_list() {
     // 5. cleanup
     let resp = call(&mut rt, 6, "team_delete", json!({"name": "alpha"}));
     assert_tool_ok(&resp);
+    let deleted = first_json(&resp);
+    assert_eq!(deleted["archived"], json!(true));
+    assert_eq!(deleted["deleted"], json!(false));
 
     let resp = call(&mut rt, 7, "team_list", json!({}));
-    let text = first_text(&resp);
-    assert!(
-        !text.contains("alpha"),
-        "deleted team still in list: {text}"
-    );
+    let list = first_json(&resp);
+    let teams = list["teams"].as_array().unwrap();
+    let team = teams.iter().find(|t| t["name"] == "alpha").unwrap();
+    assert_eq!(team["status"], json!("archived"));
 }
 
 // ---------------------------------------------------------------------------

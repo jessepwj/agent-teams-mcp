@@ -11,8 +11,8 @@ Implement v3.1 project isolation for the durable HTTP Team Mode service.
 ## Steps
 
 - [x] Step 1: Propagate `X-Team-Mode-Project-Root` through relay/hooks/HTTP context and scope MCP handlers to caller project data.
-- [ ] Step 2: Harden `team_create` conflict handling, same-owner rebind, archived revive, and `overwrite=true`.
-- [ ] Step 3: Make `team_delete` archive by default and keep permanent delete explicit.
+- [x] Step 2: Harden `team_create` conflict handling, same-owner rebind, archived revive, and `overwrite=true`.
+- [x] Step 3: Make `team_delete` archive by default and keep permanent delete explicit.
 - [ ] Step 4: Port service lead-watchdog to auto-archive dead-owner teams without exiting the service.
 - [ ] Step 5: Return active + archived teams from project-scoped `team_list` and update docs/ADR.
 

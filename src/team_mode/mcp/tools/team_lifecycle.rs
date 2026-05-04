@@ -79,6 +79,7 @@ impl TeamModeToolset {
 
     pub(super) fn team_delete(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
         let team_name = required_identifier(args, "name")?;
+        let permanent = optional_bool(args, "permanent")?.unwrap_or(false);
         let mut shutdown_failures: Vec<Value> = Vec::new();
 
         // Best-effort shutdown for every managed worker; collect failures
@@ -142,15 +143,17 @@ impl TeamModeToolset {
             }
         }
 
-        self.team_service.delete(&team_name)?;
+        let outcome = self.team_service.delete(&team_name, permanent)?;
         let _ = self.runtime_workers.remove_team(&team_name);
-        // Per-team pending file lives under `<base_dir>/<team_id>/` and is
-        // removed by `team_service.delete()` (which calls TeamStore::delete
-        // → fs::remove_dir_all on the team_dir). No separate prune needed.
+        // Per-team pending file lives under `<base_dir>/<team_id>/`.
+        // Archive mode keeps the directory so the team can be revived later;
+        // permanent mode still prunes it through TeamStore::delete().
 
         let result = json!({
             "ok": true,
             "name": team_name.clone(),
+            "archived": outcome.archived,
+            "deleted": outcome.deleted,
             "shutdown_failures": shutdown_failures,
         });
 

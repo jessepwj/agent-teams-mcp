@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::error::Result;
 use crate::team_mode::data_dir::{self, TEAM_FILE};
-use crate::team_mode::domain::Team;
+use crate::team_mode::domain::{Team, TeamStatus};
 use crate::team_mode::storage::{
     acquire_lock_path, ensure_dir, read_json_opt, validate_storage_name,
 };
@@ -12,6 +12,12 @@ use crate::util::atomic_write::atomic_write_json;
 #[derive(Debug, Clone)]
 pub struct TeamStore {
     base_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamDeleteMode {
+    Archive,
+    Permanent,
 }
 
 impl TeamStore {
@@ -76,14 +82,28 @@ impl TeamStore {
         Ok(teams)
     }
 
-    pub fn delete(&self, team_id: impl AsRef<str>) -> Result<()> {
+    pub fn delete(&self, team_id: impl AsRef<str>, mode: TeamDeleteMode) -> Result<()> {
         let team_id = team_id.as_ref();
         validate_storage_name(team_id)?;
         ensure_dir(&self.base_dir.join(data_dir::DIR_LOCKS))?;
         let _lock = acquire_lock_path(&self.lock_for_teams())?;
         let team_dir = data_dir::team_dir(&self.base_dir, team_id);
-        if team_dir.exists() {
-            fs::remove_dir_all(&team_dir)?;
+        match mode {
+            TeamDeleteMode::Permanent => {
+                if team_dir.exists() {
+                    fs::remove_dir_all(&team_dir)?;
+                }
+            }
+            TeamDeleteMode::Archive => {
+                if !team_dir.exists() {
+                    return Ok(());
+                }
+                if let Some(mut team) = read_json_opt::<Team>(&self.team_file(team_id))? {
+                    team.status = TeamStatus::Archived;
+                    team.updated_at = chrono::Utc::now();
+                    atomic_write_json(&self.team_file(team_id), &team)?;
+                }
+            }
         }
         Ok(())
     }
@@ -156,8 +176,22 @@ mod tests {
         store.save(&sample_team("demo")).unwrap();
         assert!(dir.path().join("demo").exists());
 
-        store.delete("demo").unwrap();
+        store.delete("demo", TeamDeleteMode::Permanent).unwrap();
         assert!(!dir.path().join("demo").exists());
         assert!(store.get("demo").unwrap().is_none());
+    }
+
+    #[test]
+    fn archive_preserves_directory_and_marks_status() {
+        let dir = tempdir().unwrap();
+        let store = TeamStore::new(dir.path());
+        store.save(&sample_team("demo")).unwrap();
+
+        store.delete("demo", TeamDeleteMode::Archive).unwrap();
+        assert!(dir.path().join("demo").exists());
+        assert_eq!(
+            store.get("demo").unwrap().unwrap().status,
+            TeamStatus::Archived
+        );
     }
 }

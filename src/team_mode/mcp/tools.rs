@@ -341,8 +341,14 @@ impl TeamModeToolset {
             tool(
                 "team_delete",
                 "Delete a team and stop all its workers.",
-                "",
-                json_schema(&[("name", json!({"type":"string"}))], &["name"]),
+                "Defaults to archive; set permanent=true to irreversibly remove existing team data.",
+                json_schema(
+                    &[
+                        ("name", json!({"type":"string"})),
+                        ("permanent", json!({"type":"boolean"})),
+                    ],
+                    &["name"],
+                ),
             ),
             tool(
                 "worker_add",

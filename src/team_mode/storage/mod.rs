@@ -22,7 +22,7 @@ pub use member_store::{MemberRecord, MemberStore};
 pub use message_store::MessageStore;
 pub use projection_store::ProjectionStore;
 pub use room_store::RoomStore;
-pub use team_store::TeamStore;
+pub use team_store::{TeamDeleteMode, TeamStore};
 
 pub(crate) fn ensure_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;

@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::team_mode::domain::{Team, TeamStatus};
-use crate::team_mode::storage::TeamStore;
+use crate::team_mode::storage::{TeamDeleteMode, TeamStore};
 use crate::util::validate_name;
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,12 @@ pub struct CreateTeamOutcome {
     pub revived: bool,
     pub restored_from: Option<PathBuf>,
     pub discarded_teams: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteTeamOutcome {
+    pub archived: bool,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +67,8 @@ impl TeamService {
         let mut discarded_teams = Vec::new();
         if request.overwrite {
             for team in &existing {
-                self.team_store.delete(&team.id)?;
+                self.team_store
+                    .delete(&team.id, TeamDeleteMode::Permanent)?;
                 discarded_teams.push(team.id.clone());
             }
             existing.clear();
@@ -194,10 +201,21 @@ impl TeamService {
         self.team_store.list()
     }
 
-    pub fn delete(&self, team_id: impl AsRef<str>) -> Result<()> {
+    pub fn delete(&self, team_id: impl AsRef<str>, permanent: bool) -> Result<DeleteTeamOutcome> {
         let team_id = team_id.as_ref();
         match self.team_store.get(team_id)? {
-            Some(_) => self.team_store.delete(team_id),
+            Some(_) => {
+                let mode = if permanent {
+                    TeamDeleteMode::Permanent
+                } else {
+                    TeamDeleteMode::Archive
+                };
+                self.team_store.delete(team_id, mode)?;
+                Ok(DeleteTeamOutcome {
+                    archived: !permanent,
+                    deleted: permanent,
+                })
+            }
             None => Err(Error::TeamNotFound {
                 name: team_id.to_string(),
             }),
@@ -463,5 +481,36 @@ mod tests {
         let teams = service.list().unwrap();
         assert_eq!(teams.len(), 1);
         assert_eq!(teams[0].name, "Fresh");
+    }
+
+    #[test]
+    fn delete_archives_by_default_and_permanently_deletes_when_requested() {
+        let dir = tempdir().unwrap();
+        let service = TeamService::new(TeamStore::new(dir.path()));
+
+        service
+            .create(CreateTeamRequest {
+                id: Some("team-1".into()),
+                name: "Demo".into(),
+                description: None,
+                cwd: None,
+                lead_member_id: None,
+                owner_cc_pid: None,
+                overwrite: false,
+            })
+            .unwrap();
+
+        let archived = service.delete("team-1", false).unwrap();
+        assert!(archived.archived);
+        assert!(!archived.deleted);
+        assert_eq!(
+            service.get("team-1").unwrap().unwrap().status,
+            TeamStatus::Archived
+        );
+
+        let deleted = service.delete("team-1", true).unwrap();
+        assert!(!deleted.archived);
+        assert!(deleted.deleted);
+        assert!(service.get("team-1").unwrap().is_none());
     }
 }
