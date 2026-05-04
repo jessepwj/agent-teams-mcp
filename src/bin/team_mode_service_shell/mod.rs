@@ -898,6 +898,28 @@ fn http_client_with_timeout(
 
 fn spawn_service_detached(spec: &RelaySpawnSpec) -> Result<(), Box<dyn std::error::Error>> {
     let mut command = Command::new(&spec.service_exe);
+    // Redirect the service's stderr to a persistent log file under
+    // `~/.team-mode/runtime/service.log`. The service emits structured
+    // tracing (INFO `event=http_call_context` per MCP request, etc.) to
+    // stderr; without this, the lazy-spawn flow piped stderr to
+    // /dev/null and every diagnostic line vanished — making routing
+    // failures (BUG-11 cross-project header drop) impossible to debug
+    // post-mortem. Append mode so existing log history survives a
+    // service restart.
+    let stderr_target: Stdio = dirs::home_dir()
+        .map(|home| home.join(".team-mode").join("runtime").join("service.log"))
+        .and_then(|path| {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Stdio::from)
+        })
+        .unwrap_or_else(Stdio::null);
     command
         .arg("--project-root")
         .arg(&spec.project_root)
@@ -906,7 +928,7 @@ fn spawn_service_detached(spec: &RelaySpawnSpec) -> Result<(), Box<dyn std::erro
         .current_dir(&spec.project_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(stderr_target);
     if let Some(data_dir) = &spec.data_dir_override {
         command.arg("--data-dir").arg(data_dir);
     }
@@ -933,6 +955,23 @@ fn spawn_service_detached(spec: &RelaySpawnSpec) -> Result<(), Box<dyn std::erro
                 "relay spawn with CREATE_BREAKAWAY_FROM_JOB denied; retrying without it"
             );
             let mut retry = Command::new(&spec.service_exe);
+            // Mirror the primary spawn's stderr redirect so the
+            // fallback path (without CREATE_BREAKAWAY_FROM_JOB) also
+            // captures the tracing log.
+            let retry_stderr: Stdio = dirs::home_dir()
+                .map(|home| home.join(".team-mode").join("runtime").join("service.log"))
+                .and_then(|path| {
+                    if let Some(parent) = path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .ok()
+                        .map(Stdio::from)
+                })
+                .unwrap_or_else(Stdio::null);
             retry
                 .arg("--project-root")
                 .arg(&spec.project_root)
@@ -941,7 +980,7 @@ fn spawn_service_detached(spec: &RelaySpawnSpec) -> Result<(), Box<dyn std::erro
                 .current_dir(&spec.project_root)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stderr(retry_stderr);
             if let Some(data_dir) = &spec.data_dir_override {
                 retry.arg("--data-dir").arg(data_dir);
             }
