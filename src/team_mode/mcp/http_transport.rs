@@ -194,7 +194,24 @@ fn call_context_from_headers(headers: &HeaderMap) -> HttpCallContext {
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name)?.to_str().ok().filter(|s| !s.is_empty())
+    let value = headers.get(name)?;
+    // Fast path: visible ASCII (HTTP/1.1 spec). `HeaderValue::to_str()`
+    // bails on bytes >= 0x80, which silently drops Windows paths that
+    // contain CJK characters (e.g. `E:\aigc内容整理\...`). When that
+    // happens the service falls back to `--project-root`, defeating
+    // per-project isolation — exactly the BUG-6 we hit on 2026-05-04
+    // when projectA team_list returned projectB's smoke. Fall back to
+    // a UTF-8 view of the raw bytes so non-ASCII paths route correctly;
+    // axum/hyper accept these bytes inbound and `HeaderValue::from_bytes`
+    // accepts them outbound, so client and server stay symmetric.
+    if let Ok(s) = value.to_str() {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    std::str::from_utf8(value.as_bytes())
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn handle_payload(
@@ -427,6 +444,48 @@ mod tests {
     use axum::http::Request;
     use futures::executor::block_on;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn header_str_decodes_non_ascii_utf8_bytes() {
+        // BUG-6 regression: Windows project paths frequently contain CJK
+        // characters (e.g. `E:\aigc内容整理\agent-teams-rs-team-mode`).
+        // `HeaderValue::to_str()` rejects bytes >= 0x80, so without the
+        // UTF-8 fallback the service silently treats the header as missing
+        // and routes the request to its `--project-root` fallback,
+        // breaking per-project isolation.
+        let mut headers = HeaderMap::new();
+        let chinese_path = "E:\\aigc内容整理\\agent-teams-rs-team-mode";
+        headers.insert(
+            "x-team-mode-project-root",
+            axum::http::HeaderValue::from_bytes(chinese_path.as_bytes())
+                .expect("HeaderValue::from_bytes accepts non-ASCII"),
+        );
+        let resolved = header_str(&headers, "x-team-mode-project-root");
+        assert_eq!(resolved, Some(chinese_path));
+    }
+
+    #[test]
+    fn header_str_still_handles_pure_ascii_fast_path() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-team-mode-project-root",
+            axum::http::HeaderValue::from_static("C:/projects/foo"),
+        );
+        assert_eq!(
+            header_str(&headers, "x-team-mode-project-root"),
+            Some("C:/projects/foo")
+        );
+    }
+
+    #[test]
+    fn header_str_returns_none_for_empty_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-team-mode-project-root",
+            axum::http::HeaderValue::from_static(""),
+        );
+        assert_eq!(header_str(&headers, "x-team-mode-project-root"), None);
+    }
 
     #[test]
     fn injects_owner_and_worker_context_into_tools_call() {
