@@ -189,7 +189,11 @@ function openDashboardSse(teamId) {
   const EventSourceCtor = window.EventSource;
   const generation = dashboardConnectionGeneration;
   const cursorParam = encodeURIComponent(state.dashboard?.connection?.cursor || "");
-  const url = `/api/teams/${encodeURIComponent(teamId)}/events/stream?cursor=${cursorParam}`;
+  // BUG-7: SSE bypasses api()/apiPost(), so propagate ?project= manually.
+  const baseUrl = `/api/teams/${encodeURIComponent(teamId)}/events/stream?cursor=${cursorParam}`;
+  const url = typeof globalThis.withProjectQuery === "function"
+    ? globalThis.withProjectQuery(baseUrl)
+    : baseUrl;
   let source = null;
   try {
     source = new EventSourceCtor(url);

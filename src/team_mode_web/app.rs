@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::routes;
 use super::sse::{self, SseConfig};
 use super::state::{StaticBundleMode, TeamModeWebState};
+
+/// Suffix appended to a project_root to get its `.agent-teams/` data dir.
+const AGENT_TEAMS_DIR_NAME: &str = ".agent-teams";
 
 /// Cap incoming POST bodies. Messages are short text + a small mentions
 /// array, so 256 KiB is generous and prevents a misbehaving client from
@@ -20,7 +24,12 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct TeamModeWebApp {
-    state: Arc<TeamModeWebState>,
+    default_state: Arc<TeamModeWebState>,
+    /// Pinned base_dir captured at startup. Becomes the parent of every
+    /// per-project state when `?project=` resolves to its project_root.
+    /// Also the fallback when the request omits the project query.
+    default_base_dir: PathBuf,
+    project_states: Arc<Mutex<HashMap<PathBuf, Arc<TeamModeWebState>>>>,
     config: TeamModeWebServerConfig,
 }
 
@@ -30,18 +39,63 @@ impl TeamModeWebApp {
     }
 
     pub fn with_config(base_dir: impl Into<PathBuf>, config: TeamModeWebServerConfig) -> Self {
+        let base_dir: PathBuf = base_dir.into();
+        let default_state = Arc::new(TeamModeWebState::with_session_home_and_static_bundle(
+            base_dir.clone(),
+            config.session_home.clone(),
+            config.static_bundle.clone(),
+        ));
         Self {
-            state: Arc::new(TeamModeWebState::with_session_home_and_static_bundle(
-                base_dir,
-                config.session_home.clone(),
-                config.static_bundle.clone(),
-            )),
+            default_state,
+            default_base_dir: base_dir,
+            project_states: Arc::new(Mutex::new(HashMap::new())),
             config,
         }
     }
 
+    /// Look up the per-project `TeamModeWebState`. When `project_root` is
+    /// `None`, returns the startup default (matches legacy behavior). When
+    /// `Some(path)`, returns a cached state pinned to
+    /// `<path>/.agent-teams/`, constructing it lazily on first hit.
+    ///
+    /// BUG-7 fix: the web service used to be hard-pinned to the project that
+    /// lazy-spawned it (whichever CC reconnected first). A second CC in a
+    /// different project would open the team_create-emitted URL and see
+    /// `{teams: []}` even though its data was on disk. Per-request project
+    /// resolution lets both CCs share one web port and still see their own
+    /// data.
+    pub(crate) fn resolve_state(
+        &self,
+        project_root: Option<&Path>,
+    ) -> Arc<TeamModeWebState> {
+        let Some(project_root) = project_root else {
+            return Arc::clone(&self.default_state);
+        };
+        // If the requested project_root would resolve to the same base_dir
+        // we were started with, just hand back the pinned default state.
+        // Avoids constructing a duplicate TeamModeWebState (and a duplicate
+        // SHARED_MESSAGE_SERVICE-aware MessageService) for the common case.
+        let target_base = project_root.join(AGENT_TEAMS_DIR_NAME);
+        if same_path(&target_base, &self.default_base_dir) {
+            return Arc::clone(&self.default_state);
+        }
+        let mut cache = self.project_states.lock().expect("project_states mutex");
+        if let Some(state) = cache.get(&target_base) {
+            return Arc::clone(state);
+        }
+        let state = Arc::new(TeamModeWebState::with_session_home_and_static_bundle(
+            target_base.clone(),
+            self.config.session_home.clone(),
+            self.config.static_bundle.clone(),
+        ));
+        cache.insert(target_base, Arc::clone(&state));
+        state
+    }
+
     pub fn handle_request(&self, method: &str, target: &str) -> routes::WebResponse {
-        routes::handle_request(&self.state, method, target)
+        let project_root = project_root_from_query(target);
+        let state = self.resolve_state(project_root.as_deref());
+        routes::handle_request(&state, method, target)
     }
 
     pub fn handle_request_with_body(
@@ -50,8 +104,85 @@ impl TeamModeWebApp {
         target: &str,
         body: &[u8],
     ) -> routes::WebResponse {
-        routes::handle_request_with_body(&self.state, method, target, body)
+        let project_root = project_root_from_query(target);
+        let state = self.resolve_state(project_root.as_deref());
+        routes::handle_request_with_body(&state, method, target, body)
     }
+
+    pub fn handle_request_with_project(
+        &self,
+        method: &str,
+        target: &str,
+        body: &[u8],
+        project_root_header: Option<&str>,
+    ) -> routes::WebResponse {
+        let project_root = project_root_from_query(target)
+            .or_else(|| project_root_header.map(PathBuf::from));
+        let state = self.resolve_state(project_root.as_deref());
+        routes::handle_request_with_body(&state, method, target, body)
+    }
+}
+
+/// Extract `?project=<urlencoded path>` from a request target like
+/// `/api/teams?project=E%3A%5Caigc%5Copencode`. Returns the decoded path
+/// (using percent-encoding round-trip) or `None` when absent.
+fn project_root_from_query(target: &str) -> Option<PathBuf> {
+    let (_, query) = target.split_once('?')?;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("project=") {
+            let decoded = url_decode(value);
+            if !decoded.is_empty() {
+                return Some(PathBuf::from(decoded));
+            }
+        }
+    }
+    None
+}
+
+fn url_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = decode_hex(bytes[i + 1]);
+                let lo = decode_hex(bytes[i + 2]);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn decode_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        p.to_string_lossy().replace('/', "\\").to_lowercase()
+    }
+    norm(a) == norm(b)
 }
 
 #[derive(Debug, Clone)]
@@ -218,10 +349,25 @@ fn handle_stream(app: TeamModeWebApp, mut stream: TcpStream) -> std::io::Result<
         return Ok(());
     }
 
+    // Pull `X-Team-Mode-Project-Root` header (case-insensitive) for the
+    // multi-project router. The query string is preferred (matches the URL
+    // the team_create response embeds), but the header is honored as a
+    // backup so tools that prefer headers (curl, programmatic clients)
+    // still route correctly. BUG-7.
+    let project_root_header = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("x-team-mode-project-root"))
+        .map(|(_, value)| value.clone());
+
     if method == "GET" {
         if let Some(stream_request) = parse_sse_request(&target, &headers) {
+            // SSE also picks the per-project state so the streamed events
+            // come from the right project's room/inbox stores.
+            let sse_project_root = project_root_from_query(&target)
+                .or_else(|| project_root_header.as_deref().map(PathBuf::from));
+            let state = app.resolve_state(sse_project_root.as_deref());
             if let Err(err) = routes::validate_events_cursor(
-                &app.state,
+                &state,
                 &stream_request.team_id,
                 stream_request.initial_cursor.as_deref(),
             ) {
@@ -232,7 +378,7 @@ fn handle_stream(app: TeamModeWebApp, mut stream: TcpStream) -> std::io::Result<
             let elapsed_ms = started.elapsed().as_millis();
             eprintln!("[team_mode_web] {method} {target} -> 200 stream in {elapsed_ms}ms");
             return sse::stream_events(
-                app.state.clone(),
+                state,
                 stream,
                 stream_request.team_id,
                 stream_request.initial_cursor,
@@ -241,7 +387,12 @@ fn handle_stream(app: TeamModeWebApp, mut stream: TcpStream) -> std::io::Result<
         }
     }
 
-    let response = app.handle_request_with_body(&method, &target, body_slice);
+    let response = app.handle_request_with_project(
+        &method,
+        &target,
+        body_slice,
+        project_root_header.as_deref(),
+    );
     let elapsed_ms = started.elapsed().as_millis();
     write_response(&mut stream, &response)?;
     eprintln!(
@@ -311,4 +462,84 @@ fn write_response(stream: &mut TcpStream, response: &routes::WebResponse) -> std
     stream.write_all(header.as_bytes())?;
     stream.write_all(&response.body)?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod multi_project_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn project_root_from_query_extracts_urlencoded_path() {
+        // Windows path with backslashes + colon — must round-trip through
+        // %5C and %3A so the relay/CC can stash a path in `?project=`.
+        let target = "/api/teams?project=E%3A%5Caigc%5Copencode";
+        let parsed = project_root_from_query(target).unwrap();
+        assert_eq!(parsed.to_string_lossy(), r"E:\aigc\opencode");
+    }
+
+    #[test]
+    fn project_root_from_query_returns_none_when_absent() {
+        assert!(project_root_from_query("/api/teams").is_none());
+        assert!(project_root_from_query("/api/teams?other=value").is_none());
+        assert!(project_root_from_query("/").is_none());
+    }
+
+    #[test]
+    fn project_root_from_query_decodes_chinese_path() {
+        // BUG-7 + the v3.1 chinese-path bug we fixed earlier on the HTTP MCP
+        // service: per-project routing must not lose data when paths
+        // contain CJK characters (Windows users routinely have those).
+        let target = "/api/teams?project=E%3A%5Caigc%E5%86%85%E5%AE%B9%E6%95%B4%E7%90%86%5Copencode";
+        let parsed = project_root_from_query(target).unwrap();
+        assert_eq!(parsed.to_string_lossy(), r"E:\aigc内容整理\opencode");
+    }
+
+    #[test]
+    fn resolve_state_returns_default_for_no_query() {
+        let dir = tempdir().unwrap();
+        let app = TeamModeWebApp::new(dir.path().join(".agent-teams"));
+        let resolved = app.resolve_state(None);
+        // Both pointers identify the same Arc.
+        assert!(Arc::ptr_eq(&resolved, &app.default_state));
+    }
+
+    #[test]
+    fn resolve_state_caches_per_project() {
+        let dir = tempdir().unwrap();
+        // Pretend two project roots that are different from the startup one.
+        let project_b = dir.path().join("other-project-b");
+        let project_c = dir.path().join("other-project-c");
+        fs::create_dir_all(project_b.join(".agent-teams")).unwrap();
+        fs::create_dir_all(project_c.join(".agent-teams")).unwrap();
+
+        let app = TeamModeWebApp::new(dir.path().join(".agent-teams"));
+        let b1 = app.resolve_state(Some(&project_b));
+        let b2 = app.resolve_state(Some(&project_b));
+        let c1 = app.resolve_state(Some(&project_c));
+
+        // Same project resolves to same cached state.
+        assert!(Arc::ptr_eq(&b1, &b2));
+        // Different project resolves to a different state.
+        assert!(!Arc::ptr_eq(&b1, &c1));
+        // Neither is the startup default.
+        assert!(!Arc::ptr_eq(&b1, &app.default_state));
+        assert!(!Arc::ptr_eq(&c1, &app.default_state));
+    }
+
+    #[test]
+    fn resolve_state_short_circuits_to_default_when_project_matches_startup() {
+        // If `?project=` happens to resolve to the same on-disk base_dir as
+        // the startup default, resolve_state should hand back the pinned
+        // default state — not construct a duplicate. This avoids splitting
+        // shared message-service state across two seemingly-different
+        // states that point at the same files.
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().to_path_buf();
+        fs::create_dir_all(project_root.join(".agent-teams")).unwrap();
+        let app = TeamModeWebApp::new(project_root.join(".agent-teams"));
+        let resolved = app.resolve_state(Some(&project_root));
+        assert!(Arc::ptr_eq(&resolved, &app.default_state));
+    }
 }

@@ -1,5 +1,35 @@
+// BUG-7 fix: a single web port may serve multiple projects (one per CC).
+// The team_create response embeds the owning project_root in the URL as
+// ?project=<urlencoded>. Read it once on page load and propagate it on
+// every API request so the server's multi-project router can pick the
+// right `.agent-teams/` data dir. Without this, all fetches go to the
+// startup-time default project and a CC in another project sees empty
+// data.
+function readWebProjectRoot() {
+  try {
+    const params = new URLSearchParams(globalThis.location?.search || "");
+    const project = params.get("project");
+    return project && project.length > 0 ? project : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+const WEB_PROJECT_ROOT = readWebProjectRoot();
+
+function withProjectQuery(path) {
+  if (!WEB_PROJECT_ROOT) {
+    return path;
+  }
+  const encoded = encodeURIComponent(WEB_PROJECT_ROOT);
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}project=${encoded}`;
+}
+
 async function api(path) {
-  const response = await fetch(path, { headers: { Accept: "application/json" } });
+  const response = await fetch(withProjectQuery(path), {
+    headers: { Accept: "application/json" },
+  });
   if (!response.ok) {
     const err = new Error(`${response.status} ${response.statusText}`);
     err.status = response.status;
@@ -9,7 +39,7 @@ async function api(path) {
 }
 
 async function apiPost(path, payload) {
-  const response = await fetch(path, {
+  const response = await fetch(withProjectQuery(path), {
     method: "POST",
     headers: {
       "Content-Type": "application/json; charset=utf-8",
@@ -35,4 +65,9 @@ async function apiPost(path, payload) {
 Object.assign(globalThis, {
   api,
   apiPost,
+  // Exposed so app-conversation / SSE callers can build their EventSource
+  // URLs with the same project query — fetch() goes through api()/apiPost()
+  // already, but EventSource doesn't share that wrapper.
+  withProjectQuery,
+  WEB_PROJECT_ROOT,
 });

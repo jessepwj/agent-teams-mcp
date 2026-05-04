@@ -52,7 +52,18 @@ pub(super) fn open_team_web_ui(base_dir: &std::path::Path, team_id: &str) -> Tea
             };
         }
     };
-    let url = format!("{base_url}/#team={team_id}");
+    // Embed the project_root in the URL so the multi-project web router
+    // can route this request to the correct `.agent-teams/` data dir
+    // when several CCs (each in a different project) share one web port.
+    // Without this, a CC #2 in projectB would open the URL but the web
+    // service (pinned to whatever project lazy-spawned it first) would
+    // return projectA's empty team list. BUG-7 fix.
+    let project_root = base_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| base_dir.to_path_buf());
+    let project_query = url_encode(&project_root.to_string_lossy());
+    let url = format!("{base_url}/?project={project_query}#team={team_id}");
 
     match open_url_in_browser(&url) {
         Ok(()) => TeamWebStatus {
@@ -68,6 +79,26 @@ pub(super) fn open_team_web_ui(base_dir: &std::path::Path, team_id: &str) -> Tea
             error: Some(err),
         },
     }
+}
+
+/// Minimal RFC-3986-ish percent-encoder for path strings going into the
+/// `?project=` query. Encodes everything outside the unreserved set
+/// (alpha / digit / `-`, `_`, `.`, `~`) so Windows paths with backslashes,
+/// colons, spaces, and CJK characters round-trip safely. This avoids
+/// pulling in a `url`/`urlencoding` crate dependency for one call site.
+fn url_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0F) as usize] as char);
+        }
+    }
+    out
 }
 
 fn web_auto_open_disabled_reason() -> Option<String> {

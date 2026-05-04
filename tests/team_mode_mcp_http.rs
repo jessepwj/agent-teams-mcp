@@ -97,17 +97,27 @@ fn get_healthz() -> Request<Body> {
 }
 
 fn create_team_with_owner(base: &std::path::Path, id: &str, owner_cc_pid: u32) {
-    TeamService::new(TeamStore::new(base))
-        .create(CreateTeamRequest {
-            id: Some(id.into()),
-            name: id.into(),
-            description: None,
-            cwd: None,
-            lead_member_id: Some("lead".into()),
-            owner_cc_pid: Some(owner_cc_pid),
-            overwrite: false,
-        })
-        .unwrap();
+    // Write the team record directly via TeamStore so the test can stage
+    // arbitrary fixtures — including multi-team-per-CC layouts that the
+    // TeamService::create path now rejects (`feat: cap one CC to one
+    // active team per project`). This test isn't exercising the create
+    // policy; it's exercising the /lead-pending/my-teams routing logic,
+    // which must still correctly filter by owner_cc_pid regardless of
+    // how the on-disk fixture got there (e.g. migration from pre-cap
+    // data, or future tooling that bypasses the cap).
+    let now = chrono::Utc::now();
+    let team = agent_teams::team_mode::domain::Team {
+        id: id.into(),
+        name: id.into(),
+        description: None,
+        cwd: None,
+        status: agent_teams::team_mode::domain::TeamStatus::Active,
+        lead_member_id: Some("lead".into()),
+        owner_cc_pid: Some(owner_cc_pid),
+        created_at: now,
+        updated_at: now,
+    };
+    TeamStore::new(base).save(&team).unwrap();
 }
 
 async fn response_json(response: axum::response::Response) -> Value {
