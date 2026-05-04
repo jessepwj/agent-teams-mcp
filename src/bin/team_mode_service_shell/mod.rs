@@ -114,7 +114,7 @@ pub(crate) fn relay_stdio(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let project_root = project_root(cli_project_root.as_deref())?;
     log_relay_startup_diagnostic(&project_root, cli_project_root.as_deref());
-    let client = http_client()?;
+    let client = http_client_for_relay_forward()?;
     let runtime = ensure_runtime_for_relay(&project_root, data_dir_override.as_deref(), &client)?;
     // Token is read from disk once: it doesn't change for the lifetime of
     // a service instance and the relay can recover from a service restart
@@ -761,8 +761,27 @@ fn headers_to_json(headers: &HttpHeaders) -> Value {
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, Box<dyn std::error::Error>> {
+    http_client_with_timeout(Duration::from_secs(5))
+}
+
+/// Relay forwards tool calls (worker_add, team_create, etc.) over this client.
+/// Some tools (notably `worker_add` with codex spawn) take 5-15s normally and
+/// can exceed 30s on slow disks. The default 5s `http_client()` cuts those
+/// requests short, the relay returns Err, exits, and the CC sees
+/// `MCP error -32000: Connection closed` — even though the service-side spawn
+/// kept running and the worker came up. Use a generous ceiling here so
+/// long-running tool dispatches can complete and the relay can deliver the
+/// real response back to the CC.
+fn http_client_for_relay_forward() -> Result<reqwest::blocking::Client, Box<dyn std::error::Error>>
+{
+    http_client_with_timeout(Duration::from_secs(120))
+}
+
+fn http_client_with_timeout(
+    timeout: Duration,
+) -> Result<reqwest::blocking::Client, Box<dyn std::error::Error>> {
     Ok(reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(timeout)
         .build()?)
 }
 
