@@ -208,7 +208,23 @@ impl MemberStore {
     /// execution profile on the record so a subsequent fast-resume can
     /// re-activate it.
     pub fn mark_removed(&self, team_id: &str, name: &str) -> Result<bool> {
-        self.update(team_id, name, |m| m.status = MemberStatus::Removed)
+        // Setting top-level `status=Removed` is necessary but not sufficient:
+        // the inner `execution.session_state` was originally left untouched
+        // so a future `worker_add on_existing=reuse` could fast-resume from
+        // a still-`Running` profile. The reuse path now consults the
+        // orchestrator's live process map to decide whether the prior
+        // session is actually alive (worker.rs:131-144), so we no longer
+        // need to lie about the session state on disk. Flipping it to
+        // Stopped here keeps `members.json` honest — readers like the web
+        // UI and `worker_list` no longer show "alice running" inside a
+        // team where alice was just removed. (BUG-9 follow-up: previous
+        // patch fixed the archive code path but missed worker_remove.)
+        self.update(team_id, name, |m| {
+            m.status = MemberStatus::Removed;
+            if let Some(exec) = m.execution.as_mut() {
+                exec.session_state = Some(crate::ExecutionSessionState::Stopped);
+            }
+        })
     }
 
     /// Convenience accessor for the lead of a team, if any.
@@ -347,6 +363,44 @@ mod tests {
 
         let active = store.list_active("demo").unwrap();
         assert!(active.iter().all(|r| r.profile.name != "alice"));
+    }
+
+    #[test]
+    fn mark_removed_flips_execution_session_state_to_stopped() {
+        // BUG-9 regression: removing a worker must update the inner
+        // session_state, not just the top-level `status`. Otherwise
+        // `members.json` advertises a removed worker as "running",
+        // misleading every reader (web UI, worker_list, MCP responses).
+        let dir = tempdir().unwrap();
+        let store = MemberStore::new(dir.path());
+        let mut worker = sample_worker("demo", "alice");
+        worker.execution = Some(crate::team_mode::domain::ExecutionProfile {
+            execution_mode: crate::team_mode::domain::ExecutionMode::Managed,
+            adapter: Some("codex".into()),
+            agent_name: Some("alice".into()),
+            model: None,
+            cwd: None,
+            env: Default::default(),
+            system_prompt: None,
+            skills: Vec::new(),
+            session_state: Some(crate::ExecutionSessionState::Running),
+            session_id: Some("019df-running".into()),
+            reasoning_effort: None,
+        });
+        store.add(worker).unwrap();
+
+        store.mark_removed("demo", "alice").unwrap();
+
+        let alice = store.get("demo", "alice").unwrap().unwrap();
+        assert_eq!(alice.profile.status, MemberStatus::Removed);
+        let exec = alice.execution.expect("execution preserved for fast-resume");
+        assert_eq!(
+            exec.session_state,
+            Some(crate::ExecutionSessionState::Stopped)
+        );
+        // session_id stays so fast-resume still has the codex thread to
+        // attach to — only the liveness flag flips.
+        assert_eq!(exec.session_id.as_deref(), Some("019df-running"));
     }
 
     #[test]
