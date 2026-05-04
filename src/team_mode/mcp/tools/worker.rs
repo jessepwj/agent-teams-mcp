@@ -221,11 +221,23 @@ impl TeamModeToolset {
             .unwrap_or_else(|| format!("You are {worker_name}, a worker in team `{team_name}`."));
         let prompt = format!(
             "{base}\n\n\
-             IMPORTANT — Team Mode reply protocol:\n\
-             To reply to teammates (especially `@lead`), you MUST call the \
+             IMPORTANT — Team Mode reply protocol (auto-injected, DO NOT ignore):\n\
+             - Your team is `{team_name}` and your worker name is `{worker_name}`. \
+             Never invent a different team name or pass `cwd` arguments to MCP \
+             tools — those values are managed by the lead, not by you. If a \
+             tool's pre-filled context disagrees with this header, trust THIS \
+             header.\n\
+             - To reply to teammates (especially `@lead`), you MUST call the \
              `mcp__team-mode__send_message` tool. Plain text in your turn \
              output is INVISIBLE to the rest of the team. Example: \
-             `send_message(team=\"{team_name}\", text=\"@lead <your reply>\")`.",
+             `send_message(team=\"{team_name}\", text=\"@lead <your reply>\")`.\n\
+             - DO NOT call lead-only tools (`team_create`, `team_delete`, \
+             `worker_add`, `worker_remove`, `team_overwrite`). If a tool you \
+             called returns \"team not found\" or similar, REPORT it back to \
+             `@lead` via `send_message` — never self-recover by creating teams \
+             or adding workers. That self-recovery is the silent-failure \
+             pattern that surfaced as BUG-11 (worker accidentally creating a \
+             clone team in the wrong project).",
         );
         let mut config = SpawnConfig::new(
             execution
