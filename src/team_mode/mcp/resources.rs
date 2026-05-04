@@ -343,6 +343,7 @@ mod tests {
                 cwd: None,
                 lead_member_id: Some("lead".into()),
                 owner_cc_pid: None,
+                overwrite: false,
             })
             .unwrap();
         member_service

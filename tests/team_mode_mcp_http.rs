@@ -105,6 +105,7 @@ fn create_team_with_owner(base: &std::path::Path, id: &str, owner_cc_pid: u32) {
             cwd: None,
             lead_member_id: Some("lead".into()),
             owner_cc_pid: Some(owner_cc_pid),
+            overwrite: false,
         })
         .unwrap();
 }

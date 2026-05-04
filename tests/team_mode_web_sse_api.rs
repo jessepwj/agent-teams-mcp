@@ -44,6 +44,7 @@ fn seed_data(base_dir: &Path) {
             cwd: Some("E:/project".into()),
             lead_member_id: Some("lead".into()),
             owner_cc_pid: Some(42),
+            overwrite: false,
         })
         .unwrap();
     member_service

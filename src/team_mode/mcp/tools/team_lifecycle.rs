@@ -27,37 +27,18 @@ impl TeamModeToolset {
         // stdio calls use the same Rust ancestor walk. Push routing later
         // uses this to send worker replies only to the owner CC.
         let owner_cc_pid = optional_u32(args, "_owner_cc_pid")?.or_else(current_cc_pid);
+        let overwrite = optional_bool(args, "overwrite")?.unwrap_or(false);
 
-        // Enforce: one project = at most one LIVE team at a time.
-        //
-        // Rationale: workers consume real resources (subprocesses, model
-        // calls), and the lead CC is the coordinator. Allowing multiple
-        // live teams per project would let a single CC spawn runaway work
-        // by accident (forgetting to clean up old teams), and is the
-        // natural model the user thinks in (one project, one team-in-flight).
-        //
-        // Behavior:
-        //   - If any existing team has a still-alive owner_cc_pid → refuse
-        //     with a clear error listing which team and who owns it. Caller
-        //     must team_delete the existing one before creating a new one.
-        //   - If only orphan teams exist (owner CC is dead) → auto-clean
-        //     them and proceed. We report how many we reaped.
-        //   - If no teams exist → proceed cleanly.
-        let existing_team = self.team_service.get(&name)?;
-        let cleaned_orphans = if existing_team.is_some() {
-            Vec::new()
-        } else {
-            self.enforce_single_live_team(owner_cc_pid)?
-        };
-
-        let team = self.team_service.create(CreateTeamRequest {
+        let outcome = self.team_service.create_with_outcome(CreateTeamRequest {
             id: Some(name.clone()),
             name: name.clone(),
             description: None,
             cwd: optional_text(args, "cwd")?,
             lead_member_id: Some(LEAD_NAME.into()),
             owner_cc_pid,
+            overwrite,
         })?;
+        let team = outcome.team.clone();
 
         if self.member_service.get(&team.id, LEAD_NAME)?.is_none() {
             self.member_service.add(AddMemberRequest {
@@ -76,8 +57,17 @@ impl TeamModeToolset {
         let mut response = json!(team.clone());
         if let Value::Object(obj) = &mut response {
             obj.insert("web".into(), web_status.to_json());
-            if !cleaned_orphans.is_empty() {
-                obj.insert("cleaned_orphan_teams".into(), json!(cleaned_orphans));
+            if outcome.revived {
+                obj.insert("revived".into(), Value::Bool(true));
+            }
+            if let Some(restored_from) = outcome.restored_from {
+                obj.insert(
+                    "restored_from".into(),
+                    Value::String(restored_from.display().to_string()),
+                );
+            }
+            if !outcome.discarded_teams.is_empty() {
+                obj.insert("discarded_teams".into(), json!(outcome.discarded_teams));
             }
         }
 
@@ -85,80 +75,6 @@ impl TeamModeToolset {
             response,
             vec![team_uri(&team.id), inbox_uri(&team.id, LEAD_NAME)],
         ))
-    }
-
-    /// Enforce the "one live team per project" invariant.
-    ///
-    /// Returns the list of orphan team names that were auto-cleaned, so the
-    /// caller can surface them to the user. Fails hard if any LIVE team
-    /// (owner_cc_pid still alive per sysinfo) already exists — the caller
-    /// must explicitly delete that team first.
-    fn enforce_single_live_team(&self, _caller_pid: Option<u32>) -> Result<Vec<String>> {
-        use sysinfo::{Pid, ProcessesToUpdate, System};
-
-        let existing = self.team_service.list()?;
-        if existing.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut sys = System::new();
-        sys.refresh_processes(ProcessesToUpdate::All, true);
-        let is_live = |pid: u32| -> bool { sys.process(Pid::from_u32(pid)).is_some() };
-
-        let mut live = Vec::new();
-        let mut orphans = Vec::new();
-        for team in &existing {
-            match team.owner_cc_pid {
-                Some(pid) if is_live(pid) => live.push((team.id.clone(), pid)),
-                Some(_) => orphans.push(team.id.clone()),
-                None => {
-                    // Legacy / unbound team — treat conservatively as live
-                    // (can't verify death, don't auto-purge user data).
-                    live.push((team.id.clone(), 0));
-                }
-            }
-        }
-
-        if !live.is_empty() {
-            let listed = live
-                .iter()
-                .map(|(name, pid)| format!("'{}' (owner_cc_pid={})", name, pid))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(Error::Other(format!(
-                "this project already has {} live team(s): {}. \
-                 Only one live team per project is allowed — call `team_delete` \
-                 on the existing team before creating a new one.",
-                live.len(),
-                listed
-            )));
-        }
-
-        // Only orphans remain. Auto-clean them so the new team_create succeeds,
-        // but report back so the caller can surface what happened.
-        for orphan_id in &orphans {
-            if let Err(err) = self.team_service.delete(orphan_id) {
-                tracing::warn!(
-                    team = %orphan_id,
-                    error = %err,
-                    "failed to delete orphan team during team_create cleanup; will surface error"
-                );
-                return Err(Error::Other(format!(
-                    "failed to auto-clean orphan team '{orphan_id}': {err}. \
-                     Delete it manually and retry."
-                )));
-            }
-            // Best-effort: also drop the worker runtime record for the orphan.
-            let _ = self.runtime_workers.remove_team(orphan_id);
-        }
-        if !orphans.is_empty() {
-            tracing::info!(
-                count = orphans.len(),
-                teams = ?orphans,
-                "auto-cleaned orphan teams before creating new one"
-            );
-        }
-        Ok(orphans)
     }
 
     pub(super) fn team_delete(&self, args: &Map<String, Value>) -> Result<ToolExecution> {

@@ -25,6 +25,10 @@ impl TeamStore {
         data_dir::team_file(&self.base_dir, team_id)
     }
 
+    pub fn team_dir(&self, team_id: &str) -> PathBuf {
+        data_dir::team_dir(&self.base_dir, team_id)
+    }
+
     fn lock_for_teams(&self) -> PathBuf {
         data_dir::lock_path(&self.base_dir, "teams")
     }

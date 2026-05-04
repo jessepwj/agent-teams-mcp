@@ -64,6 +64,7 @@ fn seed_data_with_cwd(base_dir: &std::path::Path, cwd: Option<&str>) {
             cwd: cwd.map(str::to_string),
             lead_member_id: Some("lead".into()),
             owner_cc_pid: Some(42),
+            overwrite: false,
         })
         .unwrap();
 
@@ -931,6 +932,7 @@ fn read_model_uses_configured_lead_and_latest_timestamp() {
             cwd: None,
             lead_member_id: Some("boss".into()),
             owner_cc_pid: None,
+            overwrite: false,
         })
         .unwrap();
     member_service

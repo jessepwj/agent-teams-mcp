@@ -327,18 +327,21 @@ impl TeamModeToolset {
             tool(
                 "team_create",
                 "Create a team. The caller becomes its lead.",
+                "WARNING: irreversibly removes existing team data when overwrite=true.",
                 json_schema(
                     &[
                         ("name", json!({"type":"string"})),
                         ("cwd", json!({"type":"string"})),
+                        ("overwrite", json!({"type":"boolean"})),
                     ],
                     &["name"],
                 ),
             ),
-            tool("team_list", "List teams.", empty_object_schema()),
+            tool("team_list", "List teams.", "", empty_object_schema()),
             tool(
                 "team_delete",
                 "Delete a team and stop all its workers.",
+                "",
                 json_schema(&[("name", json!({"type":"string"}))], &["name"]),
             ),
             tool(
@@ -346,6 +349,7 @@ impl TeamModeToolset {
                 "Add a worker to a team and start its process. \
                  Pass `adapter` on first add. If a saved profile for this name \
                  already exists, also pass `on_existing` to choose what to do.",
+                "",
                 json_schema(
                     &[
                         ("team", json!({"type":"string"})),
@@ -379,11 +383,13 @@ impl TeamModeToolset {
             tool(
                 "worker_list",
                 "List a team's workers and their state.",
+                "",
                 json_schema(&[("team", json!({"type":"string"}))], &["team"]),
             ),
             tool(
                 "worker_remove",
                 "Stop a worker's process. The on-disk profile is kept so it can be revived later with `worker_add on_existing=reuse`.",
+                "",
                 json_schema(
                     &[
                         ("team", json!({"type":"string"})),
@@ -408,6 +414,7 @@ impl TeamModeToolset {
                  them. Set `preempt=true` to abort the recipient's in-flight turn so the new \
                  message is processed immediately (lead-only; no-op if recipient is idle; \
                  messages are always enqueued regardless of interrupt outcome).",
+                "",
                 json_schema(
                     &[
                         ("team", json!({"type":"string"})),
@@ -426,6 +433,7 @@ impl TeamModeToolset {
                 "Read the lead's inbox. Replies normally arrive automatically \
                  via the Stop hook; this tool is a fallback for explicit backlog \
                  checks. `auto_ack=true` marks returned messages as read.",
+                "",
                 json_schema(
                     &[
                         ("team", json!({"type":"string"})),
@@ -568,10 +576,14 @@ fn parse_env_map(value: Option<&Value>) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
-fn tool(name: &str, description: &str, input_schema: Value) -> ToolDescriptor {
+fn tool(name: &str, description: &str, extra_note: &str, input_schema: Value) -> ToolDescriptor {
     ToolDescriptor {
         name: name.into(),
-        description: description.into(),
+        description: if extra_note.is_empty() {
+            description.into()
+        } else {
+            format!("{description} {extra_note}")
+        },
         input_schema,
     }
 }
