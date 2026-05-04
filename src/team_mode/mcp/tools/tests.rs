@@ -138,6 +138,12 @@ fn lead_watchdog_auto_archives_dead_owner_after_grace() {
     let teams = v["teams"].as_array().unwrap();
     let team = teams.iter().find(|t| t["name"] == "demo").unwrap();
     assert_eq!(team["status"], json!("archived"));
+    assert_eq!(team["ownerStatus"], json!("archived"));
+    let hint = v["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("Archived team 'demo' available"),
+        "missing archived revive hint: {hint}"
+    );
 }
 
 #[test]

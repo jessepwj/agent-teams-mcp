@@ -113,6 +113,7 @@ If you already used `team_mode_service init` in a project, keep the existing `.a
 folder in place. The old project-local runtime still works. To move that machine to the
 v3 global path, stop the old service, run `team_mode_service install-global`, and then
 fully restart Claude Code. New users should start with `install-global` directly.
+With global install, each project still gets its own isolated team data via the caller project root; use `init` only when you explicitly want project-local files.
 
 ---
 

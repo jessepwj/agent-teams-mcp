@@ -570,20 +570,28 @@ impl TeamModeToolset {
                 let teams = self.team_service.list()?;
                 let mut sys = sysinfo::System::new();
                 sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                let mut archived_names: Vec<String> = Vec::new();
                 let mut orphan_names: Vec<String> = Vec::new();
                 let decorated = teams
                     .into_iter()
                     .map(|team| {
-                        let status = match team.owner_cc_pid {
-                            Some(pid) => {
-                                if sys.process(sysinfo::Pid::from_u32(pid)).is_some() {
-                                    "alive"
-                                } else {
-                                    orphan_names.push(team.name.clone());
-                                    "orphan"
-                                }
+                        let status = match team.status {
+                            crate::team_mode::domain::TeamStatus::Archived => {
+                                archived_names.push(team.name.clone());
+                                "archived"
                             }
-                            None => "unbound",
+                            crate::team_mode::domain::TeamStatus::Active => match team.owner_cc_pid
+                            {
+                                Some(pid) => {
+                                    if sys.process(sysinfo::Pid::from_u32(pid)).is_some() {
+                                        "alive"
+                                    } else {
+                                        orphan_names.push(team.name.clone());
+                                        "orphan"
+                                    }
+                                }
+                                None => "unbound",
+                            },
                         };
                         let mut val = serde_json::to_value(&team).unwrap_or(Value::Null);
                         if let Value::Object(obj) = &mut val {
@@ -593,18 +601,33 @@ impl TeamModeToolset {
                     })
                     .collect::<Vec<_>>();
                 let mut payload = json!({ "teams": decorated });
-                if !orphan_names.is_empty() {
+                if !archived_names.is_empty() || !orphan_names.is_empty() {
                     if let Value::Object(map) = &mut payload {
-                        map.insert(
-                            "hint".into(),
-                            Value::String(format!(
+                        let mut hints = Vec::new();
+                        if !archived_names.is_empty() {
+                            let revive_hint = if archived_names.len() == 1 {
+                                format!(
+                                    "Archived team '{}' available — call `team_create({{name:'{}'}})` to revive.",
+                                    archived_names[0], archived_names[0]
+                                )
+                            } else {
+                                format!(
+                                    "Archived teams available — [{}]. Call `team_create({{name:'<archived-name>'}})` to revive one.",
+                                    archived_names.join(", ")
+                                )
+                            };
+                            hints.push(revive_hint);
+                        }
+                        if !orphan_names.is_empty() {
+                            hints.push(format!(
                                 "Orphan teams (owner CC has died): [{}]. \
                                  Their workers are gone; run `team_delete name=<x>` \
                                  on each to free the one-live-team-per-project budget. \
                                  (team_create also auto-cleans orphans when called.)",
                                 orphan_names.join(", ")
-                            )),
-                        );
+                            ));
+                        }
+                        map.insert("hint".into(), Value::String(hints.join(" ")));
                     }
                 }
                 Ok(success(payload))
