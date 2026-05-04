@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -11,6 +11,7 @@ use crate::backend::claude_code::ClaudeCodeBackend;
 use crate::backend::codex::CodexBackend;
 use crate::backend::gemini::GeminiCliBackend;
 use crate::error::{Error, Result};
+use crate::team_mode::data_dir;
 use crate::team_mode::domain::MessageKind;
 use crate::team_mode::mcp::resources::{inbox_uri, team_uri};
 use crate::team_mode::mcp::schemas::{ToolCallResult, ToolDescriptor, empty_object_schema};
@@ -56,7 +57,18 @@ pub struct TeamModeToolset {
     runtime_workers: RuntimeWorkerStore,
     runtime_orchestrator: Arc<tokio::sync::Mutex<RuntimeOrchestrator>>,
     async_runtime: Arc<TokioRuntime>,
-    loop_handles: std::sync::Mutex<HashMap<String, crate::runtime::AgentLoopHandle>>,
+    loop_handles: Arc<Mutex<HashMap<String, crate::runtime::AgentLoopHandle>>>,
+}
+
+struct ToolsetServices {
+    team_service: TeamService,
+    member_service: MemberService,
+    member_store: MemberStore,
+    room_service: RoomService,
+    message_store: MessageStore,
+    message_service: MessageService,
+    inbox_service: InboxService,
+    runtime_workers: RuntimeWorkerStore,
 }
 
 impl TeamModeToolset {
@@ -76,6 +88,55 @@ impl TeamModeToolset {
         project_root: Option<PathBuf>,
     ) -> Self {
         let base_dir = base_dir.into();
+
+        let mut runtime_orchestrator = RuntimeOrchestrator::new();
+        if let Ok(claude) = ClaudeCodeBackend::new() {
+            runtime_orchestrator.register_backend(claude);
+        }
+        if let Ok(codex) = CodexBackend::new() {
+            runtime_orchestrator.register_backend(codex);
+        }
+        if let Ok(gemini) = GeminiCliBackend::new() {
+            runtime_orchestrator.register_backend(gemini);
+        }
+
+        let inbox_notifier = InboxNotifier::new();
+        let services =
+            Self::build_services(base_dir.clone(), project_root, inbox_notifier.clone(), true);
+        // Hand the fully-wired service to the web layer so user-initiated
+        // sends from the browser fire the same notifier + lead-pending writes
+        // as MCP-tool sends. Both sides hit the exact same routing path.
+        crate::team_mode_web::install_shared_message_service(services.message_service.clone());
+
+        Self {
+            base_dir,
+            team_service: services.team_service,
+            member_service: services.member_service,
+            member_store: services.member_store,
+            room_service: services.room_service,
+            message_store: services.message_store,
+            message_service: services.message_service,
+            inbox_service: services.inbox_service,
+            inbox_notifier,
+            runtime_workers: services.runtime_workers,
+            runtime_orchestrator: Arc::new(tokio::sync::Mutex::new(runtime_orchestrator)),
+            async_runtime: Arc::new(
+                TokioRuntimeBuilder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .expect("failed to create Team Mode MCP tokio runtime"),
+            ),
+            loop_handles: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn build_services(
+        base_dir: PathBuf,
+        project_root: Option<PathBuf>,
+        inbox_notifier: InboxNotifier,
+        migrate_legacy: bool,
+    ) -> ToolsetServices {
         let team_store = TeamStore::new(base_dir.clone());
         let member_store = MemberStore::new(base_dir.clone());
         let room_store = RoomStore::new(base_dir.clone());
@@ -95,51 +156,36 @@ impl TeamModeToolset {
             writer = writer.with_legacy_root(root);
         }
         let lead_pending_writer = writer;
-        match lead_pending_writer.migrate_legacy() {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                event = "lead_pending.startup_migration",
-                migrated = n,
-                "migrated legacy lead_pending.jsonl into per-team files"
-            ),
-            Err(err) => tracing::warn!(
-                event = "lead_pending.startup_migration_failed",
-                error = %err
-            ),
-        }
-
-        let mut runtime_orchestrator = RuntimeOrchestrator::new();
-        if let Ok(claude) = ClaudeCodeBackend::new() {
-            runtime_orchestrator.register_backend(claude);
-        }
-        if let Ok(codex) = CodexBackend::new() {
-            runtime_orchestrator.register_backend(codex);
-        }
-        if let Ok(gemini) = GeminiCliBackend::new() {
-            runtime_orchestrator.register_backend(gemini);
+        if migrate_legacy {
+            match lead_pending_writer.migrate_legacy() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    event = "lead_pending.startup_migration",
+                    migrated = n,
+                    "migrated legacy lead_pending.jsonl into per-team files"
+                ),
+                Err(err) => tracing::warn!(
+                    event = "lead_pending.startup_migration_failed",
+                    error = %err
+                ),
+            }
         }
 
         let team_service = TeamService::new(team_store.clone());
         let member_service = MemberService::new(member_store.clone(), team_store.clone());
         let room_service = RoomService::new(room_store.clone());
-        let inbox_notifier = InboxNotifier::new();
         let message_service = MessageService::new(
             message_store.clone(),
             member_store.clone(),
             room_store.clone(),
-            team_store.clone(),
+            team_store,
         )
         .with_inbox_notifier(inbox_notifier.clone())
-        .with_lead_pending_writer(lead_pending_writer.clone());
-        // Hand the fully-wired service to the web layer so user-initiated
-        // sends from the browser fire the same notifier + lead-pending writes
-        // as MCP-tool sends. Both sides hit the exact same routing path.
-        crate::team_mode_web::install_shared_message_service(message_service.clone());
+        .with_lead_pending_writer(lead_pending_writer);
         let inbox_service = InboxService::new(projection_store, message_store.clone());
-        let runtime_workers = RuntimeWorkerStore::new(base_dir.clone());
+        let runtime_workers = RuntimeWorkerStore::new(base_dir);
 
-        Self {
-            base_dir,
+        ToolsetServices {
             team_service,
             member_service,
             member_store,
@@ -147,17 +193,32 @@ impl TeamModeToolset {
             message_store,
             message_service,
             inbox_service,
-            inbox_notifier,
             runtime_workers,
-            runtime_orchestrator: Arc::new(tokio::sync::Mutex::new(runtime_orchestrator)),
-            async_runtime: Arc::new(
-                TokioRuntimeBuilder::new_multi_thread()
-                    .worker_threads(4)
-                    .enable_all()
-                    .build()
-                    .expect("failed to create Team Mode MCP tokio runtime"),
-            ),
-            loop_handles: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn scoped_to_project_root(&self, project_root: PathBuf) -> Self {
+        let base_dir = data_dir::base_dir_for_project_root(&project_root);
+        let services = Self::build_services(
+            base_dir.clone(),
+            Some(project_root),
+            self.inbox_notifier.clone(),
+            false,
+        );
+        Self {
+            base_dir,
+            team_service: services.team_service,
+            member_service: services.member_service,
+            member_store: services.member_store,
+            room_service: services.room_service,
+            message_store: services.message_store,
+            message_service: services.message_service,
+            inbox_service: services.inbox_service,
+            inbox_notifier: self.inbox_notifier.clone(),
+            runtime_workers: services.runtime_workers,
+            runtime_orchestrator: Arc::clone(&self.runtime_orchestrator),
+            async_runtime: Arc::clone(&self.async_runtime),
+            loop_handles: Arc::clone(&self.loop_handles),
         }
     }
 
@@ -381,6 +442,15 @@ impl TeamModeToolset {
     pub fn call_tool(&self, name: &str, arguments: Option<Value>) -> Result<ToolExecution> {
         tracing::info!(tool = %name, "dispatching tool");
         let args = expect_object(arguments)?;
+        if let Some(project_root) = optional_text(&args, "_project_root")? {
+            return self
+                .scoped_to_project_root(PathBuf::from(project_root))
+                .call_tool_scoped(name, args);
+        }
+        self.call_tool_scoped(name, args)
+    }
+
+    fn call_tool_scoped(&self, name: &str, args: Map<String, Value>) -> Result<ToolExecution> {
         match name {
             "team_create" => self.team_create(&args),
             "team_list" => {

@@ -117,7 +117,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Some(ServiceCommand::Relay) => {
-            return team_mode_service_shell::relay_stdio(cli.data_dir.clone());
+            return team_mode_service_shell::relay_stdio(
+                cli.data_dir.clone(),
+                cli.project_root.clone(),
+            );
         }
         Some(ServiceCommand::Hook { command }) => match command {
             HookCommand::AsyncWake => team_mode_service_shell::run_async_wake_hook(),

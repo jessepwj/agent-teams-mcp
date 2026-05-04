@@ -39,6 +39,9 @@ const HTTP_RUNTIME_INFO = path.join(PROJECT_ROOT, '.agent-teams', 'runtime', 'ht
 const PROBE_START_MS = Date.now();
 
 function resolveProjectRoot() {
+    if (process.env.CLAUDE_PROJECT_DIR) {
+        return process.env.CLAUDE_PROJECT_DIR;
+    }
     const candidates = [
         process.cwd(),
         path.resolve(__dirname, '..', '..'),
@@ -89,7 +92,10 @@ async function fetchMyTeams(serviceUrl, token, sessionId) {
     url.searchParams.set('pid', String(process.pid));
     if (sessionId) url.searchParams.set('session_id', sessionId);
     const resp = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: {
+            Authorization: `Bearer ${token}`,
+            'X-Team-Mode-Project-Root': PROJECT_ROOT,
+        },
     });
     if (!resp.ok) {
         const body = await resp.text().catch(() => '');

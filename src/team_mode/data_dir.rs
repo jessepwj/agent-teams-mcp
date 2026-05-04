@@ -129,6 +129,10 @@ pub fn resolve_default_base_dir(cwd: &Path) -> PathBuf {
     new
 }
 
+pub fn base_dir_for_project_root(project_root: &Path) -> PathBuf {
+    resolve_default_base_dir(project_root)
+}
+
 /// Ensure the base dir + `.locks/` subdir exist, and (re)write
 /// `README.md` with the latest layout description.
 ///

@@ -88,7 +88,7 @@ fn identity_cache_round_trip() {
 }
 
 #[test]
-fn runtime_info_candidates_prioritize_global_then_project_local() {
+fn runtime_info_candidates_use_explicit_data_dir_before_project_local() {
     let dir = tempdir().unwrap();
     let data_dir = tempdir().unwrap();
     let candidates = runtime_info_path_candidates(dir.path(), Some(data_dir.path())).unwrap();
@@ -96,9 +96,23 @@ fn runtime_info_candidates_prioritize_global_then_project_local() {
         candidates[0],
         data_dir.path().join("runtime").join("http-mcp.json")
     );
-    assert!(candidates[1].ends_with(".team-mode/runtime/http-mcp.json"));
     assert_eq!(
-        candidates[2],
+        candidates[1],
+        dir.path()
+            .join(".agent-teams")
+            .join("runtime")
+            .join("http-mcp.json")
+    );
+    assert_eq!(candidates.len(), 2);
+}
+
+#[test]
+fn runtime_info_candidates_default_to_global_then_project_local() {
+    let dir = tempdir().unwrap();
+    let candidates = runtime_info_path_candidates(dir.path(), None).unwrap();
+    assert!(candidates[0].ends_with(".team-mode/runtime/http-mcp.json"));
+    assert_eq!(
+        candidates[1],
         dir.path()
             .join(".agent-teams")
             .join("runtime")
@@ -143,6 +157,7 @@ async fn relay_lazy_spawn_polls_healthz_and_forwards_rpc() {
     let health_hits_for_server = Arc::clone(&health_hits_clone);
     let mcp_hits_for_server = Arc::clone(&mcp_hits_clone);
     let runtime_dir_for_server = runtime_dir.clone();
+    let project_root_for_header = project_root.path().to_path_buf();
     let server = tokio::spawn(async move {
         let app = Router::new()
             .route(
@@ -227,6 +242,7 @@ async fn relay_lazy_spawn_polls_healthz_and_forwards_rpc() {
     let headers = HttpHeaders {
         authorization: "Bearer relay-test-token".into(),
         owner_cc_pid: Some(4321),
+        project_root: project_root_for_header,
     };
     let response = tokio::task::spawn_blocking(move || {
         let client = Box::leak(Box::new(http_client().unwrap()));
@@ -482,6 +498,7 @@ async fn mid_turn_corrupt_identity_cache_falls_through_to_my_teams() {
             let headers = HttpHeaders {
                 authorization: "Bearer test-token".into(),
                 owner_cc_pid: Some(4321),
+                project_root: project_root.clone(),
             };
             resolve_mid_turn_identity(&project_root, session_id, &client, &service_url, &headers)
                 .unwrap()
@@ -523,6 +540,7 @@ async fn my_teams_failure_exits_one_for_mid_turn_and_async_wake() {
         let headers = HttpHeaders {
             authorization: "Bearer test-token".into(),
             owner_cc_pid: Some(4321),
+            project_root: PathBuf::from("E:/project"),
         };
         let mid_turn = fetch_my_teams_checked(
             &client,
@@ -605,6 +623,7 @@ async fn fetch_my_teams_strips_mcp_suffix_from_service_url() {
         let headers = HttpHeaders {
             authorization: "Bearer test-token".into(),
             owner_cc_pid: Some(4321),
+            project_root: PathBuf::from("E:/project"),
         };
         fetch_my_teams_checked(
             &client,
@@ -664,6 +683,7 @@ async fn relay_forwards_json_rpc_payloads() {
         let headers = HttpHeaders {
             authorization: "Bearer test-token".into(),
             owner_cc_pid: Some(4321),
+            project_root: PathBuf::from("E:/project"),
         };
         forward_json_rpc_message(
             &client,

@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::StreamExt;
 
+use crate::team_mode::data_dir;
 use crate::team_mode::mcp::runtime::TeamModeMcpRuntime;
 use crate::team_mode::mcp::schemas::{JsonRpcErrorResponse, JsonRpcRequest};
 use crate::team_mode::service::lead_pending::PENDING_FILENAME;
@@ -39,6 +40,7 @@ pub struct HttpCallContext {
     pub owner_cc_pid: Option<u32>,
     pub caller_team: Option<String>,
     pub caller_member: Option<String>,
+    pub project_root: Option<PathBuf>,
 }
 
 impl HttpMcpState {
@@ -187,6 +189,7 @@ fn call_context_from_headers(headers: &HeaderMap) -> HttpCallContext {
         caller_member: header_str(headers, "x-team-mode-worker-id")
             .or_else(|| header_str(headers, "x-team-mode-member"))
             .map(str::to_string),
+        project_root: header_str(headers, "x-team-mode-project-root").map(PathBuf::from),
     }
 }
 
@@ -266,6 +269,12 @@ pub fn inject_http_context(payload: &mut Value, context: &HttpCallContext) {
     if let Some(team) = context.caller_team.as_deref().filter(|s| !s.is_empty()) {
         arguments.insert("_caller_team".into(), json!(team));
     }
+    if let Some(project_root) = context.project_root.as_ref() {
+        arguments.insert(
+            "_project_root".into(),
+            json!(project_root.to_string_lossy().to_string()),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +322,8 @@ pub async fn get_my_teams(
         return status.into_response();
     }
 
-    let base_dir = state.base_dir.clone();
+    let context = call_context_from_headers(&headers);
+    let base_dir = base_dir_from_context(&state, &context);
     let result: Result<Value, String> = tokio::task::spawn_blocking(move || {
         use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
         let mut sys = System::new_with_specifics(
@@ -396,6 +406,13 @@ pub async fn get_my_teams(
     }
 }
 
+fn base_dir_from_context(state: &HttpMcpState, context: &HttpCallContext) -> Arc<PathBuf> {
+    match context.project_root.as_ref() {
+        Some(project_root) => Arc::new(data_dir::base_dir_for_project_root(project_root)),
+        None => state.base_dir.clone(),
+    }
+}
+
 fn json_rpc_error(id: Value, code: i32, message: String) -> Value {
     serde_json::to_value(JsonRpcErrorResponse::new(id, code, message)).unwrap_or_else(
         |_| json!({"jsonrpc":"2.0","id":null,"error":{"code":code,"message":"internal error"}}),
@@ -426,6 +443,7 @@ mod tests {
             owner_cc_pid: Some(1234),
             caller_team: Some("demo".into()),
             caller_member: Some("alice".into()),
+            project_root: Some(PathBuf::from("E:/project-alpha")),
         };
 
         inject_http_context(&mut payload, &context);
@@ -434,6 +452,7 @@ mod tests {
         assert_eq!(args["_owner_cc_pid"], json!(1234));
         assert_eq!(args["_caller_member"], json!("alice"));
         assert_eq!(args["_caller_team"], json!("demo"));
+        assert_eq!(args["_project_root"], json!("E:/project-alpha"));
     }
 
     #[test]

@@ -39,6 +39,7 @@ struct RuntimeInfo {
 struct HttpHeaders {
     authorization: String,
     owner_cc_pid: Option<u32>,
+    project_root: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -103,8 +104,9 @@ struct ProcessRow {
 
 pub(crate) fn relay_stdio(
     data_dir_override: Option<PathBuf>,
+    cli_project_root: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let project_root = project_root()?;
+    let project_root = project_root(cli_project_root.as_deref())?;
     let client = http_client()?;
     let runtime = ensure_runtime_for_relay(&project_root, data_dir_override.as_deref(), &client)?;
     // Token is read from disk once: it doesn't change for the lifetime of
@@ -133,6 +135,7 @@ pub(crate) fn relay_stdio(
         let headers = HttpHeaders {
             authorization: static_headers.authorization.clone(),
             owner_cc_pid: owner_cc_pid(),
+            project_root: project_root.clone(),
         };
         let response = forward_json_rpc_message(&client, &service_url, &headers, message)?;
         if let Some(value) = response {
@@ -144,7 +147,7 @@ pub(crate) fn relay_stdio(
 pub(crate) fn headers_stdout(
     data_dir_override: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let project_root = project_root()?;
+    let project_root = project_root(None)?;
     let client = http_client()?;
     let runtime = match find_healthy_runtime(&client, &project_root, data_dir_override.as_deref())?
     {
@@ -169,7 +172,7 @@ pub(crate) fn headers_stdout(
 }
 
 pub(crate) fn run_async_wake_hook() -> ! {
-    let project_root = match project_root() {
+    let project_root = match project_root(None) {
         Ok(root) => root,
         Err(err) => exit_with_error(err),
     };
@@ -248,7 +251,7 @@ pub(crate) fn run_async_wake_hook() -> ! {
 }
 
 pub(crate) fn run_mid_turn_hook() -> ! {
-    let project_root = match project_root() {
+    let project_root = match project_root(None) {
         Ok(root) => root,
         Err(err) => exit_with_error(err),
     };
@@ -332,7 +335,12 @@ pub(crate) fn try_acquire_service_lock(
     Ok(FileLock::try_acquire(&lock_path)?)
 }
 
-pub(crate) fn project_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn project_root(
+    cli_project_root: Option<&Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(root) = cli_project_root.filter(|root| !root.as_os_str().is_empty()) {
+        return Ok(root.to_path_buf());
+    }
     if let Some(root) = env::var_os("CLAUDE_PROJECT_DIR").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(root));
     }
@@ -360,8 +368,7 @@ fn runtime_info_path_candidates(
     let mut candidates = Vec::new();
     if let Some(data_dir) = data_dir_override.filter(|path| !path.as_os_str().is_empty()) {
         candidates.push(data_dir.join("runtime").join("http-mcp.json"));
-    }
-    if let Ok(global_runtime_dir) = global_runtime_dir() {
+    } else if let Ok(global_runtime_dir) = global_runtime_dir() {
         candidates.push(global_runtime_dir.join("http-mcp.json"));
     }
     candidates.push(legacy_runtime_info_path(project_root));
@@ -673,6 +680,7 @@ fn build_http_headers(
     Ok(HttpHeaders {
         authorization: format!("Bearer {token}"),
         owner_cc_pid: owner_cc_pid(),
+        project_root: project_root.to_path_buf(),
     })
 }
 
@@ -682,6 +690,10 @@ fn headers_to_json(headers: &HttpHeaders) -> Value {
     if let Some(pid) = headers.owner_cc_pid {
         map.insert("X-Team-Mode-Owner-CC-Pid".into(), json!(pid));
     }
+    map.insert(
+        "X-Team-Mode-Project-Root".into(),
+        json!(headers.project_root.to_string_lossy().to_string()),
+    );
     Value::Object(map)
 }
 
@@ -762,6 +774,10 @@ fn forward_json_rpc_message(
     if let Some(pid) = headers.owner_cc_pid {
         request = request.header("X-Team-Mode-Owner-CC-Pid", pid.to_string());
     }
+    request = request.header(
+        "X-Team-Mode-Project-Root",
+        headers.project_root.to_string_lossy().to_string(),
+    );
     let response = request.send()?;
     let status = response.status();
     if status.as_u16() == 202 {
@@ -842,6 +858,10 @@ fn fetch_my_teams(
         request = request.query(&[("session_id", session_id)]);
     }
     request = request.header("Authorization", &headers.authorization);
+    request = request.header(
+        "X-Team-Mode-Project-Root",
+        headers.project_root.to_string_lossy().to_string(),
+    );
     let response = request.send()?;
     let status = response.status();
     let text = response.text()?;

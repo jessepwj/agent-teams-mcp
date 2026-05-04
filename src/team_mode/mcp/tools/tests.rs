@@ -113,6 +113,63 @@ fn team_create_rebinds_existing_active_team_owner() {
 }
 
 #[test]
+fn project_root_context_isolates_team_data() {
+    let service_dir = tempdir().unwrap();
+    let project_a = tempdir().unwrap();
+    let project_b = tempdir().unwrap();
+    let tools = TeamModeToolset::new_for_test(service_dir.path());
+
+    for project in [project_a.path(), project_b.path()] {
+        tools
+            .call_tool(
+                "team_create",
+                Some(json!({
+                    "name": "demo",
+                    "_owner_cc_pid": TEST_OWNER_CC_PID,
+                    "_project_root": project.display().to_string(),
+                })),
+            )
+            .unwrap();
+    }
+
+    let list_a = tools
+        .call_tool(
+            "team_list",
+            Some(json!({
+                "_project_root": project_a.path().display().to_string(),
+            })),
+        )
+        .unwrap()
+        .result
+        .structured_content
+        .unwrap();
+    let list_b = tools
+        .call_tool(
+            "team_list",
+            Some(json!({
+                "_project_root": project_b.path().display().to_string(),
+            })),
+        )
+        .unwrap()
+        .result
+        .structured_content
+        .unwrap();
+    let list_service = tools
+        .call_tool("team_list", Some(json!({})))
+        .unwrap()
+        .result
+        .structured_content
+        .unwrap();
+
+    assert_eq!(list_a["teams"].as_array().unwrap().len(), 1);
+    assert_eq!(list_b["teams"].as_array().unwrap().len(), 1);
+    assert!(list_service["teams"].as_array().unwrap().is_empty());
+    assert!(project_a.path().join(".agent-teams").join("demo").exists());
+    assert!(project_b.path().join(".agent-teams").join("demo").exists());
+    assert!(!service_dir.path().join("demo").exists());
+}
+
+#[test]
 fn send_message_rejects_no_mention() {
     let dir = tempdir().unwrap();
     let tools = TeamModeToolset::new_for_test(dir.path());

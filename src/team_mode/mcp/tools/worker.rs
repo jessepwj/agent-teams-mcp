@@ -218,6 +218,15 @@ impl TeamModeToolset {
         config
             .env
             .insert("TEAM_MODE_WORKER_ID".into(), worker_name.clone());
+        let project_root = self
+            .base_dir
+            .parent()
+            .map(|path| path.to_path_buf())
+            .unwrap_or_else(|| self.base_dir.clone());
+        config.env.insert(
+            "TEAM_MODE_PROJECT_ROOT".into(),
+            project_root.display().to_string(),
+        );
         if let Ok(url) = std::env::var("TEAM_MODE_HTTP_MCP_URL") {
             config.env.insert("TEAM_MODE_HTTP_MCP_URL".into(), url);
         }

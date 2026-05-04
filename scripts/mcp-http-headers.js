@@ -10,6 +10,9 @@ const PROC_QUERY_TIMEOUT_MS = 5000;
 const SHELL_WRAPPER_NAMES = new Set(['cmd', 'sh', 'bash', 'zsh', 'pwsh', 'powershell', 'conhost']);
 
 function projectRoot() {
+  if (process.env.CLAUDE_PROJECT_DIR) {
+    return process.env.CLAUDE_PROJECT_DIR;
+  }
   const candidates = [
     process.cwd(),
     path.resolve(__dirname, '..'),
@@ -103,6 +106,7 @@ function main() {
   const token = fs.readFileSync(tokenFile, 'utf8').trim();
   const headers = {
     Authorization: `Bearer ${token}`,
+    'X-Team-Mode-Project-Root': root,
   };
   const owner = ownerCcPid();
   if (owner) headers['X-Team-Mode-Owner-CC-Pid'] = owner;

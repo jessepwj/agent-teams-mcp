@@ -240,7 +240,8 @@ fn ensure_global_codex_mcp_config() -> Result<()> {
          bearer_token_env_var = \"TEAM_MODE_HTTP_MCP_TOKEN\"\n\
          env_http_headers = {{ \"X-Team-Mode-Team\" = \"TEAM_MODE_TEAM\", \
          \"X-Team-Mode-Member\" = \"TEAM_MODE_MEMBER\", \
-         \"X-Team-Mode-Worker-Id\" = \"TEAM_MODE_WORKER_ID\" }}\n\
+         \"X-Team-Mode-Worker-Id\" = \"TEAM_MODE_WORKER_ID\", \
+         \"X-Team-Mode-Project-Root\" = \"TEAM_MODE_PROJECT_ROOT\" }}\n\
          {end}\n",
         begin = BEGIN,
         url = toml_escape(&url),
