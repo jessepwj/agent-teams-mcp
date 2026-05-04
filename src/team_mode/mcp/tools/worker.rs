@@ -85,7 +85,26 @@ impl TeamModeToolset {
                 let adapter = caller_adapter
                     .clone()
                     .unwrap_or_else(|| "codex".to_string());
-                let cwd_for_worker = optional_text(args, "cwd")?.or_else(|| team.cwd.clone());
+                // BUG-11: when neither the request nor the team carries a
+                // cwd, fall back to the project_root rather than letting
+                // codex inherit the team_mode_service daemon's cwd. The
+                // daemon's cwd is whichever project lazy-spawned the
+                // service first; without this fallback, a worker created
+                // for projectB by CC #2 would still be spawned in projectA
+                // (the daemon's startup cwd) and load projectA's AGENTS.md,
+                // which is exactly the cross-project bleed the user
+                // observed on 2026-05-04 (alice in b-r5 saw a-r5 first
+                // because her cwd → AGENTS.md → MCP all resolved to the
+                // wrong project). project_root here = self.base_dir.parent()
+                // and is already correct after scoped_to_project_root.
+                let project_root_fallback = self
+                    .base_dir
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| self.base_dir.display().to_string());
+                let cwd_for_worker = optional_text(args, "cwd")?
+                    .or_else(|| team.cwd.clone())
+                    .or(Some(project_root_fallback));
                 ExecutionProfile {
                     execution_mode: ExecutionMode::Managed,
                     adapter: Some(adapter),

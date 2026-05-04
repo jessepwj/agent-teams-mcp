@@ -31,9 +31,24 @@ pub fn read_member_conversation(
         .and_then(|pid| lookup_lead_session_id(state.base_dir(), pid));
 
     let execution = member.execution.as_ref();
+    // BUG-11 (web side): when neither the member's execution profile nor
+    // the team carries an explicit cwd, fall back to the project_root
+    // (= state.base_dir().parent()) rather than the daemon's process cwd.
+    // The daemon inherits whichever project lazy-spawned it first, so
+    // `std::env::current_dir()` on the web side returns the wrong project
+    // when several CCs share one daemon — and `discover_sessions` then
+    // scans the wrong `~/.claude/projects/<encoded-cwd>/` directory,
+    // surfacing another CC's JSONL in the lead pane. project_root from
+    // the per-project state IS the right scope: it was resolved from
+    // the request's `?project=` query (see `TeamModeWebApp::resolve_state`).
+    let project_root_fallback = state
+        .base_dir()
+        .parent()
+        .map(|path| path.display().to_string());
     let cwd = execution
         .and_then(|profile| profile.cwd.clone())
         .or_else(|| team.cwd.clone())
+        .or(project_root_fallback)
         .or_else(|| {
             std::env::current_dir()
                 .ok()
