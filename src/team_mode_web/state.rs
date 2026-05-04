@@ -99,6 +99,33 @@ impl TeamModeWebState {
         session_home: Option<PathBuf>,
         static_bundle: StaticBundleMode,
     ) -> Self {
+        Self::build(base_dir, session_home, static_bundle, true)
+    }
+
+    /// Per-project state factory used by the multi-project web router.
+    /// Forces a fresh `MessageService` rooted at the given base_dir
+    /// instead of consulting `SHARED_MESSAGE_SERVICE` — that OnceLock is
+    /// pinned to whatever project lazy-spawned the daemon, so for any
+    /// other project its message_store points at the wrong directory and
+    /// `read_main_room` returns 0 messages even when `messages.jsonl` is
+    /// non-empty on disk. (BUG-12, observed 2026-05-04 immediately after
+    /// the BUG-11 fix landed: lead pane shows the right cwd but the
+    /// chat panel renders empty for any project that wasn't the first
+    /// to start the service.)
+    pub(crate) fn for_project(
+        base_dir: impl Into<PathBuf>,
+        session_home: Option<PathBuf>,
+        static_bundle: StaticBundleMode,
+    ) -> Self {
+        Self::build(base_dir, session_home, static_bundle, false)
+    }
+
+    fn build(
+        base_dir: impl Into<PathBuf>,
+        session_home: Option<PathBuf>,
+        static_bundle: StaticBundleMode,
+        use_shared_message_service: bool,
+    ) -> Self {
         let base_dir = base_dir.into();
         let team_store = TeamStore::new(base_dir.clone());
         let member_store = MemberStore::new(base_dir.clone());
@@ -109,19 +136,29 @@ impl TeamModeWebState {
         let team_service = TeamService::new(team_store.clone());
         let member_service = MemberService::new(member_store.clone(), team_store.clone());
         let room_service = RoomService::new(room_store.clone());
-        // Prefer the daemon-installed shared service so writes coming from
-        // the web layer trigger the same inbox-notifier + lead-pending-writer
-        // side effects as MCP-tool writes. Fall back to a service without
-        // those side effects only when the override isn't installed (e.g.
-        // unit tests that construct `TeamModeWebState` standalone).
-        let message_service = SHARED_MESSAGE_SERVICE.get().cloned().unwrap_or_else(|| {
+        // For the daemon's startup default state, prefer the shared
+        // service so writes from the web layer trigger the same
+        // inbox-notifier + lead-pending-writer side effects as MCP-tool
+        // writes. For per-project state (`use_shared_message_service =
+        // false`), always build fresh so reads/writes hit the correct
+        // project's `messages.jsonl`.
+        let message_service = if use_shared_message_service {
+            SHARED_MESSAGE_SERVICE.get().cloned().unwrap_or_else(|| {
+                MessageService::new(
+                    message_store.clone(),
+                    member_store.clone(),
+                    room_store.clone(),
+                    team_store.clone(),
+                )
+            })
+        } else {
             MessageService::new(
                 message_store.clone(),
                 member_store.clone(),
                 room_store.clone(),
                 team_store.clone(),
             )
-        });
+        };
         let inbox_service = InboxService::new(projection_store.clone(), message_store.clone());
         // RuntimeWorkerStore reads `<base>/runtime/workers.json` — the daemon
         // updates this sidecar whenever a worker dies or its state changes,

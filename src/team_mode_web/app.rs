@@ -83,7 +83,12 @@ impl TeamModeWebApp {
         if let Some(state) = cache.get(&target_base) {
             return Arc::clone(state);
         }
-        let state = Arc::new(TeamModeWebState::with_session_home_and_static_bundle(
+        // BUG-12: must use `for_project` (not `with_session_home_and_static_bundle`)
+        // here. The latter consults `SHARED_MESSAGE_SERVICE`, which is pinned to
+        // the daemon's startup base_dir and therefore reads/writes the wrong
+        // project's `messages.jsonl` for any non-default project. `for_project`
+        // forces a fresh MessageService rooted at the per-project base_dir.
+        let state = Arc::new(TeamModeWebState::for_project(
             target_base.clone(),
             self.config.session_home.clone(),
             self.config.static_bundle.clone(),
