@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -249,8 +250,12 @@ fn global_claude_settings_path(home: &Path) -> PathBuf {
 
 fn install_global() -> Result<(), Box<dyn std::error::Error>> {
     let home = global_home_dir()?;
-    install_global_at(&home)?;
+    let warning = install_global_at(&home)?;
     println!("Team Mode global config installed at {}", home.display());
+    if let Some(warning) = warning {
+        println!();
+        print!("{warning}");
+    }
     println!("Next steps:");
     println!("  team_mode_service");
     println!("  claude");
@@ -264,14 +269,14 @@ fn uninstall_global() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn install_global_at(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn install_global_at(home: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mcp_path = global_claude_json_path(home);
     let settings_path = global_claude_settings_path(home);
     let mcp_json = merged_global_mcp_json(&mcp_path)?;
     let settings_json = merged_global_claude_settings_json(&settings_path)?;
     write_json_pretty(&mcp_path, &mcp_json)?;
     write_json_pretty(&settings_path, &settings_json)?;
-    Ok(())
+    Ok(legacy_v2_hook_warning_section(home)?)
 }
 
 fn uninstall_global_at(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -452,6 +457,219 @@ fn merged_global_claude_settings_json(path: &Path) -> Result<Value, Box<dyn std:
         path,
     )?;
     Ok(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyV2HookWarning {
+    project_settings_path: PathBuf,
+    stop_commands: Vec<String>,
+    post_tool_use_commands: Vec<String>,
+}
+
+fn legacy_v2_hook_warning_section(
+    home: &Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let warnings = collect_legacy_v2_hook_warnings(home)?;
+    if warnings.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format_legacy_v2_hook_warning(&warnings)))
+}
+
+fn collect_legacy_v2_hook_warnings(
+    home: &Path,
+) -> Result<Vec<LegacyV2HookWarning>, Box<dyn std::error::Error>> {
+    let mcp_path = global_claude_json_path(home);
+    if !mcp_path.exists() {
+        return Ok(Vec::new());
+    }
+    let mcp_json = read_json_file(&mcp_path)?;
+    let Some(projects) = mcp_json.get("projects") else {
+        return Ok(Vec::new());
+    };
+
+    let mut project_paths = collect_project_paths(projects, home);
+    if project_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut warnings = Vec::new();
+    for project_path in project_paths.drain(..) {
+        let settings_path = project_path.join(".claude").join("settings.json");
+        if !settings_path.exists() {
+            continue;
+        }
+        let Ok(settings_json) = read_json_file(&settings_path) else {
+            continue;
+        };
+        let stop_commands =
+            legacy_v2_hook_commands(&settings_json, "Stop", "lead-pending-async-wake");
+        let post_tool_use_commands =
+            legacy_v2_hook_commands(&settings_json, "PostToolUse", "lead-pending-mid-turn");
+        if stop_commands.is_empty() && post_tool_use_commands.is_empty() {
+            continue;
+        }
+        warnings.push(LegacyV2HookWarning {
+            project_settings_path: settings_path,
+            stop_commands,
+            post_tool_use_commands,
+        });
+    }
+
+    Ok(warnings)
+}
+
+fn collect_project_paths(projects: &Value, home: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut push_path = |path: PathBuf| {
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            home.join(path)
+        };
+        let key = resolved.display().to_string();
+        if seen.insert(key) {
+            paths.push(resolved);
+        }
+    };
+
+    match projects {
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_project_paths_from_value(entry, &mut push_path);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(Value::Array(entries)) = map.get("items") {
+                for entry in entries {
+                    collect_project_paths_from_value(entry, &mut push_path);
+                }
+            } else {
+                for (key, value) in map {
+                    if let Some(path) = project_path_from_value(value) {
+                        push_path(path);
+                    } else if !key.trim().is_empty() {
+                        push_path(PathBuf::from(key));
+                    }
+                }
+            }
+        }
+        Value::String(path) => push_path(PathBuf::from(path)),
+        _ => {}
+    }
+
+    paths
+}
+
+fn collect_project_paths_from_value(value: &Value, push_path: &mut impl FnMut(PathBuf)) {
+    match value {
+        Value::String(path) => push_path(PathBuf::from(path)),
+        Value::Object(map) => {
+            if let Some(path) = project_path_from_value(value) {
+                push_path(path);
+                return;
+            }
+            for (key, nested) in map {
+                if key == "path" || key == "project_path" || key == "projectPath" {
+                    continue;
+                }
+                if let Some(path) = project_path_from_value(nested) {
+                    push_path(path);
+                }
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_project_paths_from_value(entry, push_path);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn project_path_from_value(value: &Value) -> Option<PathBuf> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+    for key in ["path", "project_path", "projectPath"] {
+        if let Some(Value::String(path)) = map.get(key) {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+fn legacy_v2_hook_commands(settings_json: &Value, event: &str, needle: &str) -> Vec<String> {
+    let Some(hooks) = settings_json.get("hooks").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let Some(entries) = hooks.get(event).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut commands = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in entries {
+        collect_command_matches(entry, needle, &mut seen, &mut commands);
+    }
+    commands
+}
+
+fn collect_command_matches(
+    value: &Value,
+    needle: &str,
+    seen: &mut HashSet<String>,
+    commands: &mut Vec<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(command)) = map.get("command") {
+                if command.contains(needle) && seen.insert(command.clone()) {
+                    commands.push(command.clone());
+                }
+            }
+            for (key, nested) in map {
+                if key == "command" {
+                    continue;
+                }
+                collect_command_matches(nested, needle, seen, commands);
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_command_matches(entry, needle, seen, commands);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn format_legacy_v2_hook_warning(warnings: &[LegacyV2HookWarning]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "⚠ Found legacy v2 hooks in {} project(s) — these will conflict with v3 user-scope hooks:",
+        warnings.len()
+    );
+    for warning in warnings {
+        let _ = writeln!(out, "  - {}", warning.project_settings_path.display());
+        for command in &warning.stop_commands {
+            let _ = writeln!(out, "      Stop hook: {command}");
+        }
+        for command in &warning.post_tool_use_commands {
+            let _ = writeln!(out, "      PostToolUse hook: {command}");
+        }
+    }
+    let _ = writeln!(out, "  Replace those `command` strings with:");
+    let _ = writeln!(out, "    - Stop:        team_mode_service hook async-wake");
+    let _ = writeln!(out, "    - PostToolUse: team_mode_service hook mid-turn");
+    let _ = writeln!(
+        out,
+        "  Keep `asyncRewake: true` and `timeout: 7200` on the Stop entry."
+    );
+    out
 }
 
 fn global_mcp_json_is_empty_shell(
@@ -913,7 +1131,8 @@ mod tests {
     fn install_global_empty_home_writes_expected_config() {
         let home = tempdir().unwrap();
 
-        install_global_at(home.path()).unwrap();
+        let warning = install_global_at(home.path()).unwrap();
+        assert!(warning.is_none());
 
         let mcp = read_json_file(&home.path().join(".claude.json")).unwrap();
         assert_eq!(
@@ -952,7 +1171,8 @@ mod tests {
         let original_mcp = read_json_file(&mcp_path).unwrap();
         let original_settings = read_json_file(&settings_path).unwrap();
 
-        install_global_at(home.path()).unwrap();
+        let warning = install_global_at(home.path()).unwrap();
+        assert!(warning.is_none());
         let installed_mcp = read_json_file(&mcp_path).unwrap();
         assert_eq!(installed_mcp["mcpServers"]["other"]["command"], "x");
         assert_eq!(installed_mcp["extra"], json!("keep-me"));
@@ -987,7 +1207,8 @@ mod tests {
     fn install_global_clean_home_round_trip_leaves_no_shells() {
         let home = tempdir().unwrap();
 
-        install_global_at(home.path()).unwrap();
+        let warning = install_global_at(home.path()).unwrap();
+        assert!(warning.is_none());
         uninstall_global_at(home.path()).unwrap();
 
         assert!(!home.path().join(".claude.json").exists());
@@ -1034,5 +1255,85 @@ mod tests {
         assert!(err.contains(".claude/settings.json"), "got: {err}");
         assert!(err.contains("Team Mode install-global hooks"), "got: {err}");
         assert!(err.contains("merge manually"), "got: {err}");
+    }
+
+    #[test]
+    fn install_global_warns_about_legacy_v2_project_hooks_without_touching_other_projects() {
+        let home = tempdir().unwrap();
+        let legacy_project = home.path().join("legacy-project");
+        let empty_project = home.path().join("empty-project");
+        let v3_project = home.path().join("v3-project");
+        let mut projects = Map::new();
+        projects.insert(legacy_project.display().to_string(), json!({}));
+        projects.insert(empty_project.display().to_string(), json!({}));
+        projects.insert(v3_project.display().to_string(), json!({}));
+
+        fs::create_dir_all(legacy_project.join(".claude")).unwrap();
+        fs::write(
+            legacy_project.join(".claude/settings.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"node scripts/hooks/lead-pending-async-wake.js"}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"node scripts/hooks/lead-pending-mid-turn.js"}]}]}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(empty_project.join(".claude")).unwrap();
+        fs::write(
+            empty_project.join(".claude/settings.json"),
+            r#"{"theme":"dark"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(v3_project.join(".claude")).unwrap();
+        fs::write(
+            v3_project.join(".claude/settings.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"team_mode_service hook async-wake","asyncRewake":true,"timeout":7200}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"team_mode_service hook mid-turn"}]}]}}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.path().join(".claude.json"),
+            serde_json::to_string_pretty(&json!({
+                "projects": projects,
+                "mcpServers": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let warnings = collect_legacy_v2_hook_warnings(home.path()).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].project_settings_path,
+            legacy_project.join(".claude/settings.json")
+        );
+        assert_eq!(
+            warnings[0].stop_commands,
+            vec!["node scripts/hooks/lead-pending-async-wake.js".to_string()]
+        );
+        assert_eq!(
+            warnings[0].post_tool_use_commands,
+            vec!["node scripts/hooks/lead-pending-mid-turn.js".to_string()]
+        );
+
+        let warning = legacy_v2_hook_warning_section(home.path())
+            .unwrap()
+            .unwrap();
+        let warning = warning.replace('\\', "/");
+        assert!(warning.contains("⚠ Found legacy v2 hooks in 1 project(s)"));
+        assert!(warning.contains("legacy-project/.claude/settings.json"));
+        assert!(warning.contains("Stop hook: node scripts/hooks/lead-pending-async-wake.js"));
+        assert!(warning.contains("PostToolUse hook: node scripts/hooks/lead-pending-mid-turn.js"));
+        assert!(warning.contains("Replace those `command` strings with:"));
+        assert!(warning.contains("team_mode_service hook async-wake"));
+        assert!(warning.contains("team_mode_service hook mid-turn"));
+        assert!(!warning.contains("empty-project/.claude/settings.json"));
+        assert!(!warning.contains("v3-project/.claude/settings.json"));
+    }
+
+    #[test]
+    fn install_global_warns_only_when_claude_projects_are_present() {
+        let home = tempdir().unwrap();
+
+        let warning = install_global_at(home.path()).unwrap();
+
+        assert!(warning.is_none());
+        let mcp = read_json_file(&home.path().join(".claude.json")).unwrap();
+        assert!(mcp.get("projects").is_none());
     }
 }
