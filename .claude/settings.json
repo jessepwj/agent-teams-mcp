@@ -1,11 +1,12 @@
 {
+  "_comment": "v3 hooks: prefer the Rust subcommand over the legacy node JS scripts. The JS hooks only look for project-local .agent-teams/runtime/http-mcp.json and ENOENT-fail under v3 user-scope install-global; the Rust subcommand falls back to ~/.team-mode/runtime/http-mcp.json. Once a project has run `team_mode_service install-global`, project-scope hooks here are redundant — they remain only so devs working in this repo before install-global still get hook delivery.",
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "node scripts/hooks/lead-pending-async-wake.js",
+            "command": "team_mode_service hook async-wake",
             "asyncRewake": true,
             "timeout": 7200
           }
@@ -17,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node scripts/hooks/lead-pending-mid-turn.js"
+            "command": "team_mode_service hook mid-turn"
           }
         ]
       }
