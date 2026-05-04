@@ -103,7 +103,7 @@ impl TeamModeToolset {
                 if matches!(record.profile.status, MemberStatus::Removed) {
                     continue;
                 }
-                let key = spawn_key(team_name, &record.profile.name);
+                let key = spawn_key(&self.base_dir, team_name, &record.profile.name);
                 let orch = Arc::clone(&self.runtime_orchestrator);
                 let key_clone = key.clone();
                 let result = self.async_runtime.block_on(async move {

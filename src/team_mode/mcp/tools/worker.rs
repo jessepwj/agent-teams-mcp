@@ -127,7 +127,7 @@ impl TeamModeToolset {
         // a dead worker would fail with "already registered" — exactly the
         // workflow the `[SYSTEM] worker died ... use on_existing=reuse to
         // restart` notice tells the lead to perform.
-        let spawn_key_pre = spawn_key(&team_name, &worker_name);
+        let spawn_key_pre = spawn_key(&self.base_dir, &team_name, &worker_name);
         let (already_live, revived_from_dead) = self.async_runtime.block_on({
             let orch = Arc::clone(&self.runtime_orchestrator);
             let key = spawn_key_pre.clone();
@@ -245,7 +245,7 @@ impl TeamModeToolset {
         // = "high"` globally must see that take effect.
         config.reasoning_effort = execution.reasoning_effort.clone();
 
-        let key = spawn_key(&team_name, &worker_name);
+        let key = spawn_key(&self.base_dir, &team_name, &worker_name);
         self.runtime_workers.upsert_state(
             &team_name,
             &worker_name,
@@ -446,7 +446,7 @@ impl TeamModeToolset {
                 "the team lead cannot be removed via worker_remove".into(),
             ));
         }
-        let key = spawn_key(&team_name, &worker_name);
+        let key = spawn_key(&self.base_dir, &team_name, &worker_name);
 
         // Shut down process (best-effort)
         let orch = Arc::clone(&self.runtime_orchestrator);
@@ -532,7 +532,7 @@ impl TeamModeToolset {
                 let session_state = if sidecar_state.as_deref() == Some(STATE_DEAD) {
                     STATE_DEAD.to_string()
                 } else if stored_state == "running" {
-                    let key = spawn_key(&team_name, &record.profile.name);
+                    let key = spawn_key(&self.base_dir, &team_name, &record.profile.name);
                     let orch = Arc::clone(&orch);
                     let alive = self.async_runtime.block_on(async move {
                         orch.lock().await.is_alive(&key).await.unwrap_or(false)

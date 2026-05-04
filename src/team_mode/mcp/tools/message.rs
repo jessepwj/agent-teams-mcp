@@ -195,7 +195,7 @@ impl TeamModeToolset {
                 live_recipients.push(recipient.clone());
                 continue;
             }
-            let key = spawn_key(&team_name, recipient);
+            let key = spawn_key(&self.base_dir, &team_name, recipient);
             let alive = self.async_runtime.block_on({
                 let orch = Arc::clone(&self.runtime_orchestrator);
                 let key = key.clone();
@@ -343,7 +343,7 @@ impl TeamModeToolset {
                     // Lead has no spawned process to interrupt.
                     continue;
                 }
-                let key = spawn_key(&team_name, recipient);
+                let key = spawn_key(&self.base_dir, &team_name, recipient);
                 let outcome = self.async_runtime.block_on({
                     let orch = Arc::clone(&self.runtime_orchestrator);
                     let key = key.clone();

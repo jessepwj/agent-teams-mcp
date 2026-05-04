@@ -204,6 +204,78 @@ fn project_root_context_isolates_team_data() {
 }
 
 #[test]
+fn project_root_context_isolates_live_worker_sessions() {
+    let service_dir = tempdir().unwrap();
+    let project_a = tempdir().unwrap();
+    let project_b = tempdir().unwrap();
+    let tools = TeamModeToolset::new_for_test(service_dir.path());
+
+    tools.async_runtime.block_on({
+        let orch = Arc::clone(&tools.runtime_orchestrator);
+        async move {
+            orch.lock().await.register_backend(FakeCodexBackend {
+                stderr_tail: String::new(),
+                stderr_log_hint: String::new(),
+            });
+        }
+    });
+
+    let tools_a = tools.scoped_to_project_root(project_a.path().to_path_buf());
+    let tools_b = tools.scoped_to_project_root(project_b.path().to_path_buf());
+
+    create_demo_team_for_tool_test(&tools_a);
+    create_demo_team_for_tool_test(&tools_b);
+
+    tools_a
+        .call_tool(
+            "worker_add",
+            Some(json!({
+                "team": "demo",
+                "name": "worker",
+                "adapter": "codex",
+            })),
+        )
+        .unwrap();
+    tools_b
+        .call_tool(
+            "worker_add",
+            Some(json!({
+                "team": "demo",
+                "name": "worker",
+                "adapter": "codex",
+            })),
+        )
+        .unwrap();
+
+    let worker_a = tools_a
+        .runtime_workers
+        .list_all()
+        .unwrap()
+        .into_iter()
+        .find(|worker| worker.team == "demo" && worker.name == "worker")
+        .unwrap();
+    let worker_b = tools_b
+        .runtime_workers
+        .list_all()
+        .unwrap()
+        .into_iter()
+        .find(|worker| worker.team == "demo" && worker.name == "worker")
+        .unwrap();
+
+    assert_ne!(worker_a.spawn_key, worker_b.spawn_key);
+    assert!(
+        worker_a
+            .spawn_key
+            .contains(project_a.path().to_string_lossy().as_ref())
+    );
+    assert!(
+        worker_b
+            .spawn_key
+            .contains(project_b.path().to_string_lossy().as_ref())
+    );
+}
+
+#[test]
 fn send_message_rejects_no_mention() {
     let dir = tempdir().unwrap();
     let tools = TeamModeToolset::new_for_test(dir.path());

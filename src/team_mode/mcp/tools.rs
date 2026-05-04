@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -676,11 +676,12 @@ fn parse_on_existing(s: &str) -> Result<OnExisting> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compose the orchestrator key from (team, worker_name). Kept as a
-/// compound string for backward compatibility with RuntimeOrchestrator,
-/// which still uses single-string keys.
-fn spawn_key(team: &str, name: &str) -> String {
-    format!("{team}__{name}")
+/// Compose the orchestrator key from (project scope, team, worker_name).
+/// The runtime orchestrator still uses single-string keys, so we keep a
+/// compound string; the project-scoped prefix prevents cross-project
+/// collisions when `runtime_orchestrator` / `loop_handles` are shared.
+fn spawn_key(scope: &Path, team: &str, name: &str) -> String {
+    format!("{}::{team}__{name}", scope.display())
 }
 
 fn parse_env_map(value: Option<&Value>) -> Result<HashMap<String, String>> {
