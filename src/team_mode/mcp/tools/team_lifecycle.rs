@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::Arc;
 
+use crate::ExecutionSessionState;
 use crate::team_mode::domain::{MemberKind, MemberStatus};
 use crate::team_mode::mcp::resources::{inbox_uri, team_uri};
 use crate::team_mode::runtime_workers::STATE_STOPPED;
@@ -138,9 +139,26 @@ impl TeamModeToolset {
                         team_name,
                         &record.profile.name,
                         &key,
-                        record.execution.and_then(|e| e.adapter),
+                        record.execution.clone().and_then(|e| e.adapter),
                         STATE_STOPPED,
                         None,
+                    );
+                    // Also flip `members.json` execution.session_state to
+                    // Stopped so reads (web UI, MCP tool responses) don't
+                    // keep advertising the worker as "running" after its
+                    // owner CC died and the team was archived. Previously
+                    // only the runtime-workers sidecar was updated, leaving
+                    // members.json showing stale `running` state for
+                    // archived teams — the BUG-9 we caught while debugging
+                    // the stale smoke-test fixture on 2026-05-04.
+                    let _ = self.member_store.update(
+                        team_name,
+                        &record.profile.name,
+                        |m| {
+                            if let Some(exec) = m.execution.as_mut() {
+                                exec.session_state = Some(ExecutionSessionState::Stopped);
+                            }
+                        },
                     );
                 }
             }

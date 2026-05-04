@@ -1,5 +1,4 @@
 use agent_teams::team_mode::mcp::http_transport::{HttpMcpState, router as http_mcp_router};
-use agent_teams::team_mode::service::{CreateTeamRequest, TeamService};
 use agent_teams::team_mode::storage::TeamStore;
 use agent_teams::{TeamModeMcpRuntime, TeamModeToolset, util};
 use axum::body::{Body, to_bytes};

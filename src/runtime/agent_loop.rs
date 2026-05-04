@@ -356,8 +356,14 @@ impl AgentLoop {
                     )),
                     TurnEndCause::TurnComplete if !worker_spoke_explicitly => Some(format!(
                         "[INFO] worker '{member}' completed turn (msg {mid}) \
-                         without a routed team message.",
+                         without a routed team message. If you expected a \
+                         reply, check `runtime/codex-stderr-{team}__{member}.log` \
+                         for tool-router errors (BUG-8: codex reports \
+                         TurnComplete even when its tool router exits 1, \
+                         which silently breaks send_message). To recover, \
+                         run `worker_remove` + `worker_add on_existing=reuse`.",
                         member = self.member_id,
+                        team = self.team_id,
                         mid = message.id
                     )),
                     TurnEndCause::TurnComplete => None, // worker spoke — silent success
