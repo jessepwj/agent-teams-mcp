@@ -1,6 +1,6 @@
 # agent-teams-v2 - Main Plan
 
-> Status: **全部主线 + 全部 P5 backlog (B1~B7) 闭环**；项目可发布状态。Session 7~11 落地 ADR-019~029（latest ADR-029：hook `fetch_my_teams` 修 `/mcp` 后缀拼接 bug，端到端 v3 全局安装真正可用）。
+> Status: **全部主线 + 全部 P5 backlog (B1~B7) 闭环**；项目可发布状态。Session 7~12 落地 ADR-019~030（latest ADR-030：v3.1 project-root isolation + archive/delete/watchdog 语义闭环，task v3.1 已 closed）。
 > Created: 2026-04-26
 > Updated: 2026-05-04 Session 12（v3.1 project isolation refactor：Step 1~4 complete, Step 5 docs closeout in progress；latest ADR-030）
 > Team: agent-teams-v2 (backend-dev/codex, frontend-dev/codex, researcher/codex, e2e-tester/codex, reviewer/codex, custodian/codex)
@@ -87,7 +87,7 @@
 | Q12 | task-events-cursor-400-on-invalid（reviewer T7 #3 修复） | backend-dev | ✅ complete-no-review-needed | backend-dev/task-events-cursor-400-on-invalid/ |
 | Q13 | fix-dashboard-sse-runtime-fallback（reviewer T7 #1 HIGH 修复） | frontend-dev | ✅ Round 2 [OK] | frontend-dev/task-dashboard/fix-dashboard-sse-runtime-fallback/ |
 | Q14 | task-v3-phase2d（ADR-027 + README / architecture / docs closeout） | backend-dev | ✅ done-ready-for-review | backend-dev/task-v3-phase2d/ |
-| Q15 | task-v3.1-project-isolation（project-root isolation / archive / watchdog / docs） | backend-dev | 🟡 Step 1~4 complete，Step 5 docs closeout in progress | backend-dev/task-v3.1-project-isolation/ |
+| Q15 | task-v3.1-project-isolation（project-root isolation / archive / watchdog / docs） | backend-dev | ✅ closed (2026-05-04) | backend-dev/task-v3.1-project-isolation/ |
 
 > task list 会随 phase 推进追加，team-lead 维护
 
