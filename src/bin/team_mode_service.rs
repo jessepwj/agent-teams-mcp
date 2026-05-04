@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -10,7 +11,6 @@ use agent_teams::team_mode::data_dir;
 use agent_teams::team_mode::mcp::http_transport::{HttpMcpState, router as http_mcp_router};
 use agent_teams::team_mode::mcp::{TeamModeMcpRuntime, TeamModeToolset};
 use agent_teams::team_mode::runtime_workers::RuntimeWorkerStore;
-use agent_teams::team_mode::storage::TeamStore;
 use axum::Router;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -23,7 +23,6 @@ mod team_mode_service_shell;
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8786;
 const LEAD_WATCH_INTERVAL: Duration = Duration::from_secs(5);
-const LEAD_WATCH_GRACE_CHECKS: u32 = 3;
 const WORKER_LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
 const MCP_HEADERS_HELPER: &str = ".agent-teams/scripts/mcp-http-headers.js";
 const STOP_HOOK_SCRIPT: &str = ".agent-teams/scripts/hooks/lead-pending-async-wake.js";
@@ -183,7 +182,7 @@ async fn run_service(args: ServiceArgs) -> Result<(), Box<dyn std::error::Error>
         Some(args.project_root.clone()),
     ));
     pre_spawn_web(&args.data_dir);
-    spawn_watchdogs(args.data_dir.clone(), Arc::clone(&toolset))?;
+    spawn_watchdogs(Arc::clone(&toolset))?;
 
     let runtime = TeamModeMcpRuntime::with_tool_executor(
         args.data_dir.clone(),
@@ -763,15 +762,20 @@ fn pre_spawn_web(base_dir: &Path) {
     }
 }
 
-fn spawn_watchdogs(
-    base_dir: PathBuf,
-    toolset: Arc<TeamModeToolset>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let team_store = TeamStore::new(base_dir);
+fn spawn_watchdogs(toolset: Arc<TeamModeToolset>) -> Result<(), Box<dyn std::error::Error>> {
     let lead_toolset = Arc::clone(&toolset);
-    std::thread::Builder::new()
-        .name("lead-watchdog".into())
-        .spawn(move || run_lead_watchdog(team_store, lead_toolset))?;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(LEAD_WATCH_INTERVAL);
+        let mut dead_strikes: HashMap<String, u32> = HashMap::new();
+        loop {
+            interval.tick().await;
+            let archived =
+                tokio::task::block_in_place(|| lead_toolset.lead_watchdog_tick(&mut dead_strikes));
+            if archived > 0 {
+                tracing::info!(archived, "lead-watchdog: auto-archived dead-owner team(s)");
+            }
+        }
+    });
     std::thread::Builder::new()
         .name("worker-liveness".into())
         .spawn(move || run_worker_liveness_watchdog(toolset))?;
@@ -782,55 +786,6 @@ fn run_worker_liveness_watchdog(toolset: Arc<TeamModeToolset>) {
     loop {
         std::thread::sleep(WORKER_LIVENESS_INTERVAL);
         let _ = toolset.worker_liveness_tick();
-    }
-}
-
-fn run_lead_watchdog(team_store: TeamStore, _toolset: Arc<TeamModeToolset>) {
-    // HTTP Team Mode service is a durable process: it must outlive any
-    // particular Claude Code instance (CC restarts, switches projects, or
-    // crashes shouldn't bring the service down). The old daemon assumed the
-    // owning CC was a strict parent and exited on its death; that contract
-    // does not apply here — CC connects via HTTP, and its PID can change
-    // arbitrarily across reconnects. Watchdog is downgraded to pure
-    // observability: log "lead apparently gone" but never exit. Service
-    // lifecycle is now governed only by `team-mode-service.ps1 stop` /
-    // explicit shutdown.
-    //
-    // Keeping the loop (instead of removing the watchdog entirely) preserves
-    // a periodic visibility signal in `team-mode-service.log` and leaves a
-    // single place to rewire to e.g. inactivity-based shutdown later.
-    use sysinfo::{Pid, ProcessesToUpdate, System};
-    let mut sys = System::new();
-    let mut consecutive_dead = 0;
-    loop {
-        std::thread::sleep(LEAD_WATCH_INTERVAL);
-        let teams = match team_store.list() {
-            Ok(teams) => teams,
-            Err(err) => {
-                tracing::warn!(error = %err, "lead-watchdog list failed");
-                continue;
-            }
-        };
-        sys.refresh_processes(ProcessesToUpdate::All, true);
-        let any_live = teams.iter().any(|team| {
-            team.owner_cc_pid
-                .map(|pid| sys.process(Pid::from_u32(pid)).is_some())
-                .unwrap_or(true)
-        });
-        consecutive_dead = if teams.is_empty() || !any_live {
-            consecutive_dead + 1
-        } else {
-            0
-        };
-        if consecutive_dead == LEAD_WATCH_GRACE_CHECKS {
-            // Log once at the threshold; do NOT exit. Reset is implicit
-            // (next live tick zeros the counter).
-            tracing::info!(
-                event = "lead_watchdog.observation",
-                teams_total = teams.len(),
-                "lead-watchdog: no live owner_cc_pid across all teams; service stays up (HTTP service is durable)"
-            );
-        }
     }
 }
 

@@ -6,6 +6,7 @@ use crate::team_mode::mcp::resources::{inbox_uri, team_uri};
 use crate::team_mode::runtime_workers::STATE_STOPPED;
 use crate::team_mode::service::{AddMemberRequest, CreateTeamRequest};
 
+use super::TeamDeletionResult;
 use super::web_open::open_team_web_ui;
 
 impl TeamModeToolset {
@@ -77,9 +78,11 @@ impl TeamModeToolset {
         ))
     }
 
-    pub(super) fn team_delete(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
-        let team_name = required_identifier(args, "name")?;
-        let permanent = optional_bool(args, "permanent")?.unwrap_or(false);
+    pub fn delete_team_with_cleanup(
+        &self,
+        team_name: &str,
+        permanent: bool,
+    ) -> Result<TeamDeletionResult> {
         let mut shutdown_failures: Vec<Value> = Vec::new();
 
         // Best-effort shutdown for every managed worker; collect failures
@@ -95,12 +98,12 @@ impl TeamModeToolset {
         //     forgot the spawn_key (daemon restart or earlier remove). We
         //     drop those from `shutdown_failures` so only real shutdown
         //     errors (a still-alive child the OS refused to kill) surface.
-        if let Ok(members) = self.member_service.list_by_team(&team_name) {
+        if let Ok(members) = self.member_service.list_by_team(team_name) {
             for record in members {
                 if matches!(record.profile.status, MemberStatus::Removed) {
                     continue;
                 }
-                let key = spawn_key(&team_name, &record.profile.name);
+                let key = spawn_key(team_name, &record.profile.name);
                 let orch = Arc::clone(&self.runtime_orchestrator);
                 let key_clone = key.clone();
                 let result = self.async_runtime.block_on(async move {
@@ -121,7 +124,7 @@ impl TeamModeToolset {
                         || (msg.contains("not found") && msg.contains("'runtime'"));
                     if !matches!(record.profile.kind, MemberKind::Lead) && !is_already_gone {
                         shutdown_failures.push(json!({
-                            "team": team_name.clone(),
+                            "team": team_name,
                             "member": record.profile.name,
                             "reason": msg,
                         }));
@@ -132,7 +135,7 @@ impl TeamModeToolset {
                 }
                 if !matches!(record.profile.kind, MemberKind::Lead) {
                     let _ = self.runtime_workers.upsert_state(
-                        &team_name,
+                        team_name,
                         &record.profile.name,
                         &key,
                         record.execution.and_then(|e| e.adapter),
@@ -143,21 +146,33 @@ impl TeamModeToolset {
             }
         }
 
-        let outcome = self.team_service.delete(&team_name, permanent)?;
-        let _ = self.runtime_workers.remove_team(&team_name);
+        let outcome = self.team_service.delete(team_name, permanent)?;
+        let _ = self.runtime_workers.remove_team(team_name);
         // Per-team pending file lives under `<base_dir>/<team_id>/`.
         // Archive mode keeps the directory so the team can be revived later;
         // permanent mode still prunes it through TeamStore::delete().
 
-        let result = json!({
+        Ok(TeamDeletionResult {
+            archived: outcome.archived,
+            deleted: outcome.deleted,
+            shutdown_failures,
+        })
+    }
+
+    pub(super) fn team_delete(&self, args: &Map<String, Value>) -> Result<ToolExecution> {
+        let team_name = required_identifier(args, "name")?;
+        let permanent = optional_bool(args, "permanent")?.unwrap_or(false);
+
+        let result = self.delete_team_with_cleanup(&team_name, permanent)?;
+        let payload = json!({
             "ok": true,
             "name": team_name.clone(),
-            "archived": outcome.archived,
-            "deleted": outcome.deleted,
-            "shutdown_failures": shutdown_failures,
+            "archived": result.archived,
+            "deleted": result.deleted,
+            "shutdown_failures": result.shutdown_failures,
         });
 
-        Ok(success_with_updates(result, vec![team_uri(&team_name)]))
+        Ok(success_with_updates(payload, vec![team_uri(&team_name)]))
     }
 
     pub(super) fn member_store_members_file_hint(&self, team_name: &str) -> String {

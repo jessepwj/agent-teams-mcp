@@ -19,3 +19,9 @@
 - `team_delete` now has two modes: archive by default and explicit permanent removal when requested.
 - Archive mode keeps the team directory and only flips `team.json` to `Archived`, so a later revive path can restore it.
 - The tool response now surfaces `archived` and `deleted` so callers can tell which path ran without inferring from side effects.
+
+## Step 4 Notes
+
+- Service startup now spawns the lead watchdog as a tokio task rather than a second thread, so the durable HTTP service keeps ownership of the lifecycle loop.
+- The watchdog now keeps a per-team consecutive dead strike map and only archives a team after three consecutive dead-owner observations.
+- Auto-archive reuses the same cleanup path as manual delete, then emits `team.auto_archived_dead_owner` as the audit event when the grace window expires.

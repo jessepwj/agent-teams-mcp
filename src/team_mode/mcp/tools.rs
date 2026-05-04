@@ -36,11 +36,19 @@ pub use web_open::ensure_team_web_server_public;
 
 /// Per-team lead is always a virtual member with this name.
 const LEAD_NAME: &str = "lead";
+const LEAD_WATCH_GRACE_CHECKS: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecution {
     pub result: ToolCallResult,
     pub updated_resources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamDeletionResult {
+    pub archived: bool,
+    pub deleted: bool,
+    pub shutdown_failures: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -307,6 +315,93 @@ impl TeamModeToolset {
             flipped += 1;
         }
         flipped
+    }
+
+    pub fn lead_watchdog_tick(&self, dead_strikes: &mut HashMap<String, u32>) -> usize {
+        use std::collections::HashSet;
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+
+        let teams = match self.team_service.list() {
+            Ok(teams) => teams,
+            Err(err) => {
+                tracing::warn!(error = %err, "lead-watchdog: list failed");
+                return 0;
+            }
+        };
+
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+
+        let known_team_ids: HashSet<String> = teams.iter().map(|team| team.id.clone()).collect();
+        dead_strikes.retain(|team_id, _| known_team_ids.contains(team_id));
+
+        let mut archived = 0;
+        for team in teams {
+            if matches!(team.status, crate::team_mode::domain::TeamStatus::Archived) {
+                dead_strikes.remove(&team.id);
+                continue;
+            }
+            let Some(owner_cc_pid) = team.owner_cc_pid else {
+                dead_strikes.remove(&team.id);
+                continue;
+            };
+            if sys.process(Pid::from_u32(owner_cc_pid)).is_some() {
+                dead_strikes.remove(&team.id);
+                continue;
+            }
+
+            let strikes = dead_strikes.entry(team.id.clone()).or_insert(0);
+            *strikes += 1;
+            tracing::debug!(
+                event = "lead_watchdog.observation",
+                team = %team.name,
+                team_id = %team.id,
+                owner_cc_pid,
+                consecutive_dead = *strikes,
+                grace = LEAD_WATCH_GRACE_CHECKS,
+                "lead-watchdog: owner CC missing"
+            );
+            if *strikes < LEAD_WATCH_GRACE_CHECKS {
+                continue;
+            }
+            dead_strikes.remove(&team.id);
+
+            match self.delete_team_with_cleanup(&team.id, false) {
+                Ok(result) => {
+                    if !result.shutdown_failures.is_empty() {
+                        tracing::warn!(
+                            event = "team.auto_archived_dead_owner.shutdown_failures",
+                            team = %team.name,
+                            team_id = %team.id,
+                            owner_cc_pid,
+                            shutdown_failures = %result.shutdown_failures.len(),
+                            "lead-watchdog: archived dead-owner team with shutdown failures"
+                        );
+                    }
+                    tracing::info!(
+                        event = "team.auto_archived_dead_owner",
+                        team = %team.name,
+                        team_id = %team.id,
+                        owner_cc_pid,
+                        shutdown_failures = %result.shutdown_failures.len(),
+                        "lead-watchdog: auto-archived dead-owner team"
+                    );
+                    archived += 1;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        event = "team.auto_archived_dead_owner.error",
+                        team = %team.name,
+                        team_id = %team.id,
+                        owner_cc_pid,
+                        error = %err,
+                        "lead-watchdog: failed to auto-archive dead-owner team"
+                    );
+                }
+            }
+        }
+
+        archived
     }
 
     pub(super) fn lock_loop_handles(

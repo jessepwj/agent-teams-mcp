@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -110,6 +111,33 @@ fn team_create_rebinds_existing_active_team_owner() {
 
     assert_eq!(same_owner["ownerCcPid"], json!(42));
     assert_eq!(same_owner["updatedAt"], rebound["updatedAt"]);
+}
+
+#[test]
+fn lead_watchdog_auto_archives_dead_owner_after_grace() {
+    let dir = tempdir().unwrap();
+    let tools = TeamModeToolset::new_for_test(dir.path());
+
+    tools
+        .call_tool(
+            "team_create",
+            Some(json!({
+                "name": "demo",
+                "_owner_cc_pid": TEST_OWNER_CC_PID
+            })),
+        )
+        .unwrap();
+
+    let mut strikes = HashMap::new();
+    assert_eq!(tools.lead_watchdog_tick(&mut strikes), 0);
+    assert_eq!(tools.lead_watchdog_tick(&mut strikes), 0);
+    assert_eq!(tools.lead_watchdog_tick(&mut strikes), 1);
+
+    let team_list = tools.call_tool("team_list", Some(json!({}))).unwrap();
+    let v = team_list.result.structured_content.unwrap();
+    let teams = v["teams"].as_array().unwrap();
+    let team = teams.iter().find(|t| t["name"] == "demo").unwrap();
+    assert_eq!(team["status"], json!("archived"));
 }
 
 #[test]
