@@ -107,7 +107,10 @@ pub(crate) fn relay_stdio(
     let project_root = project_root()?;
     let client = http_client()?;
     let runtime = ensure_runtime_for_relay(&project_root, data_dir_override.as_deref(), &client)?;
-    let headers = build_http_headers(&project_root, &runtime)?;
+    // Token is read from disk once: it doesn't change for the lifetime of
+    // a service instance and the relay can recover from a service restart
+    // by exiting cleanly when the service rejects a stale token.
+    let static_headers = build_http_headers(&project_root, &runtime)?;
     let service_url = runtime_url(&runtime);
 
     let stdin = io::stdin();
@@ -119,6 +122,17 @@ pub(crate) fn relay_stdio(
         let Some(message) = read_json_rpc_message(&mut reader)? else {
             writer.flush()?;
             return Ok(());
+        };
+        // Re-walk the parent chain on every forward instead of caching the
+        // startup result. Windows stdin EOF is unreliable, so a relay can
+        // outlive the CC that spawned it; if the user restarts CC, our
+        // parent chain points at a fresh node.exe with a different PID.
+        // Re-walking keeps `X-Team-Mode-Owner-CC-Pid` aligned with the
+        // currently-alive CC, which `team_create` (ADR-023) and
+        // `/lead-pending/my-teams` both rely on for owner matching.
+        let headers = HttpHeaders {
+            authorization: static_headers.authorization.clone(),
+            owner_cc_pid: owner_cc_pid(),
         };
         let response = forward_json_rpc_message(&client, &service_url, &headers, message)?;
         if let Some(value) = response {
