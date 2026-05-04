@@ -12,6 +12,12 @@ use agent_teams::util::file_lock::FileLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+mod helpers;
+
+use helpers::{
+    exit_hook_error, exit_with_error, exit_with_hook_error, json_contains_string, read_json_file,
+};
+
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8786;
 const RELAY_SPAWN_TIMEOUT_SECS: u64 = 30;
@@ -793,29 +799,6 @@ fn forward_json_rpc_message(
     Ok(Some(serde_json::from_str(&text)?))
 }
 
-fn read_json_file(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content).map_err(|err| {
-        io::Error::other(format!(
-            "failed to parse JSON file '{}': {err}",
-            path.display()
-        ))
-    })?)
-}
-
-fn json_contains_string(value: &Value, needle: &str) -> bool {
-    match value {
-        Value::String(s) => s.contains(needle),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| json_contains_string(value, needle)),
-        Value::Object(map) => map
-            .values()
-            .any(|value| json_contains_string(value, needle)),
-        _ => false,
-    }
-}
-
 fn read_hook_event() -> Option<Value> {
     let mut raw = String::new();
     if io::stdin().read_to_string(&mut raw).is_err() {
@@ -1189,21 +1172,6 @@ fn parse_content_length_header(line: &str) -> Result<Option<usize>, Box<dyn std:
         )
         .into())
     }
-}
-
-fn exit_with_error(err: Box<dyn std::error::Error>) -> ! {
-    eprintln!("team_mode_service: {err}");
-    std::process::exit(1)
-}
-
-fn exit_with_hook_error(err: Box<dyn std::error::Error>) -> ! {
-    eprintln!("team_mode_service hook: {err}");
-    std::process::exit(1)
-}
-
-fn exit_hook_error(code: i32, message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(code)
 }
 
 #[derive(Debug)]
