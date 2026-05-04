@@ -276,7 +276,7 @@ fn install_global_at(home: &Path) -> Result<Option<String>, Box<dyn std::error::
     let settings_json = merged_global_claude_settings_json(&settings_path)?;
     write_json_pretty(&mcp_path, &mcp_json)?;
     write_json_pretty(&settings_path, &settings_json)?;
-    Ok(legacy_v2_hook_warning_section(home)?)
+    legacy_v2_hook_warning_section(home)
 }
 
 fn uninstall_global_at(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
