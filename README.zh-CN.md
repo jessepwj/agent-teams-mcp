@@ -27,39 +27,9 @@ Web UI（自动在 `http://127.0.0.1:8787` 启动）实时渲染 lead 与所有 
 
 ---
 
-## TL;DR — 一条命令完成初始化
+## 全局安装 — 把下面这段提示词丢给 Claude Code
 
-```bash
-git clone https://github.com/jessepwj/agent-teams-mcp
-cd agent-teams-mcp
-
-# 跨平台初始化脚本：构建 HTTP service，生成 .mcp.json，
-# 并运行 300 个单元测试。
-bash scripts/setup.sh
-# 或：  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-
-# 然后：
-claude   # 从仓库根目录启动 Claude Code
-```
-
-进入 Claude Code 会话后，运行 `/mcp`——你应该会看到 `team-mode` 已连接。调用 `team_create` 时 Web UI 会自动打开。
-
-> **⚠ 唯一的关键坑：** 任何对 `.mcp.json` 或 `.claude/settings.json` 的修改都需要**完整重启 Claude Code**（关闭所有 CC 窗口并重新启动）。`/mcp reconnect` **不会**重新加载 hook 配置。如果在配置变更后 worker 回复不再以 `<system-reminder>` 的形式到达，几乎百分之百是这个原因。详见 [§ 故障排查](#troubleshooting--worker-replies-arent-pushing)。
-
----
-
-## 在这台机器上全局使用
-
-推荐路径：在机器上只安装一次，之后任何项目都能在完整重启 Claude Code 后直接使用 Team Mode。
-
-```bash
-cargo install --path .
-team_mode_service install-global
-# 之后进入任意项目并启动 claude 即可
-```
-
-<details>
-<summary>📋 点击展开 AI 辅助安装提示词</summary>
+最快的安装方式是**把下面这段提示词粘贴到 Claude Code 会话里**，Claude 会端到端跑完安装、停在唯一一次必须的 CC 重启处、然后帮你验证。
 
 ```text
 你是一个能跑 shell 命令的 AI 助手。请帮我把 agent-teams-mcp
@@ -122,9 +92,20 @@ team_mode_service install-global
 完成后告诉我："team-mode 已在这台机器上就绪，可以用 worker_add / send_message 派任务了"
 ```
 
-</details>
+### 手动安装（不用 AI）
 
-### 从旧的 init 迁移
+```bash
+git clone https://github.com/jessepwj/agent-teams-mcp
+cd agent-teams-mcp
+cargo install --path .
+team_mode_service install-global
+# 然后完整关闭所有 Claude Code 窗口，再从任意项目目录重新启动。
+# /mcp 应该看到 `team-mode connected`。
+```
+
+> **⚠ 唯一的关键坑：** 任何对 `.mcp.json` 或 `.claude/settings.json` 的修改都需要**完整重启 Claude Code**（关闭所有 CC 窗口并重新启动）。`/mcp reconnect` **不会**重新加载 hook 配置。如果在配置变更后 worker 回复不再以 `<system-reminder>` 的形式到达，几乎百分之百是这个原因。详见 [§ 故障排查](#故障排查--worker-回复没有推送过来)。
+
+### 从旧的 `init` 迁移
 
 如果你之前已经在某个项目里跑过 `team_mode_service init`，那就继续保留现有的
 `.agent-teams/` 目录不动。旧的项目本地 runtime 仍然可用。要把这台机器升级到
@@ -434,6 +415,18 @@ approval_policy = "never"
 ---
 
 ## 开发
+
+如果你是要 hack 这个仓库（不是单纯安装），先 bootstrap 一个项目本地的 dev 环境：
+
+```bash
+git clone https://github.com/jessepwj/agent-teams-mcp
+cd agent-teams-mcp
+bash scripts/setup.sh
+# 或：  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+claude   # 从仓库根目录启动 Claude Code
+```
+
+它会构建 HTTP service、生成项目本地的 `.mcp.json`、跑完 300 个单元测试。
 
 ```bash
 # 编译检查（快速，不链接）

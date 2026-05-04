@@ -27,39 +27,9 @@ A web UI (auto-launched at `http://127.0.0.1:8787`) renders the live chat betwee
 
 ---
 
-## TL;DR — fresh clone in one command
+## Install globally — copy the prompt below into Claude Code
 
-```bash
-git clone https://github.com/jessepwj/agent-teams-mcp
-cd agent-teams-mcp
-
-# Cross-platform bootstrap: builds the HTTP service, generates .mcp.json,
-# and runs 300 unit tests.
-bash scripts/setup.sh
-# or:  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-
-# Then:
-claude   # launch Claude Code from the repo root
-```
-
-Inside the Claude Code session, run `/mcp` — you should see `team-mode` connected. The web UI auto-opens on `team_create`.
-
-> **⚠ The one critical pitfall:** any change to `.mcp.json` or `.claude/settings.json` requires a **full Claude Code restart** (close all CC windows + relaunch). `/mcp reconnect` does NOT reload hook configuration. If worker replies stop arriving as `<system-reminder>` after a config change, this is almost always why. See [§ Troubleshooting](#troubleshooting--worker-replies-arent-pushing) for the full triage.
-
----
-
-## Use globally on this machine
-
-Recommended path: install once on the machine, then any project can use Team Mode after a full Claude Code restart.
-
-```bash
-cargo install --path .
-team_mode_service install-global
-# after that, cd into any project and launch claude
-```
-
-<details>
-<summary>📋 Click to expand the AI-assisted install prompt</summary>
+The fastest way to install this on your machine is to **paste the prompt below into your Claude Code session**. Claude will run the install end-to-end, stop at the one mandatory CC restart, and verify everything works.
 
 ```text
 You are an AI assistant that can run shell commands. Help me install
@@ -124,9 +94,20 @@ KNOWN TRAPS (do not skip these reminders):
 When done, tell me: "team-mode is ready on this machine. You can dispatch workers now."
 ```
 
-</details>
+### Manual install (no AI assistant)
 
-### Migration from older init setups
+```bash
+git clone https://github.com/jessepwj/agent-teams-mcp
+cd agent-teams-mcp
+cargo install --path .
+team_mode_service install-global
+# Then completely close all Claude Code windows and relaunch from any project.
+# /mcp should show `team-mode connected`.
+```
+
+> **⚠ The one critical pitfall:** any change to `.mcp.json` or `.claude/settings.json` requires a **full Claude Code restart** (close all CC windows + relaunch). `/mcp reconnect` does NOT reload hook configuration. If worker replies stop arriving as `<system-reminder>` after a config change, this is almost always why. See [§ Troubleshooting](#troubleshooting--worker-replies-arent-pushing) for the full triage.
+
+### Migration from older `init`-based setups
 
 If you already used `team_mode_service init` in a project, keep the existing `.agent-teams/`
 folder in place. The old project-local runtime still works. To move that machine to the
@@ -446,6 +427,18 @@ A legacy `.team-mode-data/` directory triggers a startup warning (not migrated �
 ---
 
 ## Development
+
+If you're hacking on this repo (not just installing it), bootstrap a project-local dev environment:
+
+```bash
+git clone https://github.com/jessepwj/agent-teams-mcp
+cd agent-teams-mcp
+bash scripts/setup.sh
+# or:  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+claude   # launch Claude Code from the repo root
+```
+
+This builds the HTTP service, generates a project-local `.mcp.json`, and runs the 300 unit tests.
 
 ```bash
 # Compile check (fast, no link)
