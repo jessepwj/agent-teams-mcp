@@ -10,7 +10,7 @@
   <a href="https://github.com/jessepwj/agent-teams-mcp/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
   <img alt="MCP" src="https://img.shields.io/badge/protocol-MCP-purple.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-300%20passing-brightgreen.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-351%20passing-brightgreen.svg">
 </p>
 
 # agent-teams-mcp
@@ -164,9 +164,10 @@ No polling, no token burn, no special login. Median end-to-end latency: ~50 ms.
 - **Just-in-time runtime hints** — operational guidance is delivered in tool response `hint` / `note` / `dead_recipients_hint` fields when relevant, not buried in static tool descriptions. Tool descriptions are kept tight (~700 chars each) so they don't crowd context.
 - **Crash-visible `team_delete`** — returns a `shutdown_failures` array so the caller knows which subprocesses might be orphans.
 - **Stop-hook batch-grace** — near-concurrent worker replies are coalesced into a single reminder (default 500 ms window, `TEAM_MODE_STOP_BATCH_GRACE_MS`).
-- **One-live-team-per-project enforcement** — `team_create` rejects creating a second live team while another's `owner_cc_pid` is still alive; orphan teams from dead CC sessions are auto-cleaned and reported in `cleaned_orphan_teams`.
+- **Per-project isolation (v3.1)** — every MCP call carries `X-Team-Mode-Project-Root`, so a single durable service can host multiple Claude Code sessions in different projects without their teams, workers, or messages bleeding across. Worker `cwd`, the web UI's `?project=` route, and `.lead-sessions.json` are all caller-scoped. Run two CCs in two projects, get two fully isolated team rooms in one browser.
+- **One-live-team per CC per project** — `team_create` lets one CC own at most one active team per project; trying to create a second different team returns a hint to archive, delete, or pass `overwrite=true`. Orphan teams from dead CC sessions are auto-cleaned and reported in `cleaned_orphan_teams`.
 - **Self-documenting data dir** — a `README.md` is auto-regenerated inside `.agent-teams/` on every daemon startup, describing the on-disk layout.
-- **300 unit tests, zero warnings.**
+- **351 unit tests, zero warnings.**
 
 ---
 
@@ -289,7 +290,7 @@ The setup script:
 1. Verifies prerequisites (cargo 1.85+, node 14+).
 2. Builds the release binary: `team_mode_service(.exe)`.
 3. **Generates `.mcp.json` from `.mcp.json.template`** pointing at `http://127.0.0.1:8786/mcp` and `scripts/mcp-http-headers.js`.
-4. Runs `cargo test --lib` (300 tests).
+4. Runs `cargo test --lib` (351 tests).
 5. Prints next steps.
 
 > **Why a generated `.mcp.json`?** `.mcp.json` is machine-local and gitignored. The tracked `.mcp.json.template` points Claude Code at the local HTTP MCP endpoint and uses `scripts/mcp-http-headers.js` to attach the runtime token and owner headers. Re-run setup after moving the repo so the helper path is correct, then fully restart Claude Code.
@@ -389,7 +390,7 @@ If any step fails, see [`.plans/agent-teams-v2/docs/03-operations/open-source-de
 The single most common issue. Symptoms: `send_message` returns success, but no `<system-reminder>` arrives in your next turn. Triage in this exact order:
 
 1. **Did you restart CC after first clone / after editing `.claude/settings.json`?** Hooks load only at CC startup — `/mcp reconnect` does NOT pick them up. Quit all CC windows, relaunch `claude`, retry.
-2. **Is the worker actually replying?** `tail -f .agent-teams/team-mode-service.log` — you should see the reply being appended for `lead`. If not, the worker is stuck (check that the backend CLI, e.g. `codex`, is installed and on PATH).
+2. **Is the worker actually replying?** `tail -f ~/.team-mode/runtime/service.log` — you should see the reply being appended for `lead` along with one `event=http_call_context` line per MCP call. If not, the worker is stuck (check that the backend CLI, e.g. `codex`, is installed and on PATH).
 3. **Is the Stop hook firing?** `tail -f .agent-teams/.lead-pending-wake.log` — you should see async-wake injection lines. No entries at all → hook not loaded → see step 1. Service lookup errors → run `scripts/team-mode-service.ps1 status`.
 4. **Still nothing?** See [`.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md`](.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md) for the full table (15+ scenarios with fixes).
 
@@ -419,6 +420,14 @@ Created by the service under the lead's CWD on first tool call:
 # Hook-side scratch files:
 .agent-teams/.lead-pending-wake.log
 .agent-teams/.cc-identity.<session_id>.json
+.lead-sessions.json            ← per-project, written by Stop hook so Web UI can route
+                                  each lead conversation to the right CC across reconnects
+
+# Service-wide diagnostics (machine-global, not per project):
+~/.team-mode/runtime/service.log         ← service stderr; one `event=http_call_context`
+                                            line per MCP call (logs resolved project_root)
+~/.team-mode/runtime/relay-startup.log   ← one line per relay spawn (cwd + cli_arg
+                                            + cc_session_cwd + resolved_project_root)
 ```
 
 Old project-root `lead_pending.jsonl` files are migrated into per-team files by the service at startup.
@@ -439,13 +448,13 @@ bash scripts/setup.sh
 claude   # launch Claude Code from the repo root
 ```
 
-This builds the HTTP service, generates a project-local `.mcp.json`, and runs the 300 unit tests.
+This builds the HTTP service, generates a project-local `.mcp.json`, and runs the 351 unit tests.
 
 ```bash
 # Compile check (fast, no link)
 cargo check --lib
 
-# Run the 300 unit tests (~1s)
+# Run the 351 unit tests (~1s)
 cargo test --lib
 
 # Build the default HTTP MCP service

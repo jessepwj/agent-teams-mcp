@@ -10,7 +10,7 @@
   <a href="https://github.com/jessepwj/agent-teams-mcp/blob/main/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
   <img alt="MCP" src="https://img.shields.io/badge/protocol-MCP-purple.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-300%20passing-brightgreen.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-351%20passing-brightgreen.svg">
 </p>
 
 # agent-teams-mcp
@@ -157,9 +157,10 @@ Claude 读取该 reminder 并继续工作
 - **即时运行时提示** — 操作指引通过工具响应的 `hint` / `note` / `dead_recipients_hint` 字段按需下发，而不是埋在静态工具描述里。工具描述保持简短（每个约 700 字符），不挤占上下文。
 - **`team_delete` 的失败可见性** — 返回 `shutdown_failures` 数组，让调用方知道哪些子进程可能成了孤儿。
 - **Stop hook 批量合并窗口** — 近乎同时到达的多个 worker 回复会被合并为一条 reminder（默认 500 ms 窗口，通过 `TEAM_MODE_STOP_BATCH_GRACE_MS` 配置）。
-- **每个项目最多一个活跃团队** — `team_create` 会拒绝在另一个团队的 `owner_cc_pid` 仍存活时创建第二个团队；来自已死亡 CC 会话的孤儿团队会自动清理，并在 `cleaned_orphan_teams` 中汇报。
+- **跨项目隔离（v3.1）** — 每次 MCP 调用都带上 `X-Team-Mode-Project-Root`，单个 durable service 可同时承载多个 Claude Code 会话（来自不同项目），团队、worker、消息互不串台。Worker 的 `cwd`、Web UI 的 `?project=` 路由、`.lead-sessions.json` 全部按调用方项目作用域隔离。两个 CC 跑在两个项目里，浏览器里看到两个完全独立的团队房间。
+- **同 CC 同项目最多一个活跃团队** — `team_create` 限制单个 CC 在同一个项目内最多持有一个 active team；试图创建第二个不同名团队会返回 hint 提示 archive、delete 或加 `overwrite=true`。来自已死亡 CC 会话的孤儿团队会自动清理，并在 `cleaned_orphan_teams` 中汇报。
 - **自描述数据目录** — 每次 daemon 启动时，会在 `.agent-teams/` 内自动重新生成一份描述目录结构的 `README.md`。
-- **300 个单元测试，零警告。**
+- **351 个单元测试，零警告。**
 
 ---
 
@@ -282,7 +283,7 @@ setup 脚本做了以下事情：
 1. 验证前置条件（cargo 1.85+，node 14+）。
 2. 构建 release 二进制文件：`team_mode_service(.exe)`。
 3. **从 `.mcp.json.template` 生成 `.mcp.json`**，指向 `http://127.0.0.1:8786/mcp` 和 `scripts/mcp-http-headers.js`。
-4. 运行 `cargo test --lib`（300 个测试）。
+4. 运行 `cargo test --lib`（351 个测试）。
 5. 打印后续步骤。
 
 > **为何需要生成 `.mcp.json`？** `.mcp.json` 是本机配置且已加入 gitignore。版本跟踪的 `.mcp.json.template` 指向本地 HTTP MCP endpoint，并通过 `scripts/mcp-http-headers.js` 注入 runtime token 与 owner headers。移动仓库后重新运行 setup，并完整重启 Claude Code。
@@ -376,7 +377,7 @@ approval_policy = "never"
 这是最常见的问题。症状：`send_message` 返回成功，但下一个 turn 没有收到 `<system-reminder>`。请按以下顺序逐步排查：
 
 1. **首次克隆后 / 编辑 `.claude/settings.json` 后，你重启 CC 了吗？** Hook 只在 CC 启动时加载——`/mcp reconnect` **不会**重新加载。退出所有 CC 窗口，重新启动 `claude`，然后重试。
-2. **Worker 真的在回复吗？** `tail -f .agent-teams/team-mode-service.log`——你应该能看到回复被 append 给 `lead`。如果没有，说明 worker 卡住了（检查后端 CLI，例如 `codex` 是否已安装并在 PATH 中）。
+2. **Worker 真的在回复吗？** `tail -f ~/.team-mode/runtime/service.log`——你应该能看到回复被 append 给 `lead`，以及每次 MCP 调用一行 `event=http_call_context`。如果没有，说明 worker 卡住了（检查后端 CLI，例如 `codex` 是否已安装并在 PATH 中）。
 3. **Stop hook 在触发吗？** `tail -f .agent-teams/.lead-pending-wake.log`——你应该看到 async-wake 注入日志。完全没有条目 → hook 未加载 → 见步骤 1。service 查询失败 → 运行 `scripts/team-mode-service.ps1 status`。
 4. **仍然没有效果？** 见 [`.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md`](.plans/agent-teams-v2/docs/03-operations/open-source-deployment.md)，其中有完整的排查表（15+ 个场景及修复方案）。
 
@@ -406,6 +407,14 @@ approval_policy = "never"
 # Hook 侧 scratch 文件：
 .agent-teams/.lead-pending-wake.log
 .agent-teams/.cc-identity.<session_id>.json
+.lead-sessions.json            ← 每个项目根一份，Stop hook 写入；Web UI 用它把每个
+                                  lead 对话跨 CC 重连路由到正确的 CC
+
+# Service 全局诊断（不在项目内，machine-global）：
+~/.team-mode/runtime/service.log         ← service stderr；每次 MCP 调用一行
+                                            `event=http_call_context`，含解析出的 project_root
+~/.team-mode/runtime/relay-startup.log   ← 每个 relay 启动一行（cwd + cli_arg
+                                            + cc_session_cwd + resolved_project_root）
 ```
 
 旧的项目根 `lead_pending.jsonl` 会在 service 启动时迁移到 per-team 文件。
@@ -426,13 +435,13 @@ bash scripts/setup.sh
 claude   # 从仓库根目录启动 Claude Code
 ```
 
-它会构建 HTTP service、生成项目本地的 `.mcp.json`、跑完 300 个单元测试。
+它会构建 HTTP service、生成项目本地的 `.mcp.json`、跑完 351 个单元测试。
 
 ```bash
 # 编译检查（快速，不链接）
 cargo check --lib
 
-# 运行 300 个单元测试（约 1 秒）
+# 运行 351 个单元测试（约 1 秒）
 cargo test --lib
 
 # 构建默认 HTTP MCP service
