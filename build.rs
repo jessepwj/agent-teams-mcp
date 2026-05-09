@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const WEB_DIR: &str = "web/team-mode";
 const INDEX_PLACEHOLDER: &str = "__TEAM_MODE_WEB_BUNDLE_REVISION__";
@@ -20,11 +21,52 @@ fn main() {
     let revision = bundle_revision(&web_dir, &files);
     println!("cargo:rustc-env=TEAM_MODE_WEB_BUNDLE_REVISION={revision}");
 
+    // Embed a git commit identifier so binaries can self-report their build
+    // version. Used by the version-mismatch check in relay/hook to warn
+    // when the on-disk binary is newer than the running service.
+    let git_rev = git_rev(&manifest_dir);
+    println!("cargo:rustc-env=TEAM_MODE_GIT_REV={git_rev}");
+    // Re-run build.rs when HEAD moves so the embedded value tracks commits
+    // without requiring a clean rebuild. `index` covers staged-but-uncommitted
+    // changes that influence the dirty marker.
+    let git_dir = manifest_dir.join(".git");
+    if git_dir.exists() {
+        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+        println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
+    }
+
     let index_path = web_dir.join("index.html");
     let index = fs::read_to_string(&index_path).expect("read web/team-mode/index.html");
     let processed = index.replace(INDEX_PLACEHOLDER, &revision);
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     fs::write(out_dir.join("index.processed.html"), processed).expect("write processed index");
+}
+
+/// Resolve a short commit identifier suitable for embedding in the binary.
+/// Returns `unknown` when git is unavailable (e.g. cargo install from
+/// crates.io) so callers never panic and the version-mismatch check
+/// gracefully no-ops in that case.
+fn git_rev(manifest_dir: &Path) -> String {
+    let head = Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(manifest_dir)
+        .output();
+    let head = match head {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return "unknown".to_string(),
+    };
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(manifest_dir)
+        .output()
+        .ok()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    if dirty {
+        format!("{head}-dirty")
+    } else {
+        head
+    }
 }
 
 fn collect_files(web_dir: &Path) -> Vec<PathBuf> {

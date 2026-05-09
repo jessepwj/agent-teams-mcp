@@ -103,6 +103,7 @@ struct RuntimeInfo {
     url: String,
     token_file: PathBuf,
     started_at: String,
+    binary_commit: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -442,6 +443,7 @@ fn write_runtime_info(
         url: url.to_string(),
         token_file: token_file.to_path_buf(),
         started_at: chrono::Utc::now().to_rfc3339(),
+        binary_commit: env!("TEAM_MODE_GIT_REV").to_string(),
     };
     let path = runtime_dir.join("http-mcp.json");
     let tmp = path.with_extension("json.tmp");

@@ -39,6 +39,11 @@ struct RuntimeInfo {
     url: Option<String>,
     #[serde(alias = "tokenFile")]
     token_file: PathBuf,
+    /// Embedded git rev of the running service. `None` for legacy services
+    /// (pre-version-check upgrade) so the mismatch check can no-op safely
+    /// instead of treating the missing field as a divergence.
+    #[serde(default)]
+    binary_commit: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +122,7 @@ pub(crate) fn relay_stdio(
     log_relay_startup_diagnostic(&project_root, cli_project_root.as_deref(), cc_pid);
     let client = http_client_for_relay_forward()?;
     let runtime = ensure_runtime_for_relay(&project_root, data_dir_override.as_deref(), &client)?;
+    warn_on_version_mismatch("relay", &runtime);
     // Token is read from disk once: it doesn't change for the lifetime of
     // a service instance and the relay can recover from a service restart
     // by exiting cleanly when the service rejects a stale token.
@@ -233,6 +239,7 @@ pub(crate) fn run_async_wake_hook() -> ! {
         ),
         Err(err) => exit_hook_error(1, &format!("lead-pending-async-wake: {err}")),
     };
+    warn_on_version_mismatch("lead-pending-async-wake hook", &runtime);
     let headers = match build_http_headers(&project_root, &runtime) {
         Ok(headers) => headers,
         Err(err) => exit_with_hook_error(err),
@@ -1274,6 +1281,32 @@ fn owner_cc_pid() -> Option<u32> {
     snapshot_process_tree()
         .ok()
         .and_then(|tree| owner_cc_pid_from_tree(&tree, std::process::id()))
+}
+
+/// Compare the embedded git rev of this binary against the rev reported by
+/// the running service. When they diverge, write a single-line warning to
+/// stderr (which lands in the service.log via the relay/hook stderr
+/// redirect) so the user knows a `cargo install` / restart is pending.
+///
+/// Silent when:
+/// - service does not report `binary_commit` (legacy service, can't
+///   compare — better than spamming false positives during rollouts);
+/// - either side reports `unknown` (build.rs ran without git available);
+/// - the two strings match exactly.
+fn warn_on_version_mismatch(context: &str, runtime: &RuntimeInfo) {
+    let own = env!("TEAM_MODE_GIT_REV");
+    let Some(service) = runtime.binary_commit.as_deref() else {
+        return;
+    };
+    if own == "unknown" || service == "unknown" || own == service {
+        return;
+    }
+    eprintln!(
+        "[team-mode] WARNING: {context} binary is at commit '{own}' but the \
+         running service is at commit '{service}'. Restart the service to \
+         pick up the latest changes (stop the service, then re-run the \
+         service launcher; chatr / active teams resume on the next session)."
+    );
 }
 
 /// Snapshot the start_time of `pid` for later use as a PID-recycling guard.
