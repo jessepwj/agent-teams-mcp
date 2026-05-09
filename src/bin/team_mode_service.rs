@@ -14,6 +14,7 @@ use agent_teams::team_mode::mcp::{TeamModeMcpRuntime, TeamModeToolset};
 use agent_teams::team_mode::runtime_workers::RuntimeWorkerStore;
 use axum::Router;
 use clap::{Parser, Subcommand};
+use include_dir::{Dir, include_dir};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tracing_subscriber::EnvFilter;
@@ -32,6 +33,10 @@ const EMBEDDED_HEADERS_HELPER: &str = include_str!("../../scripts/mcp-http-heade
 const EMBEDDED_STOP_HOOK: &str = include_str!("../../scripts/hooks/lead-pending-async-wake.js");
 const EMBEDDED_POST_TOOL_USE_HOOK: &str =
     include_str!("../../scripts/hooks/lead-pending-mid-turn.js");
+
+const SKILL_INSTALL_NAME: &str = "agent-teams-mcp-setup";
+static EMBEDDED_SKILL_DIR: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/.claude/skills/agent-teams-mcp-setup");
 
 #[derive(Debug, Parser)]
 #[command(name = "team_mode_service")]
@@ -278,6 +283,7 @@ fn install_global_at(home: &Path) -> Result<Option<String>, Box<dyn std::error::
     if let Some(settings_json) = merged_global_claude_settings_json(&settings_path)? {
         write_json_pretty(&settings_path, &settings_json)?;
     }
+    install_skill_global_at(home)?;
     legacy_v2_hook_warning_section(home)
 }
 
@@ -304,7 +310,100 @@ fn uninstall_global_at(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    uninstall_skill_global_at(home)?;
+    remove_empty_directory(&home.join(".claude").join("skills"))?;
     remove_empty_directory(&home.join(".claude"))?;
+    Ok(())
+}
+
+fn skill_install_root(home: &Path) -> PathBuf {
+    home.join(".claude")
+        .join("skills")
+        .join(SKILL_INSTALL_NAME)
+}
+
+/// Recursively yield every embedded file under `dir` (relative paths kept).
+fn walk_embedded_files<'a>(dir: &'a Dir<'a>, out: &mut Vec<&'a include_dir::File<'a>>) {
+    for f in dir.files() {
+        out.push(f);
+    }
+    for sub in dir.dirs() {
+        walk_embedded_files(sub, out);
+    }
+}
+
+/// Write the embedded `agent-teams-mcp-setup` skill into `<home>/.claude/skills/`.
+///
+/// Idempotent: files whose on-disk bytes already match the embedded source are
+/// left untouched. Fail-closed: if a target file exists with **different**
+/// contents we refuse and surface the path, mirroring the
+/// `mcpServers.team-mode` conflict policy. This keeps user-authored skill
+/// edits safe from silent clobbering across reinstalls.
+fn install_skill_global_at(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let root = skill_install_root(home);
+    let mut files = Vec::new();
+    walk_embedded_files(&EMBEDDED_SKILL_DIR, &mut files);
+    for file in files {
+        let rel = file.path();
+        let target = root.join(rel);
+        let bytes = file.contents();
+        if target.exists() {
+            let existing = fs::read(&target)?;
+            if existing == bytes {
+                continue;
+            }
+            return Err(format!(
+                "Refusing to overwrite {} — file content differs from the embedded \
+                 agent-teams-mcp-setup skill source. Save your local edits elsewhere, \
+                 delete the file, then re-run install-global.",
+                target.display()
+            )
+            .into());
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, bytes)?;
+    }
+    Ok(())
+}
+
+/// Symmetric removal: delete files whose on-disk bytes still match the
+/// embedded source; preserve user-modified files (and report nothing — the
+/// remaining file itself is the trace). Empty subdirectories are pruned.
+fn uninstall_skill_global_at(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let root = skill_install_root(home);
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    walk_embedded_files(&EMBEDDED_SKILL_DIR, &mut files);
+    for file in files {
+        let target = root.join(file.path());
+        if !target.exists() {
+            continue;
+        }
+        let existing = fs::read(&target)?;
+        if existing == file.contents() {
+            fs::remove_file(&target)?;
+        }
+    }
+    remove_empty_dir_tree(&root)?;
+    Ok(())
+}
+
+fn remove_empty_dir_tree(dir: &Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            remove_empty_dir_tree(&path)?;
+        }
+    }
+    let _ = fs::remove_dir(dir);
     Ok(())
 }
 
@@ -1378,5 +1477,127 @@ mod tests {
         assert!(warning.is_none());
         let mcp = read_json_file(&home.path().join(".claude.json")).unwrap();
         assert!(mcp.get("projects").is_none());
+    }
+
+    #[test]
+    fn install_global_writes_skill_to_user_skills_dir() {
+        let home = tempdir().unwrap();
+
+        install_global_at(home.path()).unwrap();
+
+        let skill_root = home
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("agent-teams-mcp-setup");
+        let skill_md = skill_root.join("SKILL.md");
+        assert!(skill_md.exists(), "SKILL.md not written: {skill_md:?}");
+
+        let on_disk = fs::read_to_string(&skill_md).unwrap();
+        assert!(
+            on_disk.contains("name: agent-teams-mcp-setup"),
+            "SKILL.md frontmatter missing"
+        );
+        assert!(
+            on_disk.contains("硬前置依赖"),
+            "SKILL.md missing hard-dependency block — embedded skill bytes appear stale"
+        );
+
+        // references/ subtree must also land
+        let onboarding = skill_root.join("references").join("onboarding.md");
+        assert!(
+            onboarding.exists(),
+            "references/onboarding.md not written: {onboarding:?}"
+        );
+    }
+
+    #[test]
+    fn install_global_skill_install_is_idempotent() {
+        let home = tempdir().unwrap();
+        install_global_at(home.path()).unwrap();
+        let skill_md = home
+            .path()
+            .join(".claude/skills/agent-teams-mcp-setup/SKILL.md");
+        let bytes_first = fs::read(&skill_md).unwrap();
+
+        install_global_at(home.path()).unwrap();
+        let bytes_second = fs::read(&skill_md).unwrap();
+
+        assert_eq!(
+            bytes_first, bytes_second,
+            "skill file rewritten on second install"
+        );
+    }
+
+    #[test]
+    fn install_global_skill_errors_when_user_modified_file_conflicts() {
+        let home = tempdir().unwrap();
+        let skill_md = home
+            .path()
+            .join(".claude/skills/agent-teams-mcp-setup/SKILL.md");
+        fs::create_dir_all(skill_md.parent().unwrap()).unwrap();
+        fs::write(&skill_md, "user-modified skill body, do not clobber").unwrap();
+
+        let err = install_global_at(home.path()).unwrap_err().to_string();
+
+        assert!(
+            err.contains("agent-teams-mcp-setup"),
+            "error should name the skill: {err}"
+        );
+        assert!(
+            err.contains("Refusing to overwrite"),
+            "error should refuse overwrite: {err}"
+        );
+        let after = fs::read_to_string(&skill_md).unwrap();
+        assert_eq!(after, "user-modified skill body, do not clobber");
+    }
+
+    #[test]
+    fn uninstall_global_removes_skill_when_unmodified() {
+        let home = tempdir().unwrap();
+        install_global_at(home.path()).unwrap();
+        let skill_root = home
+            .path()
+            .join(".claude/skills/agent-teams-mcp-setup");
+        assert!(skill_root.exists());
+
+        uninstall_global_at(home.path()).unwrap();
+
+        assert!(
+            !skill_root.exists(),
+            "skill dir should be gone after uninstall when files are unchanged"
+        );
+        // .claude/skills/ should also be pruned (no other skills installed in this temp home)
+        assert!(
+            !home.path().join(".claude/skills").exists(),
+            "empty .claude/skills/ should be pruned"
+        );
+    }
+
+    #[test]
+    fn uninstall_global_preserves_user_modified_skill_files() {
+        let home = tempdir().unwrap();
+        install_global_at(home.path()).unwrap();
+        let skill_md = home
+            .path()
+            .join(".claude/skills/agent-teams-mcp-setup/SKILL.md");
+        fs::write(&skill_md, "i edited this after install").unwrap();
+
+        uninstall_global_at(home.path()).unwrap();
+
+        // Modified SKILL.md must still be on disk; its dir must therefore survive.
+        assert_eq!(
+            fs::read_to_string(&skill_md).unwrap(),
+            "i edited this after install"
+        );
+        // Sibling untouched files (references/onboarding.md etc.) should be cleaned
+        // because they still match the embedded source.
+        assert!(
+            !home
+                .path()
+                .join(".claude/skills/agent-teams-mcp-setup/references/onboarding.md")
+                .exists(),
+            "unmodified sibling files should be removed even when SKILL.md kept"
+        );
     }
 }

@@ -4,6 +4,11 @@ description: >
   在本仓库的 team-mode MCP（agent-teams-mcp）下，搭建一支 AI 团队（默认全员 codex，
   可选 claude-code 替代），并落盘文件式协作框架（.plans/ 目录、CLAUDE.md + AGENTS.md、
   Phase Gate、Doc-Code Sync、Custodian、Golden Rules）。
+  **硬前置依赖**：本 skill 与 `agent-teams-mcp` MCP 服务**绑定**——必须先用
+  `team_mode_service install-global` 完成机器级安装、重启 Claude Code、`/mcp`
+  显示 `team-mode` 已连接，本 skill 才能跑通；未连接时 Step 4 调 `team_create`
+  必失败。`install-global` 同时把本 skill 拷到 `~/.claude/skills/`，所以全局
+  装好后任何 cwd 都能触发。
   适用场景：(1) 用户要求"搭建团队/swarm/多 agent 项目"；(2) 用户输入
   /agent-teams-mcp-setup；(3) 多模块并行开发（前后端同时推进）；(4) 需要 Codex
   GPT-5 编码能力 + 可选 Claude 对比；(5) 长期运行的复杂项目需要可恢复的进度记录。
@@ -39,6 +44,7 @@ Read references/adapters.md
 
 ## 总流程
 
+**Step 0.A 前置自检（硬门）**：验证 team-mode MCP 已连，未连立即停止
 **Step 0 检测（自动）**：检查是否已有活团队 / `.plans/` 目录，决定 reuse 还是新建
 **Step 1 需求咨询**：介绍 team-mode 工作机制、收集用户需求、推荐 backend 组合
 **Step 2 方案确认**：用 AskUserQuestion 让用户确认项目名/角色/phase/backend
@@ -46,6 +52,24 @@ Read references/adapters.md
 **Step 3.5 Harness Setup**：拷贝 golden_rules.py + 准备 CI 骨架（仅可测试代码项目）
 **Step 4 调用 team_create + worker_add 拉起团队 + 写 team-snapshot.md**
 **Step 5 引导用户 /compact**
+
+---
+
+## Step 0.A 前置自检（MCP 硬绑定门）
+
+本 skill 的 Step 4 完全依赖 `mcp__team-mode__team_create` 和 `mcp__team-mode__worker_add`，没有这两个工具 skill 跑不通。开任何后续 step 之前先确认：
+
+1. 你的可用工具列表里能看到 `mcp__team-mode__team_list` —— 看不到说明 MCP 没连
+2. 试调一次 `mcp__team-mode__team_list`：返回 JSON（`teams`/`hint` 等字段）即通过；返回 "tool not found" 或 connection error 即未连接
+3. **未连接时立即停止**，告知用户原文如下（照念）：
+   > "本 skill 与 team-mode MCP（agent-teams-mcp）绑定，需要它先安装并连接。请：
+   > 1. 跑 `team_mode_service install-global`（机器级安装：写 ~/.claude.json + ~/.claude/settings.json + 拷 skill 到 ~/.claude/skills/）
+   > 2. 完全关闭 Claude Code 后重开
+   > 3. 输入 `/mcp` 确认 `team-mode` 显示 `connected`
+   > 4. 再触发本 skill"
+4. **不要降级**：禁止用 spawn 标准 subagent 模拟团队、禁止改用 TaskCreate/TaskUpdate 凑合协作 —— skill 的协议依赖真实 MCP 工具，模拟无法保真，会让用户得到看似可用、实则失稳的协作系统。
+
+通过本 step 后再进入 Step 0 检测。
 
 ---
 
