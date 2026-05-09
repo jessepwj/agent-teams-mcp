@@ -71,11 +71,30 @@ impl TeamStore {
         if !self.base_dir.exists() {
             return Ok(teams);
         }
+        // Per-entry IO errors (Windows EACCES while another caller is mid-rename
+        // during auto-archive, or a transient share-violation) must not fail
+        // the whole list. We skip the entry and warn — the next list() call
+        // (hooks fire frequently) will retry naturally. Same applies to the
+        // per-file read of team.json: a half-written team_file mid-rename can
+        // surface as Err here, and surfacing that to /lead-pending/my-teams
+        // turns a transient I/O race into an error response that breaks the
+        // whole hook fire.
         for entry in fs::read_dir(&self.base_dir)? {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::warn!(
+                        event = "team_store.list_entry_skipped",
+                        error = %err,
+                        "skipping unreadable directory entry"
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
-            if !path.is_dir() {
-                continue;
+            match path.is_dir() {
+                true => {}
+                false => continue,
             }
             // Skip reserved non-team directories (.locks, etc).
             if matches!(
@@ -86,8 +105,18 @@ impl TeamStore {
                 continue;
             }
             let team_file = path.join(TEAM_FILE);
-            if let Some(team) = read_json_opt::<Team>(&team_file)? {
-                teams.push(team);
+            match read_json_opt::<Team>(&team_file) {
+                Ok(Some(team)) => teams.push(team),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        event = "team_store.list_entry_skipped",
+                        path = %team_file.display(),
+                        error = %err,
+                        "skipping team with unreadable team.json"
+                    );
+                    continue;
+                }
             }
         }
         teams.sort_by(|a, b| a.id.cmp(&b.id));

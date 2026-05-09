@@ -180,7 +180,9 @@ pub(crate) fn headers_stdout(
 }
 
 pub(crate) fn run_async_wake_hook() -> ! {
-    let project_root = match project_root(None, owner_cc_pid()) {
+    let cc_pid = owner_cc_pid();
+    let cc_start_time = cc_pid.and_then(snapshot_pid_start_time);
+    let project_root = match project_root(None, cc_pid) {
         Ok(root) => root,
         Err(err) => exit_with_error(err),
     };
@@ -213,7 +215,7 @@ pub(crate) fn run_async_wake_hook() -> ! {
     // JSONL (mtime-fallback inside `lookup_lead_session_id`), which is
     // exactly the cross-CC bleed the user reported on 2026-05-04.
     if let Some(ref sid) = session_id {
-        let _ = persist_lead_session_id(&project_root, owner_cc_pid(), sid);
+        let _ = persist_lead_session_id(&project_root, cc_pid, sid);
     }
 
     let client = match http_client() {
@@ -248,6 +250,9 @@ pub(crate) fn run_async_wake_hook() -> ! {
     if my_teams.teams.is_empty() {
         loop {
             thread::sleep(Duration::from_secs(LONG_IDLE_SLEEP_SECS));
+            if !cc_parent_alive(cc_pid, cc_start_time) {
+                std::process::exit(0);
+            }
         }
     }
 
@@ -265,6 +270,9 @@ pub(crate) fn run_async_wake_hook() -> ! {
             std::process::exit(2);
         }
         thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        if !cc_parent_alive(cc_pid, cc_start_time) {
+            std::process::exit(0);
+        }
     }
 }
 
@@ -1266,6 +1274,41 @@ fn owner_cc_pid() -> Option<u32> {
     snapshot_process_tree()
         .ok()
         .and_then(|tree| owner_cc_pid_from_tree(&tree, std::process::id()))
+}
+
+/// Snapshot the start_time of `pid` for later use as a PID-recycling guard.
+/// Returns None if the process is gone or sysinfo can't read it.
+fn snapshot_pid_start_time(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    sys.process(Pid::from_u32(pid)).map(|p| p.start_time())
+}
+
+/// True iff `cc_pid` is still the original CC process (PID + start_time
+/// match, and its name stem is `node` or `claude`). When `cc_pid` is None
+/// (ancestor walk failed at hook startup) we conservatively return true so
+/// the hook keeps polling — better than silently exiting on a misdetection.
+fn cc_parent_alive(cc_pid: Option<u32>, expected_start_time: Option<u64>) -> bool {
+    let Some(pid) = cc_pid else { return true };
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let Some(proc) = sys.process(Pid::from_u32(pid)) else {
+        return false;
+    };
+    if let Some(expected) = expected_start_time {
+        if proc.start_time() != expected {
+            return false;
+        }
+    }
+    let name_lc = proc.name().to_string_lossy().to_lowercase();
+    let stem = name_lc.trim_end_matches(".exe");
+    matches!(stem, "node" | "claude")
 }
 
 fn snapshot_process_tree() -> Result<HashMap<u32, ProcessRow>, Box<dyn std::error::Error>> {
