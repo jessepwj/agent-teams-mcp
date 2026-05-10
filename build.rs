@@ -55,8 +55,13 @@ fn git_rev(manifest_dir: &Path) -> String {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => return "unknown".to_string(),
     };
+    // Only modified-tracked files count as dirty. Untracked files (e.g. a
+    // user's private scratch dir under docs/, or an editor swap file) do
+    // not influence the compiled binary, so flagging them as `-dirty`
+    // would mislabel every release build the user runs while keeping
+    // local notes around.
     let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(manifest_dir)
         .output()
         .ok()
