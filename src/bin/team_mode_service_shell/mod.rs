@@ -254,11 +254,47 @@ pub(crate) fn run_async_wake_hook() -> ! {
     )
     .unwrap_or_else(|err| exit_hook_error(err.code, &err.message));
 
+    // Singleton coordination: one async-wake hook per (project_root, owner_cc_pid).
+    //
+    // Why this exists: ADR-022 designed async-wake as a long-poll hook that
+    // exits with code 2 only when it catches a pending reply. In practice
+    // the mid-turn (PostToolUse) hook drains most replies before async-wake
+    // ever sees them, so async-wake never exits and accumulates one process
+    // per Stop event. Lock file lets the newest hook take ownership; older
+    // siblings step down on their next sleep wake-up.
+    //
+    // `cc_pid` can be None when ancestor walking failed at startup. In that
+    // case we skip singleton coordination entirely and fall back to the
+    // legacy long-poll behavior — better than blocking the hook on a
+    // misdetection.
+    let lock_path = cc_pid.map(|pid| stop_hook_lock_path(&project_root, pid));
+    if let Some(cc) = cc_pid {
+        // First-rollout sweep: terminate any legacy-binary siblings that
+        // won't honor the lock. New-binary siblings will step down via the
+        // lock check below; this kill is one-shot and idempotent.
+        sweep_sibling_async_wake_hooks(cc);
+    }
+    if let Some(ref path) = lock_path {
+        // Take ownership. Overwriting is intentional — any prior lock
+        // pointer is by definition stale once we've reached this point.
+        let _ = write_stop_hook_lock(path, std::process::id());
+    }
+
     if my_teams.teams.is_empty() {
         loop {
             thread::sleep(Duration::from_secs(LONG_IDLE_SLEEP_SECS));
             if !cc_parent_alive(cc_pid, cc_start_time) {
+                if let Some(ref p) = lock_path {
+                    cleanup_stop_hook_lock(p);
+                }
                 std::process::exit(0);
+            }
+            if let Some(ref p) = lock_path {
+                if !stop_hook_lock_held_by_self(p) {
+                    // A newer hook claimed the lock — step down without
+                    // deleting the file (it still names the new owner).
+                    std::process::exit(0);
+                }
             }
         }
     }
@@ -274,11 +310,22 @@ pub(crate) fn run_async_wake_hook() -> ! {
                 found.extend(drain_pending_file(&team.pending_path));
             }
             eprintln!("{}", render_async_wake_reminder(&found));
+            if let Some(ref p) = lock_path {
+                cleanup_stop_hook_lock(p);
+            }
             std::process::exit(2);
         }
         thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         if !cc_parent_alive(cc_pid, cc_start_time) {
+            if let Some(ref p) = lock_path {
+                cleanup_stop_hook_lock(p);
+            }
             std::process::exit(0);
+        }
+        if let Some(ref p) = lock_path {
+            if !stop_hook_lock_held_by_self(p) {
+                std::process::exit(0);
+            }
         }
     }
 }
@@ -1281,6 +1328,130 @@ fn owner_cc_pid() -> Option<u32> {
     snapshot_process_tree()
         .ok()
         .and_then(|tree| owner_cc_pid_from_tree(&tree, std::process::id()))
+}
+
+/// Path of the per-CC stop-hook singleton lock. Each owner_cc_pid gets its
+/// own file so multiple Claude Code instances under the same project_root
+/// don't fight each other's hook generations.
+fn stop_hook_lock_path(project_root: &Path, owner_cc_pid: u32) -> PathBuf {
+    project_root
+        .join(".agent-teams")
+        .join("runtime")
+        .join(format!("stop-hook-{owner_cc_pid}.lock"))
+}
+
+/// Atomically write `pid` into the singleton-lock file. Subsequent
+/// `stop_hook_lock_held_by_self` calls compare this value against
+/// `std::process::id()`; mismatches signal "another hook took over, please
+/// step down".
+fn write_stop_hook_lock(path: &Path, pid: u32) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("lock.tmp");
+    fs::write(&tmp, pid.to_string())?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// Returns true when the lock file still names this process. Designed to
+/// fail open (return true) on missing / unreadable / malformed lock files
+/// so a transient I/O blip never causes an in-flight hook to exit
+/// prematurely — the worst outcome of that mistake is silently losing the
+/// next worker reply, which is far costlier than the lock occasionally
+/// disagreeing about ownership.
+fn stop_hook_lock_held_by_self(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(content) => content
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .map(|pid| pid == std::process::id())
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// Best-effort lock cleanup at exit. Failures are ignored: the next hook to
+/// boot will overwrite the file with its own PID anyway.
+fn cleanup_stop_hook_lock(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+/// Force-terminate any other `team_mode_service hook async-wake` processes
+/// whose ancestor chain resolves to the same `own_cc_pid` we resolved. This
+/// is the one-shot cleanup path: new binaries coordinate via the lock file
+/// (see `stop_hook_lock_held_by_self`), but legacy binaries from before this
+/// fix won't read the lock — sweep kills them on startup so a single hook
+/// fire converges the system to one async-wake hook per CC even on first
+/// rollout.
+///
+/// Safety scope:
+///   - Only kills processes whose resolved CC ancestor equals `own_cc_pid`.
+///     Processes belonging to a different CC (or where the ancestor chain
+///     can't be resolved) are left alone.
+///   - Skips `self_pid`.
+///   - Best-effort: any `proc.kill()` failure is silently ignored;
+///     subsequent hook fires will retry.
+///
+/// Race window: a target hook can be mid-drain (atomic rename → read → write
+/// stderr → exit 2) when killed, dropping that batch of pending entries.
+/// drain is sub-millisecond, all currently-observed siblings are in the
+/// sleep phase, so the practical risk is negligible. The graceful-exit
+/// path (lock check on each sleep wake-up) avoids this race for any hook
+/// running the same binary as this one.
+fn sweep_sibling_async_wake_hooks(own_cc_pid: u32) {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always)),
+    );
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+    );
+    let self_pid = std::process::id();
+    let mut tree: HashMap<u32, ProcessRow> = HashMap::new();
+    for (pid, proc) in sys.processes() {
+        let name = proc.name().to_string_lossy().to_string();
+        let ppid = proc.parent().map(|p| p.as_u32()).unwrap_or(0);
+        tree.insert(pid.as_u32(), ProcessRow { ppid, name });
+    }
+    for (pid, proc) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        if pid_u32 == self_pid {
+            continue;
+        }
+        let name_lc = proc.name().to_string_lossy().to_lowercase();
+        let stem = name_lc.trim_end_matches(".exe");
+        if stem != "team_mode_service" {
+            continue;
+        }
+        let mut has_hook = false;
+        let mut has_async_wake = false;
+        for arg in proc.cmd() {
+            let arg_str = arg.to_string_lossy();
+            if arg_str == "hook" {
+                has_hook = true;
+            } else if arg_str == "async-wake" {
+                has_async_wake = true;
+            }
+        }
+        if !(has_hook && has_async_wake) {
+            continue;
+        }
+        let Some(their_cc) = owner_cc_pid_from_tree(&tree, pid_u32) else {
+            continue;
+        };
+        if their_cc != own_cc_pid {
+            continue;
+        }
+        if proc.kill() {
+            eprintln!(
+                "[lead-pending-async-wake] swept stale sibling hook pid={pid_u32} owner_cc_pid={own_cc_pid}"
+            );
+        }
+    }
 }
 
 /// Compare the embedded git rev of this binary against the rev reported by

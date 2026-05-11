@@ -837,6 +837,104 @@ async fn relay_forwards_json_rpc_payloads() {
 }
 
 #[test]
+fn stop_hook_lock_path_lives_under_per_cc_runtime_dir() {
+    let tmp = tempdir().unwrap();
+    let path = stop_hook_lock_path(tmp.path(), 99999);
+    let rel = path.strip_prefix(tmp.path()).unwrap();
+    let segments: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        segments,
+        vec![
+            ".agent-teams".to_string(),
+            "runtime".to_string(),
+            "stop-hook-99999.lock".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn write_stop_hook_lock_creates_dirs_and_serializes_pid() {
+    let tmp = tempdir().unwrap();
+    let path = stop_hook_lock_path(tmp.path(), 12345);
+    assert!(!path.exists());
+    write_stop_hook_lock(&path, 77777).unwrap();
+    assert!(path.exists());
+    let content = fs::read_to_string(&path).unwrap();
+    assert_eq!(content.trim().parse::<u32>().unwrap(), 77777);
+}
+
+#[test]
+fn write_stop_hook_lock_overwrites_prior_owner_atomically() {
+    let tmp = tempdir().unwrap();
+    let path = stop_hook_lock_path(tmp.path(), 12345);
+    write_stop_hook_lock(&path, 11111).unwrap();
+    write_stop_hook_lock(&path, 22222).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+    assert_eq!(content.trim().parse::<u32>().unwrap(), 22222);
+    let tmp_sibling = path.with_extension("lock.tmp");
+    assert!(!tmp_sibling.exists());
+}
+
+#[test]
+fn stop_hook_lock_held_by_self_true_when_pid_matches() {
+    let tmp = tempdir().unwrap();
+    let path = stop_hook_lock_path(tmp.path(), 12345);
+    write_stop_hook_lock(&path, std::process::id()).unwrap();
+    assert!(stop_hook_lock_held_by_self(&path));
+}
+
+#[test]
+fn stop_hook_lock_held_by_self_false_when_pid_differs() {
+    let tmp = tempdir().unwrap();
+    let path = stop_hook_lock_path(tmp.path(), 12345);
+    let other = std::process::id().wrapping_add(1);
+    write_stop_hook_lock(&path, other).unwrap();
+    assert!(!stop_hook_lock_held_by_self(&path));
+}
+
+#[test]
+fn stop_hook_lock_held_by_self_fails_open_on_missing_file() {
+    // Missing lock file must be treated as "still ours" so a transient
+    // I/O failure (concurrent cleanup, filesystem hiccup) can't trick a
+    // healthy hook into stepping down prematurely.
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("missing.lock");
+    assert!(!path.exists());
+    assert!(stop_hook_lock_held_by_self(&path));
+}
+
+#[test]
+fn stop_hook_lock_held_by_self_fails_open_on_malformed_content() {
+    let tmp = tempdir().unwrap();
+    let path = stop_hook_lock_path(tmp.path(), 12345);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "not-a-number\n").unwrap();
+    assert!(stop_hook_lock_held_by_self(&path));
+}
+
+#[test]
+fn cleanup_stop_hook_lock_removes_existing_file() {
+    let tmp = tempdir().unwrap();
+    let path = stop_hook_lock_path(tmp.path(), 12345);
+    write_stop_hook_lock(&path, 1).unwrap();
+    assert!(path.exists());
+    cleanup_stop_hook_lock(&path);
+    assert!(!path.exists());
+}
+
+#[test]
+fn cleanup_stop_hook_lock_is_idempotent_when_missing() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("absent.lock");
+    cleanup_stop_hook_lock(&path);
+    cleanup_stop_hook_lock(&path);
+    assert!(!path.exists());
+}
+
+#[test]
 fn reminder_rendering_matches_expected_labels() {
     let entries = vec![json!({
         "team": "demo",
