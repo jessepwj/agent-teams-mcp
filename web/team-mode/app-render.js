@@ -301,8 +301,23 @@ function renderTimeline() {
           : message.senderKind === "lead" || message.sender === "lead"
             ? "lead"
             : "worker";
+      const mentionsUser =
+        message.sender !== "user" &&
+        Array.isArray(message.mentions) &&
+        message.mentions.includes("user");
+      let toUserClass = "";
+      if (mentionsUser) {
+        toUserClass = " chat-message-to-user";
+        if (!state.mentionPulsedIds.has(message.id)) {
+          toUserClass += " chat-message-pulse";
+          state.mentionPulsedIds.add(message.id);
+        }
+      }
+      const toYouBadge = mentionsUser
+        ? `<span class="chat-meta-to-you" title="${escapeAttr(t("toYouTooltip"))}">${escapeHtml(t("toYouBadge"))}</span>`
+        : "";
       return `
-        <article class="chat-message${active}" data-message="${escapeHtml(message.id)}" style="--sender-hue: ${senderHueValue}">
+        <article class="chat-message${active}${toUserClass}" data-message="${escapeHtml(message.id)}" style="--sender-hue: ${senderHueValue}">
           <button class="chat-avatar ${avatarKind} sender-tinted" type="button" data-sender="${escapeHtml(message.sender)}" aria-label="${escapeHtml(message.sender)}" style="--sender-hue: ${senderHueValue}">
             ${escapeHtml(avatarInitials(message.sender))}
           </button>
@@ -310,9 +325,10 @@ function renderTimeline() {
             <div class="chat-meta">
               <button class="link-button chat-name" type="button" data-sender="${escapeHtml(message.sender)}" title="${escapeHtml(message.sender)}" style="color: hsl(${senderHueValue}, 80%, 75%)">${escapeHtml(message.sender)}</button>
               <span class="chat-time">${fmtTime(message.createdAt)}</span>
+              ${toYouBadge}
               ${status}
             </div>
-            ${renderTimelineMessageBody(message, "chat-bubble")}
+            ${renderTimelineMessageBody(message, "chat-bubble", { forceFull: mentionsUser })}
           </div>
         </article>
       `;
@@ -373,13 +389,14 @@ function membersForDisplay() {
   });
 }
 
-function renderTimelineMessageBody(message, className) {
+function renderTimelineMessageBody(message, className, opts = {}) {
   const fullText = message.body || "";
   const previewText = message.bodyPreview || fullText;
   const hasFullText = fullText && fullText !== previewText;
-  const expanded = state.timelineExpandedMessages.has(message.id);
+  const forceFull = Boolean(opts.forceFull);
+  const expanded = forceFull || state.timelineExpandedMessages.has(message.id);
   const visibleText = hasFullText && expanded ? fullText : previewText;
-  const toggle = hasFullText
+  const toggle = hasFullText && !forceFull
     ? `<button class="chat-expand-button" type="button" data-message-expand="${escapeHtml(message.id)}">${expanded ? t("hideFullMessage") : t("showFullMessage")}</button>`
     : "";
   return `

@@ -482,6 +482,49 @@ select {
   overflow-wrap: anywhere;
 }
 
+/* Messages that @-mention the web user: max contrast so the human spots them. */
+.chat-message-to-user {
+  max-width: 100%;
+}
+.chat-message-to-user .chat-bubble {
+  border-left: 4px solid var(--warn);
+  background: linear-gradient(90deg, rgba(224, 179, 74, 0.16), rgba(224, 179, 74, 0.04) 70%, #151f2a);
+  box-shadow: 0 0 0 1px rgba(224, 179, 74, 0.35);
+}
+.chat-meta-to-you {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--warn);
+  color: #1a1408;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+@keyframes pulse-mention {
+  0% {
+    box-shadow: 0 0 0 0 rgba(224, 179, 74, 0.85);
+  }
+  60% {
+    box-shadow: 0 0 0 10px rgba(224, 179, 74, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(224, 179, 74, 0);
+  }
+}
+.chat-message-pulse .chat-bubble {
+  animation: pulse-mention 1.4s ease-out 3;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-message-pulse .chat-bubble {
+    animation: none;
+  }
+}
+
 .chat-expand-button {
   justify-self: start;
   width: fit-content;

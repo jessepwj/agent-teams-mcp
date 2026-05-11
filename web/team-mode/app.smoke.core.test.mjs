@@ -183,6 +183,43 @@ test("timeline can expand truncated group messages", async () => {
   assert.match(messageList, /details that must remain available/);
 });
 
+test("timeline highlights messages that @-mention user and skips folding", async () => {
+  const payloads = basePayloads();
+  const roomPayload = await payloads["/api/teams/demo/rooms/main?limit=200"].json();
+  const longBody =
+    "Hi @user, please confirm this schema change is acceptable; full justification follows in the next paragraphs and the trailing tail must remain visible without an expand click.";
+  roomPayload.messages.push({
+    id: "m-at-user",
+    sender: "backend-dev",
+    senderKind: "member",
+    kind: "discussion",
+    body: longBody,
+    bodyPreview: "Hi @user, please confirm this schema change is acceptable...",
+    createdAt: "2026-04-24T00:12:00Z",
+    mentions: ["user"],
+    effectiveRecipients: ["user"],
+    deliveryStatus: "delivered",
+    readCount: 0,
+    ackedCount: 0,
+    replyTo: null,
+    threadId: "t-at-user",
+    threadReplyCount: 0,
+  });
+  payloads["/api/teams/demo/rooms/main?limit=200"] = okJson(roomPayload);
+  const harness = createHarness({
+    fetchImpl: async (url) => payloads[url] ?? failedJson(404, "Not Found"),
+  });
+
+  await harness.start();
+
+  const messageList = harness.document.getElementById("messageList").innerHTML;
+  assert.match(messageList, /chat-message-to-user/);
+  assert.match(messageList, /chat-meta-to-you/);
+  assert.match(messageList, /找你/);
+  assert.match(messageList, /trailing tail must remain visible/);
+  assert.doesNotMatch(messageList.match(/data-message="m-at-user"[\s\S]*?<\/article>/)[0], /展开全文/);
+});
+
 test("member list prioritizes lead and marks stale running workers idle", async () => {
   const payloads = basePayloads();
   const membersPayload = await payloads["/api/teams/demo/members"].json();
